@@ -1,0 +1,997 @@
+// =============================================================================
+// DropshipHub — data model
+//
+// A DSers-style dropshipping automation app for Shopify. The schema is split
+// into eight areas:
+//   1. Platform / auth        Session, Account, Shop, StaffAccount
+//   2. Supplier connections   SupplierAccount
+//   3. Supplier catalog       SupplierProduct, SupplierVariant, SupplierShippingOption
+//   4. Import staging         ImportedProduct + children  (the "Import List")
+//   5. Shopify catalog        Product, ProductVariant, ProductImage
+//   6. Mapping                ProductMapping, VariantMapping  (Basic/Advanced/BOGO/Bundle)
+//   7. Automation settings    PricingRule(+Tier), ShippingPreference, InventoryPolicy
+//   8. Fulfilment pipeline    Order, OrderLineItem, PurchaseOrder(+Item), TrackingNumber
+//   9. Operations             JobRun, ActivityLog, Notification, WebhookEvent, CurrencyRate,
+//                             DailyMetric, SupplierPriceSnapshot
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// 1. Platform / auth
+// -----------------------------------------------------------------------------
+
+/// Shopify OAuth session storage. Shape is dictated by
+/// @shopify/shopify-app-session-storage-prisma — do not rename fields.
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+
+  @@index([shop])
+}
+
+/// An organisation. One account can own several Shopify stores, which is how
+/// multi-store management works: supplier connections, pricing rules and
+/// mappings can be shared or copied between the account's shops.
+model Account {
+  id        String   @id @default(cuid())
+  name      String
+  ownerEmail String?
+  plan      Plan     @default(FREE)
+  planRenewsAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  shops            Shop[]
+  staff            StaffAccount[]
+  supplierAccounts SupplierAccount[]
+}
+
+enum Plan {
+  FREE
+  ADVANCED
+  PRO
+  ENTERPRISE
+}
+
+/// One installed Shopify store.
+model Shop {
+  id        String  @id @default(cuid())
+  domain    String  @unique // my-store.myshopify.com
+  accountId String?
+
+  name             String?
+  email            String?
+  country          String?
+  currency         String  @default("USD")
+  timezone         String  @default("UTC")
+  primaryLocationId String?
+  moneyFormat      String?
+
+  installedAt   DateTime  @default(now())
+  uninstalledAt DateTime?
+  isActive      Boolean   @default(true)
+  onboardingStep String   @default("connect_supplier")
+
+  /// Free-form UI/behaviour preferences (see app/domain/settings/shop-settings.ts).
+  settings Json @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  account            Account?             @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  products           Product[]
+  importedProducts   ImportedProduct[]
+  orders             Order[]
+  pricingRules       PricingRule[]
+  shippingPreferences ShippingPreference[]
+  inventoryPolicy    InventoryPolicy?
+  activityLogs       ActivityLog[]
+  notifications      Notification[]
+  jobRuns            JobRun[]
+  webhookEvents      WebhookEvent[]
+  dailyMetrics       DailyMetric[]
+  supplierAccounts   SupplierAccount[]
+
+  @@index([accountId])
+}
+
+model StaffAccount {
+  id        String    @id @default(cuid())
+  accountId String
+  email     String
+  name      String?
+  role      StaffRole @default(STAFF)
+  /// Shop domains this member may access. Empty = every shop on the account.
+  shopScopes String[] @default([])
+  invitedAt DateTime  @default(now())
+  acceptedAt DateTime?
+  disabledAt DateTime?
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, email])
+}
+
+enum StaffRole {
+  OWNER
+  ADMIN
+  STAFF
+  READ_ONLY
+}
+
+// -----------------------------------------------------------------------------
+// 2. Supplier connections
+// -----------------------------------------------------------------------------
+
+enum SupplierPlatform {
+  ALIEXPRESS
+  CJ_DROPSHIPPING
+  TEMU
+  MANUAL
+  MOCK
+}
+
+/// An authorised supplier-platform account (e.g. an AliExpress seller login).
+/// Bound to an Account so it can be reused across the account's shops, and
+/// optionally pinned to a single shop.
+model SupplierAccount {
+  id        String           @id @default(cuid())
+  accountId String
+  shopId    String?
+  platform  SupplierPlatform
+  label     String
+  externalUserId String?
+
+  accessToken  String?
+  refreshToken String?
+  expiresAt    DateTime?
+  /// Platform-specific extras (seller id, region, affiliate tracking id...).
+  meta         Json      @default("{}")
+
+  isDefault Boolean  @default(false)
+  isActive  Boolean  @default(true)
+  lastUsedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  account          Account           @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  shop             Shop?             @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  purchaseOrders   PurchaseOrder[]
+  supplierProducts SupplierProduct[]
+
+  @@index([accountId, platform])
+  @@index([shopId])
+}
+
+// -----------------------------------------------------------------------------
+// 3. Supplier catalog (cached copies of upstream products)
+// -----------------------------------------------------------------------------
+
+model SupplierProduct {
+  id                String           @id @default(cuid())
+  platform          SupplierPlatform
+  externalId        String
+  supplierAccountId String?
+
+  title        String
+  url          String?
+  currency     String   @default("USD")
+  storeName    String?
+  storeUrl     String?
+  storeId      String?
+  rating       Float?
+  orderCount   Int?
+  images       String[] @default([])
+  categoryId   String?
+  shipsFrom    String[] @default([])
+  isAvailable  Boolean  @default(true)
+
+  /// Untouched upstream payload, kept so we can re-derive fields after an
+  /// adapter change without re-fetching the whole catalog.
+  raw Json @default("{}")
+
+  lastFetchedAt DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  supplierAccount  SupplierAccount?          @relation(fields: [supplierAccountId], references: [id], onDelete: SetNull)
+  variants         SupplierVariant[]
+  shippingOptions  SupplierShippingOption[]
+  importedProducts ImportedProduct[]
+  priceSnapshots   SupplierPriceSnapshot[]
+
+  @@unique([platform, externalId])
+  @@index([platform, isAvailable])
+}
+
+model SupplierVariant {
+  id                String @id @default(cuid())
+  supplierProductId String
+
+  /// Upstream SKU identifier (AliExpress `skuId` / `skuAttr`).
+  externalSkuId String
+  skuAttr       String?
+  sku           String?
+  /// [{ name: "Color", value: "Red", image: "https://..." }, ...]
+  attributes    Json    @default("[]")
+  image         String?
+
+  price         Decimal @db.Decimal(18, 4)
+  originalPrice Decimal? @db.Decimal(18, 4)
+  currency      String  @default("USD")
+  stock         Int     @default(0)
+  isAvailable   Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  supplierProduct   SupplierProduct         @relation(fields: [supplierProductId], references: [id], onDelete: Cascade)
+  variantMappings   VariantMapping[]
+  importedVariants  ImportedVariant[]
+  purchaseOrderItems PurchaseOrderItem[]
+
+  @@unique([supplierProductId, externalSkuId])
+  @@index([supplierProductId])
+}
+
+model SupplierShippingOption {
+  id                String @id @default(cuid())
+  supplierProductId String
+
+  shipFromCountry String  @default("CN")
+  shipToCountry   String
+  carrierCode     String
+  carrierName     String
+  cost            Decimal @db.Decimal(18, 4)
+  currency        String  @default("USD")
+  minDeliveryDays Int?
+  maxDeliveryDays Int?
+  hasTracking     Boolean @default(true)
+  isFreeShipping  Boolean @default(false)
+
+  fetchedAt DateTime @default(now())
+
+  supplierProduct SupplierProduct @relation(fields: [supplierProductId], references: [id], onDelete: Cascade)
+
+  @@unique([supplierProductId, shipFromCountry, shipToCountry, carrierCode])
+  @@index([supplierProductId, shipToCountry])
+}
+
+// -----------------------------------------------------------------------------
+// 4. Import staging — the "Import List"
+// -----------------------------------------------------------------------------
+
+enum ImportStatus {
+  DRAFT
+  READY
+  PUSHING
+  PUSHED
+  FAILED
+  ARCHIVED
+}
+
+/// A product parked in the Import List: fully editable, not yet in Shopify.
+model ImportedProduct {
+  id                String @id @default(cuid())
+  shopId            String
+  supplierProductId String?
+
+  title       String
+  description String  @default("")
+  vendor      String?
+  productType String?
+  tags        String[] @default([])
+  collections String[] @default([])
+  handle      String?
+
+  images         String[] @default([])
+  /// Option names in Shopify order, e.g. ["Color", "Size"].
+  options        Json     @default("[]")
+  /// Variant attribute values excluded from the push (DSers "split/omit").
+  excludedValues Json     @default("{}")
+
+  status      ImportStatus @default(DRAFT)
+  pushedProductId String?
+  pushError   String?
+  pushedAt    DateTime?
+
+  pricingRuleId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  shop            Shop              @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  supplierProduct SupplierProduct?  @relation(fields: [supplierProductId], references: [id], onDelete: SetNull)
+  pricingRule     PricingRule?      @relation(fields: [pricingRuleId], references: [id], onDelete: SetNull)
+  variants        ImportedVariant[]
+
+  @@index([shopId, status])
+  @@unique([shopId, supplierProductId])
+}
+
+model ImportedVariant {
+  id                String @id @default(cuid())
+  importedProductId String
+  supplierVariantId String?
+
+  title         String
+  sku           String?
+  /// ["Red", "XL"] aligned with ImportedProduct.options
+  optionValues  Json     @default("[]")
+  image         String?
+
+  cost          Decimal  @db.Decimal(18, 4) @default(0)
+  shippingCost  Decimal  @db.Decimal(18, 4) @default(0)
+  price         Decimal  @db.Decimal(18, 4) @default(0)
+  compareAtPrice Decimal? @db.Decimal(18, 4)
+  weightGrams   Int?
+  inventory     Int      @default(0)
+  isEnabled     Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  importedProduct ImportedProduct  @relation(fields: [importedProductId], references: [id], onDelete: Cascade)
+  supplierVariant SupplierVariant? @relation(fields: [supplierVariantId], references: [id], onDelete: SetNull)
+
+  @@index([importedProductId])
+}
+
+// -----------------------------------------------------------------------------
+// 5. Shopify catalog mirror
+// -----------------------------------------------------------------------------
+
+model Product {
+  id     String @id @default(cuid())
+  shopId String
+
+  shopifyProductId String
+  title            String
+  handle           String?
+  status           String  @default("ACTIVE")
+  vendor           String?
+  featuredImage    String?
+
+  /// Sync state for price/stock automation.
+  autoUpdateEnabled Boolean @default(true)
+  lastSyncedAt      DateTime?
+  costOfGoods       Decimal? @db.Decimal(18, 4)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  shop     Shop             @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  variants ProductVariant[]
+  mapping  ProductMapping?
+
+  @@unique([shopId, shopifyProductId])
+  @@index([shopId])
+}
+
+model ProductVariant {
+  id        String @id @default(cuid())
+  productId String
+
+  shopifyVariantId  String
+  inventoryItemId   String?
+  title             String
+  sku               String?
+  /// ["Red", "XL"]
+  optionValues      Json    @default("[]")
+  price             Decimal @db.Decimal(18, 4)
+  compareAtPrice    Decimal? @db.Decimal(18, 4)
+  cost              Decimal? @db.Decimal(18, 4)
+  inventoryQuantity Int     @default(0)
+  position          Int     @default(1)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product        Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variantMappings VariantMapping[]
+  orderLineItems OrderLineItem[]
+
+  @@unique([productId, shopifyVariantId])
+  @@index([shopifyVariantId])
+}
+
+// -----------------------------------------------------------------------------
+// 6. Mapping
+// -----------------------------------------------------------------------------
+
+enum MappingType {
+  /// One Shopify variant -> one supplier SKU.
+  BASIC
+  /// Several ranked supplier SKUs per variant, optionally per ship-to country.
+  ADVANCED
+  /// Quantity-tiered: buy 2 get 1, etc. Selected by ordered quantity.
+  BOGO
+  /// One Shopify variant fulfilled by several supplier SKUs at once.
+  BUNDLE
+}
+
+model ProductMapping {
+  id        String      @id @default(cuid())
+  productId String      @unique
+  type      MappingType @default(BASIC)
+  isEnabled Boolean     @default(true)
+  notes     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product  Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variants VariantMapping[]
+}
+
+model VariantMapping {
+  id               String @id @default(cuid())
+  productMappingId String
+  productVariantId String
+  supplierVariantId String
+
+  /// Units of the supplier SKU consumed per unit of the Shopify variant.
+  quantity Int @default(1)
+
+  /// ADVANCED: lower runs first. BOGO: the tier's minimum ordered quantity.
+  priority Int @default(0)
+  /// ADVANCED: restrict this option to one destination ("*" = any).
+  shipToCountry String @default("*")
+  shipFromCountry String?
+  /// BOGO: this option applies when ordered qty is within [minQuantity, maxQuantity].
+  minQuantity Int?
+  maxQuantity Int?
+  /// BUNDLE: groups several rows that must all be ordered together.
+  bundleGroup String?
+
+  isDefault Boolean @default(false)
+  isEnabled Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  productMapping  ProductMapping  @relation(fields: [productMappingId], references: [id], onDelete: Cascade)
+  productVariant  ProductVariant  @relation(fields: [productVariantId], references: [id], onDelete: Cascade)
+  supplierVariant SupplierVariant @relation(fields: [supplierVariantId], references: [id], onDelete: Cascade)
+
+  @@index([productMappingId])
+  @@index([productVariantId, shipToCountry, priority])
+}
+
+// -----------------------------------------------------------------------------
+// 7. Automation settings
+// -----------------------------------------------------------------------------
+
+enum PriceOp {
+  /// price = cost * value
+  MULTIPLY
+  /// price = cost + value
+  ADD
+  /// price = cost / (1 - value/100)   — value is a target margin %
+  MARGIN
+  /// price = value
+  FIXED
+  /// leave untouched
+  NONE
+}
+
+model PricingRule {
+  id     String @id @default(cuid())
+  shopId String
+
+  name        String
+  description String?
+  isDefault   Boolean @default(false)
+  isEnabled   Boolean @default(true)
+
+  /// Applied when no tier matches.
+  basePriceOp     PriceOp  @default(MULTIPLY)
+  basePriceValue  Decimal  @default(2) @db.Decimal(18, 4)
+  compareAtOp     PriceOp  @default(NONE)
+  compareAtValue  Decimal? @db.Decimal(18, 4)
+
+  /// Force the price to end in these cents (e.g. 99 -> 19.99). Null = keep.
+  centsEnding     Int?
+  /// Round the whole-unit part up to the next multiple (e.g. 5 -> 19.99 becomes 24.99).
+  roundToMultiple Decimal? @db.Decimal(18, 4)
+  /// Fold the supplier's shipping cost into the item cost before markup.
+  includeShipping Boolean @default(false)
+  /// Guard rails.
+  minPrice Decimal? @db.Decimal(18, 4)
+  maxPrice Decimal? @db.Decimal(18, 4)
+
+  /// Also assign the computed cost to Shopify's "Cost per item" field.
+  syncCostOfGoods Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  shop             Shop              @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  tiers            PricingRuleTier[]
+  importedProducts ImportedProduct[]
+
+  @@index([shopId])
+}
+
+/// Cost-range tiers, evaluated in ascending `minCost` order.
+model PricingRuleTier {
+  id            String @id @default(cuid())
+  pricingRuleId String
+
+  minCost Decimal  @db.Decimal(18, 4)
+  maxCost Decimal? @db.Decimal(18, 4)
+
+  priceOp    PriceOp @default(MULTIPLY)
+  priceValue Decimal @db.Decimal(18, 4)
+
+  compareAtOp    PriceOp  @default(NONE)
+  compareAtValue Decimal? @db.Decimal(18, 4)
+
+  pricingRule PricingRule @relation(fields: [pricingRuleId], references: [id], onDelete: Cascade)
+
+  @@index([pricingRuleId, minCost])
+}
+
+/// Preferred carrier per destination, used by the shipping selector when an
+/// order is routed to a supplier.
+model ShippingPreference {
+  id     String @id @default(cuid())
+  shopId String
+
+  /// ISO-3166 alpha-2, or "*" for the global fallback.
+  countryCode String  @default("*")
+  carrierCode String
+  carrierName String?
+  priority    Int     @default(0)
+
+  maxCost         Decimal? @db.Decimal(18, 4)
+  maxDeliveryDays Int?
+  requireTracking Boolean  @default(false)
+  /// When nothing matches: fall back to the cheapest option or fail the order.
+  isEnabled       Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@unique([shopId, countryCode, carrierCode])
+  @@index([shopId, countryCode, priority])
+}
+
+enum PriceChangeAction {
+  DO_NOTHING
+  UPDATE_PRICE
+  NOTIFY_ONLY
+}
+
+enum StockChangeAction {
+  DO_NOTHING
+  UPDATE_QUANTITY
+  SET_ZERO_WHEN_OUT
+  UNPUBLISH_WHEN_OUT
+  NOTIFY_ONLY
+}
+
+/// Per-shop rules for the price/stock monitor.
+model InventoryPolicy {
+  id     String @id @default(cuid())
+  shopId String @unique
+
+  priceAction   PriceChangeAction @default(NOTIFY_ONLY)
+  /// Ignore supplier price moves smaller than this percentage.
+  priceThresholdPercent Decimal @default(0) @db.Decimal(9, 4)
+
+  stockAction   StockChangeAction @default(SET_ZERO_WHEN_OUT)
+  /// Treat stock at or below this as out of stock.
+  lowStockThreshold Int @default(0)
+  /// Cap what we write to Shopify so a supplier's "9999" doesn't leak through.
+  maxInventoryPushed Int @default(50)
+
+  /// What to do when the supplier product disappears entirely.
+  onProductRemoved StockChangeAction @default(UNPUBLISH_WHEN_OUT)
+
+  syncIntervalMinutes Int      @default(360)
+  lastRunAt           DateTime?
+  isEnabled           Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+}
+
+// -----------------------------------------------------------------------------
+// 8. Fulfilment pipeline
+// -----------------------------------------------------------------------------
+
+/// Internal pipeline state, mirroring the DSers order tabs.
+enum OrderStage {
+  /// Needs mapping / address fixes before it can be ordered.
+  PENDING
+  /// Ready to be placed with the supplier.
+  AWAITING_ORDER
+  /// Placed upstream, waiting for the supplier to take payment.
+  AWAITING_PAYMENT
+  /// Paid, waiting for the supplier to ship.
+  AWAITING_SHIPMENT
+  /// Tracking received, in transit.
+  AWAITING_DELIVERY
+  /// Delivered / fulfilled in Shopify.
+  FULFILLED
+  CANCELED
+  FAILED
+}
+
+model Order {
+  id     String @id @default(cuid())
+  shopId String
+
+  shopifyOrderId  String
+  name            String
+  orderNumber     Int?
+  financialStatus String?
+  fulfillmentStatus String?
+  stage           OrderStage @default(PENDING)
+
+  customerName  String?
+  customerEmail String?
+  phone         String?
+
+  /// Normalised shipping address (see app/domain/orders/address.ts).
+  shippingAddress Json @default("{}")
+  countryCode     String?
+
+  currency      String  @default("USD")
+  totalPrice    Decimal @default(0) @db.Decimal(18, 4)
+  totalShipping Decimal @default(0) @db.Decimal(18, 4)
+  totalTax      Decimal @default(0) @db.Decimal(18, 4)
+  totalDiscount Decimal @default(0) @db.Decimal(18, 4)
+
+  /// Rolled up from the purchase orders once placed.
+  supplierCost     Decimal @default(0) @db.Decimal(18, 4)
+  supplierShipping Decimal @default(0) @db.Decimal(18, 4)
+
+  tags       String[] @default([])
+  note       String?
+  riskLevel  String?
+  isTest     Boolean  @default(false)
+
+  /// Blocking problems that keep the order out of AWAITING_ORDER.
+  issues Json @default("[]")
+
+  placedAt   DateTime?
+  canceledAt DateTime?
+  shopifyCreatedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  shop           Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  lineItems      OrderLineItem[]
+  purchaseOrders PurchaseOrder[]
+
+  @@unique([shopId, shopifyOrderId])
+  @@index([shopId, stage])
+  @@index([shopId, shopifyCreatedAt])
+}
+
+model OrderLineItem {
+  id      String @id @default(cuid())
+  orderId String
+
+  shopifyLineItemId String
+  productVariantId  String?
+
+  title            String
+  variantTitle     String?
+  sku              String?
+  shopifyProductId String?
+  shopifyVariantId String?
+  image            String?
+
+  quantity          Int     @default(1)
+  fulfillableQuantity Int   @default(1)
+  price             Decimal @default(0) @db.Decimal(18, 4)
+  totalDiscount     Decimal @default(0) @db.Decimal(18, 4)
+
+  /// Mapping resolution snapshot, so an order stays reproducible even if the
+  /// mapping is edited later. See app/domain/mapping/resolve.ts.
+  resolution Json @default("{}")
+
+  isFulfilled Boolean @default(false)
+  isCanceled  Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order              Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productVariant     ProductVariant?     @relation(fields: [productVariantId], references: [id], onDelete: SetNull)
+  purchaseOrderItems PurchaseOrderItem[]
+
+  @@unique([orderId, shopifyLineItemId])
+  @@index([orderId])
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  SUBMITTING
+  PLACED
+  AWAITING_PAYMENT
+  PAID
+  SHIPPED
+  DELIVERED
+  CANCELED
+  FAILED
+}
+
+/// One order placed with one supplier. A Shopify order can produce several
+/// (different suppliers, or line items shipping from different warehouses).
+model PurchaseOrder {
+  id                String @id @default(cuid())
+  orderId           String
+  supplierAccountId String?
+
+  platform          SupplierPlatform
+  externalOrderId   String?
+  status            PurchaseOrderStatus @default(DRAFT)
+
+  currency        String  @default("USD")
+  itemsCost       Decimal @default(0) @db.Decimal(18, 4)
+  shippingCost    Decimal @default(0) @db.Decimal(18, 4)
+  totalCost       Decimal @default(0) @db.Decimal(18, 4)
+
+  carrierCode     String?
+  carrierName     String?
+  shipFromCountry String?
+  estimatedDeliveryDays Int?
+
+  /// Free-text note pushed to the supplier ("no invoice, no promotion"...).
+  supplierNote String?
+
+  errorCode    String?
+  errorMessage String?
+  attempts     Int      @default(0)
+  lastAttemptAt DateTime?
+
+  placedAt   DateTime?
+  paidAt     DateTime?
+  shippedAt  DateTime?
+  canceledAt DateTime?
+
+  raw Json @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order           Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  supplierAccount SupplierAccount?    @relation(fields: [supplierAccountId], references: [id], onDelete: SetNull)
+  items           PurchaseOrderItem[]
+  trackings       TrackingNumber[]
+
+  @@index([orderId])
+  @@index([platform, externalOrderId])
+  @@index([status])
+}
+
+model PurchaseOrderItem {
+  id              String @id @default(cuid())
+  purchaseOrderId String
+  orderLineItemId String?
+  supplierVariantId String?
+
+  externalProductId String?
+  externalSkuId     String?
+  title             String
+  quantity          Int     @default(1)
+  unitCost          Decimal @default(0) @db.Decimal(18, 4)
+  currency          String  @default("USD")
+
+  purchaseOrder   PurchaseOrder    @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  orderLineItem   OrderLineItem?   @relation(fields: [orderLineItemId], references: [id], onDelete: SetNull)
+  supplierVariant SupplierVariant? @relation(fields: [supplierVariantId], references: [id], onDelete: SetNull)
+
+  @@index([purchaseOrderId])
+}
+
+model TrackingNumber {
+  id              String @id @default(cuid())
+  purchaseOrderId String
+
+  number       String
+  carrierCode  String?
+  carrierName  String?
+  trackingUrl  String?
+
+  syncedToShopify        Boolean   @default(false)
+  syncedAt               DateTime?
+  shopifyFulfillmentId   String?
+  syncError              String?
+  /// Whether Shopify should email the customer when we create the fulfilment.
+  notifyCustomer         Boolean   @default(true)
+
+  status        String?
+  lastCheckedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+
+  @@unique([purchaseOrderId, number])
+  @@index([syncedToShopify])
+}
+
+// -----------------------------------------------------------------------------
+// 9. Operations
+// -----------------------------------------------------------------------------
+
+enum JobStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELED
+}
+
+/// Durable record of a background task, so the UI can show progress for
+/// long-running bulk operations (push 200 products, place 500 orders...).
+model JobRun {
+  id     String @id @default(cuid())
+  shopId String?
+
+  type      String
+  status    JobStatus @default(QUEUED)
+  queueJobId String?
+
+  total     Int @default(0)
+  processed Int @default(0)
+  succeeded Int @default(0)
+  failed    Int @default(0)
+
+  payload Json @default("{}")
+  result  Json @default("{}")
+  error   String?
+
+  startedAt  DateTime?
+  finishedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  shop Shop? @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, type, status])
+  @@index([status])
+}
+
+model ActivityLog {
+  id     String @id @default(cuid())
+  shopId String
+
+  actor   String  @default("system")
+  action  String
+  entity  String?
+  entityId String?
+  level   String  @default("info")
+  message String
+  meta    Json    @default("{}")
+
+  createdAt DateTime @default(now())
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, createdAt])
+  @@index([shopId, entity, entityId])
+}
+
+model Notification {
+  id     String @id @default(cuid())
+  shopId String
+
+  type     String
+  severity String  @default("info")
+  title    String
+  body     String?
+  link     String?
+  meta     Json    @default("{}")
+
+  readAt     DateTime?
+  archivedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, readAt])
+}
+
+/// Webhook de-duplication. Shopify retries, and at-least-once delivery would
+/// otherwise place duplicate supplier orders.
+model WebhookEvent {
+  id        String   @id @default(cuid())
+  shopId    String?
+  topic     String
+  webhookId String   @unique
+  payload   Json     @default("{}")
+  processedAt DateTime?
+  error     String?
+  createdAt DateTime @default(now())
+
+  shop Shop? @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([topic, createdAt])
+}
+
+model CurrencyRate {
+  id       String   @id @default(cuid())
+  base     String
+  quote    String
+  rate     Decimal  @db.Decimal(18, 8)
+  fetchedAt DateTime @default(now())
+
+  @@unique([base, quote])
+}
+
+/// Point-in-time supplier cost, used to detect price drift and to show a
+/// cost history on the product page.
+model SupplierPriceSnapshot {
+  id                String @id @default(cuid())
+  supplierProductId String
+  externalSkuId     String
+
+  price    Decimal @db.Decimal(18, 4)
+  currency String  @default("USD")
+  stock    Int     @default(0)
+
+  capturedAt DateTime @default(now())
+
+  supplierProduct SupplierProduct @relation(fields: [supplierProductId], references: [id], onDelete: Cascade)
+
+  @@index([supplierProductId, externalSkuId, capturedAt])
+}
+
+/// Pre-aggregated daily numbers behind the Reports page.
+model DailyMetric {
+  id     String   @id @default(cuid())
+  shopId String
+  day    DateTime @db.Date
+
+  orders        Int     @default(0)
+  itemsSold     Int     @default(0)
+  revenue       Decimal @default(0) @db.Decimal(18, 4)
+  productCost   Decimal @default(0) @db.Decimal(18, 4)
+  shippingCost  Decimal @default(0) @db.Decimal(18, 4)
+  profit        Decimal @default(0) @db.Decimal(18, 4)
+  currency      String  @default("USD")
+
+  ordersPlaced   Int @default(0)
+  ordersFulfilled Int @default(0)
+  ordersFailed   Int @default(0)
+
+  updatedAt DateTime @updatedAt
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@unique([shopId, day])
+  @@index([shopId, day])
+}
