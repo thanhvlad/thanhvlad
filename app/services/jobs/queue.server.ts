@@ -149,11 +149,27 @@ export async function shutdownQueue() {
   connection = null;
 }
 
-export async function queueStats() {
+export interface QueueStats {
+  mode: "inline" | "redis";
+  waiting: number;
+  active: number;
+  delayed: number;
+  failed: number;
+  completed: number;
+}
+
+export async function queueStats(): Promise<QueueStats> {
   const q = getQueue();
-  if (!q) return { mode: "inline" as const };
+  if (!q) return { mode: "inline", waiting: 0, active: 0, delayed: 0, failed: 0, completed: 0 };
   const counts = await q.getJobCounts("waiting", "active", "delayed", "failed", "completed");
-  return { mode: "redis" as const, ...counts };
+  return {
+    mode: "redis",
+    waiting: counts.waiting ?? 0,
+    active: counts.active ?? 0,
+    delayed: counts.delayed ?? 0,
+    failed: counts.failed ?? 0,
+    completed: counts.completed ?? 0,
+  };
 }
 
 function sanitizeJobId(key: string) {
