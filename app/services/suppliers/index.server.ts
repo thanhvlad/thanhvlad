@@ -134,6 +134,8 @@ export function detectPlatform(reference: string): { platform: SupplierPlatform;
   if (/aliexpress/i.test(trimmed) && ali) return { platform: "ALIEXPRESS", externalId: ali };
   const cj = new CjDropshippingAdapter().parseProductReference(trimmed);
   if (cj) return { platform: "CJ_DROPSHIPPING", externalId: cj };
-  if (ali) return { platform: env().SUPPLIER_DRIVER === "mock" ? "MOCK" : "ALIEXPRESS", externalId: ali };
+  // A bare numeric id is treated as AliExpress regardless of driver, so the
+  // same product resolves to one cached row whether pasted as URL or id.
+  if (ali) return { platform: "ALIEXPRESS", externalId: ali };
   return null;
 }

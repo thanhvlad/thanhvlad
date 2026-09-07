@@ -150,7 +150,12 @@ export function registerAllHandlers() {
   });
 
   registerHandler("scheduler-tick", async ({ kind }) => {
-    const shops = await prisma.shop.findMany({ where: { isActive: true }, select: { id: true, inventoryPolicy: { select: { isEnabled: true, syncIntervalMinutes: true, lastRunAt: true } }, settings: true } });
+    // Only shops with an offline Shopify session can be worked on; a Shop row
+    // without one (seeded demo data, half-finished install) would just fail.
+    const installed = new Set((await prisma.session.findMany({ select: { shop: true }, distinct: ["shop"] })).map((s) => s.shop));
+    const shops = (
+      await prisma.shop.findMany({ where: { isActive: true }, select: { id: true, domain: true, inventoryPolicy: { select: { isEnabled: true, syncIntervalMinutes: true, lastRunAt: true } }, settings: true } })
+    ).filter((shop) => installed.has(shop.domain));
     for (const shop of shops) {
       switch (kind) {
         case "purchase-orders":

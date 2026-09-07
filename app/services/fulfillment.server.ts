@@ -413,7 +413,9 @@ export async function syncPurchaseOrder(shop: ShopWithSettings, purchaseOrderId:
   await evaluateAndStoreOrder(shop, po.orderId);
 
   if (newTracking > 0 && shop.parsedSettings.fulfillment.autoFulfill) {
-    await syncPendingTracking(shop, po.id);
+    // Fulfilment needs an offline Shopify session; if it is missing the
+    // tracking stays queued for the periodic sync-tracking job.
+    await syncPendingTracking(shop, po.id).catch((error) => logger.warn("Tracking sync deferred", { purchaseOrderId, error }));
   }
   return { changed, status, newTracking };
 }
