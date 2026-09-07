@@ -199,7 +199,7 @@ export function planVariantSync(
       });
     } else if (policy.priceAction === "UPDATE_PRICE" && pricingRule) {
       const computed = computePrice(pricingRule, {
-        cost: newCost,
+        cost: newCost.toString(),
         shippingCost: supplier.shippingCost ?? 0,
       });
       const priceChanged = !d(computed.price).equals(d(input.currentPrice));
