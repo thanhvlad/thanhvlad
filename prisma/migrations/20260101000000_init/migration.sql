@@ -86,6 +86,7 @@ CREATE TABLE "Shop" (
     "uninstalledAt" TIMESTAMP(3),
     "isActive" BOOLEAN NOT NULL DEFAULT true,
     "onboardingStep" TEXT NOT NULL DEFAULT 'connect_supplier',
+    "apiToken" TEXT,
     "settings" JSONB NOT NULL DEFAULT '{}',
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
@@ -638,6 +639,9 @@ CREATE INDEX "Session_shop_idx" ON "Session"("shop");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Shop_domain_key" ON "Shop"("domain");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Shop_apiToken_key" ON "Shop"("apiToken");
 
 -- CreateIndex
 CREATE INDEX "Shop_accountId_idx" ON "Shop"("accountId");

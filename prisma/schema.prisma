@@ -94,6 +94,8 @@ model Shop {
   uninstalledAt DateTime?
   isActive      Boolean   @default(true)
   onboardingStep String   @default("connect_supplier")
+  /// Bearer token for the browser extension / public import API.
+  apiToken      String?   @unique
 
   /// Free-form UI/behaviour preferences (see app/domain/settings/shop-settings.ts).
   settings Json @default("{}")

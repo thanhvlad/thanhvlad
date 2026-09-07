@@ -4,6 +4,11 @@ import { RemixServer } from "@remix-run/react";
 import { createReadableStreamFromReadable, type EntryContext } from "@remix-run/node";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
+import { bootJobs } from "./services/jobs/index.server";
+
+// Register job handlers (and start the in-process worker when configured)
+// as soon as the server module loads.
+bootJobs();
 
 export const streamTimeout = 5000;
 
