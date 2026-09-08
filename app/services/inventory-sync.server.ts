@@ -1,5 +1,5 @@
 import type { Prisma } from "@prisma/client";
-import prisma from "~/db.server";
+import prisma, { chunkedTransaction } from "~/db.server";
 import { planVariantSync, type InventoryPolicyInput, type SyncAction } from "~/domain/inventory/rules";
 import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
@@ -157,7 +157,7 @@ async function applyActions(shop: ShopWithSettings, client: GraphqlClient, produ
       ...priceUpdates.map((a) => ({ id: a.shopifyVariantId, price: a.price!, compareAtPrice: a.compareAtPrice ?? null, cost: a.cost ?? null })),
       ...costUpdates.map((a) => ({ id: a.shopifyVariantId, cost: a.cost ?? null })),
     ]);
-    await prisma.$transaction([
+    await chunkedTransaction([
       ...priceUpdates.map((a) => prisma.productVariant.update({ where: { id: a.productVariantId }, data: { price: a.price!, compareAtPrice: a.compareAtPrice ?? null, cost: a.cost ?? undefined } })),
       ...costUpdates.map((a) => prisma.productVariant.update({ where: { id: a.productVariantId }, data: { cost: a.cost ?? undefined } })),
     ]);
@@ -179,7 +179,7 @@ async function applyActions(shop: ShopWithSettings, client: GraphqlClient, produ
     } else {
       const withItems = inventoryUpdates.filter((a) => a.inventoryItemId);
       await setInventoryQuantities(client, locationId, withItems.map((a) => ({ inventoryItemId: a.inventoryItemId!, quantity: a.quantity ?? 0 })));
-      await prisma.$transaction(withItems.map((a) => prisma.productVariant.update({ where: { id: a.productVariantId }, data: { inventoryQuantity: a.quantity ?? 0 } })));
+      await chunkedTransaction(withItems.map((a) => prisma.productVariant.update({ where: { id: a.productVariantId }, data: { inventoryQuantity: a.quantity ?? 0 } })));
       summary.inventoryUpdates += withItems.length;
       const outOfStock = withItems.filter((a) => (a.quantity ?? 0) === 0);
       if (outOfStock.length && shop.parsedSettings.notifications.onOutOfStock) {

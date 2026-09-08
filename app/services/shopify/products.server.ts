@@ -17,6 +17,14 @@ export interface PushVariantInput {
 }
 
 export interface PushProductInput {
+  /**
+   * Shopify product id to write into, when one already exists.
+   *
+   * `productSet` upserts on this, which is what makes a retry after a failed
+   * push safe: without it the second attempt creates a second listing of the
+   * same item in the merchant's store.
+   */
+  id?: string | null;
   title: string;
   descriptionHtml: string;
   vendor?: string | null;
@@ -138,6 +146,7 @@ export async function createProduct(
   }>(client, PRODUCT_SET_MUTATION, {
     synchronous: true,
     input: {
+      ...(input.id ? { id: input.id } : {}),
       title: input.title,
       descriptionHtml: input.descriptionHtml,
       vendor: input.vendor || undefined,

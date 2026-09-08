@@ -119,13 +119,6 @@ export function evaluateOrder(input: PipelineInput): PipelineResult {
     return { stage: "IGNORED", issues, canPlaceOrder: false, blockedLineItemIds: [] };
   }
 
-  // Every managed line is done. Shopify's own fulfillmentStatus can sit at
-  // "partial" indefinitely because of an unmanaged line (a gift card, a service,
-  // a locally stocked item), so it is not the signal we key on.
-  if (outstanding.length === 0) {
-    return { stage: "FULFILLED", issues, canPlaceOrder: false, blockedLineItemIds: [] };
-  }
-
   // ---- Supplier-side progress ----------------------------------------------
   const covered = input.coveredLineItemIds ? new Set(input.coveredLineItemIds) : null;
   // Without coverage information every outstanding line is assumed covered,
@@ -160,9 +153,13 @@ export function evaluateOrder(input: PipelineInput): PipelineResult {
         return { stage: "FAILED", issues, canPlaceOrder: false, blockedLineItemIds: [] };
       }
     } else if (uncovered.length === 0) {
-      // The whole order is in flight upstream.
+      // The whole order is in flight upstream. Supplier progress decides the
+      // stage even once Shopify's line items are fulfilled: the app creates the
+      // fulfilment the moment tracking arrives, so an order whose parcel is
+      // still in transit would otherwise read as delivered.
+      const allDelivered = live.every((po) => po.status === "DELIVERED");
       const allTerminal = live.every((po) => TERMINAL_PO.includes(po.status));
-      if (allTerminal && input.fulfillmentStatus === "fulfilled") {
+      if (allDelivered || (allTerminal && input.fulfillmentStatus === "fulfilled" && outstanding.length === 0)) {
         return { stage: "FULFILLED", issues, canPlaceOrder: false, blockedLineItemIds: [] };
       }
       if (anyShipped) {
@@ -181,6 +178,14 @@ export function evaluateOrder(input: PipelineInput): PipelineResult {
         message: `${uncovered.length} line item(s) on this order have not been sent to a supplier yet.`,
       });
     }
+  }
+
+  // Every managed line is done and no supplier order is still in flight.
+  // Shopify's own fulfillmentStatus can sit at "partial" indefinitely because of
+  // an unmanaged line (a gift card, a service, a locally stocked item), so it is
+  // not the signal we key on.
+  if (outstanding.length === 0) {
+    return { stage: "FULFILLED", issues, canPlaceOrder: false, blockedLineItemIds: [] };
   }
 
   // ---- Local readiness checks ----------------------------------------------

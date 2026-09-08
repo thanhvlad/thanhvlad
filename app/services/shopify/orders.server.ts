@@ -288,18 +288,38 @@ export interface CreateFulfillmentInput {
   orderId: string;
   /** Shopify line item ids to fulfil with their quantities. */
   items: Array<{ lineItemId: string; quantity: number }>;
-  tracking: { number: string; company?: string | null; url?: string | null };
+  /**
+   * Tracking numbers for this shipment. A supplier order that ships as several
+   * parcels produces several numbers for the same set of line items, and Shopify
+   * takes them all on one fulfilment.
+   */
+  tracking: { numbers: string[]; company?: string | null; urls?: string[] };
   notifyCustomer: boolean;
+}
+
+export interface CreateFulfillmentResult {
+  id: string | null;
+  skipped: boolean;
+  reason: string | null;
+  /** What Shopify actually accepted, per Shopify line item id. */
+  fulfilled: Record<string, number>;
 }
 
 /**
  * Create a fulfilment for the given line items with tracking. Handles the
  * fulfilment-order indirection Shopify requires: find the fulfilment orders
  * that hold those line items and fulfil the matching quantities.
+ *
+ * The quantities Shopify accepted are returned, because they can be lower than
+ * what was asked for. The caller decrements by those, never by the whole line.
  */
-export async function createFulfillmentWithTracking(client: GraphqlClient, input: CreateFulfillmentInput) {
+export async function createFulfillmentWithTracking(
+  client: GraphqlClient,
+  input: CreateFulfillmentInput,
+): Promise<CreateFulfillmentResult> {
   const fulfillmentOrders = await fetchFulfillmentOrders(client, input.orderId);
   const wanted = new Map(input.items.map((i) => [i.lineItemId, i.quantity]));
+  const fulfilled: Record<string, number> = {};
 
   const lineItemsByFulfillmentOrder = fulfillmentOrders
     .filter((fo) => ["OPEN", "IN_PROGRESS"].includes(fo.status))
@@ -307,18 +327,21 @@ export async function createFulfillmentWithTracking(client: GraphqlClient, input
       fulfillmentOrderId: fo.id,
       fulfillmentOrderLineItems: fo.lineItems
         .filter((li) => wanted.has(li.lineItemId) && li.remainingQuantity > 0)
-        .map((li) => ({
-          id: li.id,
-          quantity: Math.min(li.remainingQuantity, wanted.get(li.lineItemId) ?? 0),
-        }))
+        .map((li) => {
+          const quantity = Math.min(li.remainingQuantity, wanted.get(li.lineItemId) ?? 0);
+          if (quantity > 0) fulfilled[li.lineItemId] = (fulfilled[li.lineItemId] ?? 0) + quantity;
+          return { id: li.id, quantity };
+        })
         .filter((li) => li.quantity > 0),
     }))
     .filter((fo) => fo.fulfillmentOrderLineItems.length > 0);
 
   if (lineItemsByFulfillmentOrder.length === 0) {
-    return { id: null as string | null, skipped: true as const, reason: "Nothing left to fulfil for these items." };
+    return { id: null, skipped: true, reason: "Nothing left to fulfil for these items.", fulfilled: {} };
   }
 
+  const numbers = [...new Set(input.tracking.numbers.filter(Boolean))];
+  const urls = (input.tracking.urls ?? []).filter(Boolean);
   const data = await gql<{
     fulfillmentCreate: { fulfillment: { id: string; status: string } | null; userErrors: UserError[] };
   }>(client, FULFILLMENT_CREATE, {
@@ -326,14 +349,14 @@ export async function createFulfillmentWithTracking(client: GraphqlClient, input
       lineItemsByFulfillmentOrder,
       notifyCustomer: input.notifyCustomer,
       trackingInfo: {
-        number: input.tracking.number,
+        numbers,
         company: input.tracking.company ?? undefined,
-        url: input.tracking.url ?? undefined,
+        urls: urls.length ? urls : undefined,
       },
     },
   });
   assertNoUserErrors(data.fulfillmentCreate.userErrors, "fulfillmentCreate");
-  return { id: data.fulfillmentCreate.fulfillment?.id ?? null, skipped: false as const, reason: null };
+  return { id: data.fulfillmentCreate.fulfillment?.id ?? null, skipped: false, reason: null, fulfilled };
 }
 
 const FULFILLMENT_TRACKING_UPDATE = `#graphql
@@ -345,12 +368,21 @@ const FULFILLMENT_TRACKING_UPDATE = `#graphql
   }
 `;
 
+/**
+ * Set the tracking numbers on an existing fulfilment.
+ *
+ * Shopify *replaces* the tracking set rather than appending to it, so callers
+ * must pass every number the fulfilment should end up with — that is how a
+ * second parcel for an already-fulfilled shipment reaches the customer.
+ */
 export async function updateFulfillmentTracking(
   client: GraphqlClient,
   fulfillmentId: string,
-  tracking: { number: string; company?: string | null; url?: string | null },
+  tracking: { numbers: string[]; company?: string | null; urls?: string[] },
   notifyCustomer = false,
 ) {
+  const numbers = [...new Set(tracking.numbers.filter(Boolean))];
+  const urls = (tracking.urls ?? []).filter(Boolean);
   const data = await gql<{ fulfillmentTrackingInfoUpdate: { userErrors: UserError[] } }>(
     client,
     FULFILLMENT_TRACKING_UPDATE,
@@ -358,9 +390,9 @@ export async function updateFulfillmentTracking(
       fulfillmentId,
       notifyCustomer,
       trackingInfoInput: {
-        number: tracking.number,
+        numbers,
         company: tracking.company ?? undefined,
-        url: tracking.url ?? undefined,
+        urls: urls.length ? urls : undefined,
       },
     },
   );

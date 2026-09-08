@@ -334,6 +334,11 @@ model ImportedProduct {
 
   status      ImportStatus @default(DRAFT)
   pushedProductId String?
+  /// The Shopify product this row created, recorded the moment Shopify answers
+  /// and before the local mirror is written. A push that fails after Shopify
+  /// has created the product would otherwise orphan it, and the retry would
+  /// create a second listing of the same item.
+  shopifyProductId String?
   pushError   String?
   pushedAt    DateTime?
 
@@ -796,10 +801,24 @@ model PurchaseOrder {
   externalOrderId   String?
   status            PurchaseOrderStatus @default(DRAFT)
 
+  /// Stable across retries and sent upstream as the supplier's own order
+  /// reference, so a retry after a lost response cannot place a second order.
+  /// Derived from the Shopify order, the platform and the line items it covers.
+  idempotencyKey String?
+
   currency        String  @default("USD")
   itemsCost       Decimal @default(0) @db.Decimal(18, 4)
   shippingCost    Decimal @default(0) @db.Decimal(18, 4)
   totalCost       Decimal @default(0) @db.Decimal(18, 4)
+
+  /// The same amounts converted to the shop's currency at placement time.
+  /// Order-level totals are summed from these: adding a USD purchase order to a
+  /// CNY one and calling the result GBP is how a profit report goes wrong.
+  shopCurrency     String?
+  shopItemsCost    Decimal? @db.Decimal(18, 4)
+  shopShippingCost Decimal? @db.Decimal(18, 4)
+  /// Rate used for that conversion, for the audit trail.
+  fxRate           Decimal? @db.Decimal(18, 8)
 
   carrierCode     String?
   carrierName     String?
@@ -838,6 +857,7 @@ model PurchaseOrder {
   items           PurchaseOrderItem[]
   trackings       TrackingNumber[]
 
+  @@unique([orderId, idempotencyKey])
   @@index([orderId])
   @@index([platform, externalOrderId])
   @@index([status])
@@ -858,11 +878,20 @@ model PurchaseOrderItem {
   unitCost          Decimal @default(0) @db.Decimal(18, 4)
   currency          String  @default("USD")
 
+  /// Chosen per item: two products on one platform routinely ship from
+  /// different warehouses and support different carriers.
+  carrierCode       String?
+  carrierName       String?
+  shipFromCountry   String?
+  estimatedDeliveryDays Int?
+  shippingCost      Decimal? @db.Decimal(18, 4)
+
   purchaseOrder   PurchaseOrder    @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
   orderLineItem   OrderLineItem?   @relation(fields: [orderLineItemId], references: [id], onDelete: SetNull)
   supplierVariant SupplierVariant? @relation(fields: [supplierVariantId], references: [id], onDelete: SetNull)
 
   @@index([purchaseOrderId])
+  @@index([orderLineItemId])
 }
 
 model TrackingNumber {
@@ -880,6 +909,11 @@ model TrackingNumber {
   syncError              String?
   /// Whether Shopify should email the customer when we create the fulfilment.
   notifyCustomer         Boolean   @default(true)
+
+  /// Quantities Shopify accepted for this tracking, keyed by Shopify line item
+  /// id. A supplier order that ships in several parcels must not re-fulfil the
+  /// whole order once per parcel.
+  fulfilledQuantities Json @default("{}")
 
   status        String?
   lastCheckedAt DateTime?

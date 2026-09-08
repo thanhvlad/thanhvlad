@@ -99,6 +99,8 @@ function respond(operation: string, variables: Record<string, unknown>, fake: Fa
       };
     case "DropshipFulfillmentCreate":
       return { fulfillmentCreate: { fulfillment: { id: nextId("Fulfillment"), status: "SUCCESS", trackingInfo: [] }, userErrors: [] } };
+    case "DropshipTrackingUpdate":
+      return { fulfillmentTrackingInfoUpdate: { fulfillment: { id: String(variables.fulfillmentId ?? "") }, userErrors: [] } };
     default:
       return {};
   }

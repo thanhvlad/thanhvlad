@@ -1,5 +1,5 @@
 import type { Prisma } from "@prisma/client";
-import prisma from "~/db.server";
+import prisma, { chunkedTransaction } from "~/db.server";
 import { computePrice } from "~/domain/pricing/engine";
 import { money } from "~/lib/money";
 import { logActivity } from "./activity.server";
@@ -156,7 +156,7 @@ export async function repriceProduct(shop: ShopWithSettings, client: GraphqlClie
   }
   if (updates.length === 0) return 0;
   await updateVariantPrices(client, product.shopifyProductId, updates);
-  await prisma.$transaction(local.map((u) => prisma.productVariant.update({ where: { id: u.id }, data: { price: u.price, compareAtPrice: u.compareAtPrice, cost: u.cost } })));
+  await chunkedTransaction(local.map((u) => prisma.productVariant.update({ where: { id: u.id }, data: { price: u.price, compareAtPrice: u.compareAtPrice, cost: u.cost } })));
   await logActivity(shop.id, { actor, action: "product.repriced", entity: "Product", entityId: productId, message: `"${product.title}" repriced (${updates.length} variants).` });
   return updates.length;
 }

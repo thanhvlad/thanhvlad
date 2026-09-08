@@ -25,8 +25,19 @@ export async function createJobRun(input: {
   });
 }
 
+/**
+ * Mark a run as started.
+ *
+ * The counters are reset: the queue retries a failed job up to three times with
+ * the same JobRun id, and handlers loop over the full id list on each attempt,
+ * so carrying the previous attempt's counts forward showed the merchant a
+ * progress bar past 100% and a meaningless succeeded/failed split.
+ */
 export async function startJobRun(id: string) {
-  return prisma.jobRun.update({ where: { id }, data: { status: "RUNNING", startedAt: new Date() } });
+  return prisma.jobRun.update({
+    where: { id },
+    data: { status: "RUNNING", startedAt: new Date(), processed: 0, succeeded: 0, failed: 0, error: null },
+  });
 }
 
 export async function progressJobRun(

@@ -115,8 +115,26 @@ export async function processWebhookEvent(webhookEventId: string) {
         break;
       }
       case "SHOP_REDACT": {
+        // Deleting the Shop row is not erasure on its own. Session rows are
+        // keyed by the raw domain with no relation to Shop, so no cascade
+        // reaches them and the store's live access token would survive a
+        // request for erasure; the Account row and its account-scoped supplier
+        // tokens are orphaned the same way.
+        const { domain, accountId } = shop;
+        await prisma.session.deleteMany({ where: { shop: domain } });
         await prisma.shop.delete({ where: { id: shop.id } }).catch(() => undefined);
-        break;
+        if (accountId) {
+          const remaining = await prisma.shop.count({ where: { accountId } });
+          if (remaining === 0) {
+            // Cascades to StaffAccount and the account-scoped SupplierAccount
+            // rows holding encrypted supplier tokens.
+            await prisma.account.delete({ where: { id: accountId } }).catch(() => undefined);
+          }
+        }
+        await logActivity(shop.id, { action: "gdpr.shop_redact", message: `Store ${domain} redacted.` }).catch(() => undefined);
+        // The WebhookEvent row cascaded away with the Shop, so there is nothing
+        // left to mark processed.
+        return;
       }
       default:
         logger.info("Unhandled webhook topic", { topic: event.topic });
@@ -125,7 +143,10 @@ export async function processWebhookEvent(webhookEventId: string) {
     await prisma.webhookEvent.update({ where: { id: event.id }, data: { processedAt: new Date(), error: null } });
   } catch (error) {
     logger.error("Webhook processing failed", { topic: event.topic, id: event.id, error });
-    await prisma.webhookEvent.update({ where: { id: event.id }, data: { error: errorMessage(error) } });
+    // The row may be gone (a redaction cascaded it away, or the shop was
+    // uninstalled mid-flight); updateMany makes that a no-op instead of a
+    // second, uncaught P2025 that fails the job through every retry.
+    await prisma.webhookEvent.updateMany({ where: { id: event.id }, data: { error: errorMessage(error) } });
     throw error;
   }
 }

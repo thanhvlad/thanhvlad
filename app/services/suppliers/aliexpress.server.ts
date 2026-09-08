@@ -587,6 +587,10 @@ export class AliExpressAdapter implements SupplierAdapter {
         // charges the account, so it stays off.
         try_to_pay: "false",
       },
+      // Our own reference for this purchase order. It is stable across retries,
+      // so a retry after a lost response is recognisable as the same order
+      // rather than placed a second time.
+      out_order_id: input.reference,
       trade_extra_param: { business_model: "retail" },
       ...(this.trackingId ? { promotion: { promotion_channel_info: this.trackingId } } : {}),
     };

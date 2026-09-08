@@ -138,11 +138,23 @@ function toAddressJson(address: ShopifyOrderSnapshot["shippingAddress"], snapsho
  * the pipeline stage. Persists issues and per-line resolutions.
  */
 export async function evaluateAndStoreOrder(shop: ShopWithSettings, orderId: string): Promise<Order> {
-  const order = await prisma.order.findUnique({ where: { id: orderId }, include: { lineItems: true, purchaseOrders: { include: { trackings: { select: { id: true } } } } } });
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    include: {
+      lineItems: true,
+      purchaseOrders: {
+        include: { trackings: { select: { id: true } }, items: { select: { orderLineItemId: true } } },
+      },
+    },
+  });
   if (!order) throw new Error("Order not found");
   const settings = shop.parsedSettings.orders;
 
-  let address = order.shippingAddress as ShippingAddress;
+  const stored = order.shippingAddress as ShippingAddress;
+  // The fallback phone is applied to the copy the supplier order is built from,
+  // never to the stored record. Writing it back destroyed the customer's real
+  // number irreversibly, and support could no longer reach the buyer.
+  let address = stored;
   if (settings.overridePhone && settings.phoneFallback) address = { ...address, phone: settings.phoneFallback };
   else if (!address.phone && settings.phoneFallback) address = { ...address, phone: settings.phoneFallback };
   let validation = validateAddress(address, { requireLatin: true });
@@ -186,6 +198,17 @@ export async function evaluateAndStoreOrder(shop: ShopWithSettings, orderId: str
     }),
     addressIssues: validation.issues,
     purchaseOrders: order.purchaseOrders.map((po) => ({ status: po.status as PurchaseOrderStatus, hasTracking: po.trackings.length > 0 })),
+    // Which lines a live purchase order actually covers. Without it a
+    // partly-ordered order reads as fully in flight and the lines nobody
+    // ordered are never placed and never flagged.
+    coveredLineItemIds: [
+      ...new Set(
+        order.purchaseOrders
+          .filter((po) => !["FAILED", "CANCELED", "DRAFT"].includes(po.status))
+          .flatMap((po) => po.items.map((i) => i.orderLineItemId))
+          .filter((id): id is string => Boolean(id)),
+      ),
+    ],
     settings: {
       requirePaidOrder: settings.requirePaidOrder,
       blockHighRisk: settings.blockHighRisk,
@@ -194,22 +217,55 @@ export async function evaluateAndStoreOrder(shop: ShopWithSettings, orderId: str
     riskLevel: order.riskLevel,
   });
 
-  await prisma.$transaction([
-    ...lineResults.map((r) =>
-      prisma.orderLineItem.update({ where: { id: r.id }, data: { resolution: (r.resolution ?? {}) as unknown as Prisma.InputJsonValue } }),
-    ),
-    prisma.order.update({
+  const persistedAddress = {
+    ...(order.shippingAddress as object),
+    ...validation.normalized,
+    // Whatever the fallback did for validation, the record keeps the customer's
+    // own number.
+    phone: stored.phone ?? null,
+  } as Prisma.InputJsonValue;
+
+  // Serialised per order. Shopify delivers ORDERS_PAID and ORDERS_FULFILLED
+  // milliseconds apart and the worker runs several jobs at once, so without the
+  // lock the slower evaluation commits last and overwrites the newer stage with
+  // its own stale reading, parking the order in the wrong tab for good.
+  await prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${order.id}))`;
+    for (const r of lineResults) {
+      // A line the evaluator deliberately skipped (unmanaged, cancelled, already
+      // fulfilled) keeps the snapshot it was fulfilled under. Overwriting it
+      // with {} erased the record of which SKU and unit cost the order actually
+      // used, exactly when a dispute needs it.
+      if (r.resolution === null) continue;
+      await tx.orderLineItem.update({
+        where: { id: r.id },
+        data: { resolution: r.resolution as unknown as Prisma.InputJsonValue },
+      });
+    }
+    await tx.order.update({
       where: { id: order.id },
       data: {
         stage: evaluation.stage as OrderStage,
         issues: evaluation.issues as unknown as Prisma.InputJsonValue,
-        shippingAddress: { ...(order.shippingAddress as object), ...validation.normalized } as Prisma.InputJsonValue,
+        shippingAddress: persistedAddress,
         countryCode: validation.normalized.countryCode ?? order.countryCode,
       },
-    }),
-  ]);
+    });
+  });
 
   return (await prisma.order.findUnique({ where: { id: order.id } }))!;
+}
+
+/**
+ * The address to send to a supplier: the stored record plus the merchant's
+ * phone-fallback rules, applied here rather than baked into the record.
+ */
+export function supplierAddressFor(order: { shippingAddress: unknown }, settings: ShopWithSettings["parsedSettings"]["orders"]): ShippingAddress {
+  const address = order.shippingAddress as ShippingAddress;
+  if (settings.phoneFallback && (settings.overridePhone || !address.phone)) {
+    return { ...address, phone: settings.phoneFallback };
+  }
+  return address;
 }
 
 /** Pull recent orders from Shopify (initial sync / manual "sync orders"). */

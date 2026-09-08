@@ -256,4 +256,131 @@ describe.skipIf(!TEST_DB)("full dropshipping flow (postgres + mock supplier)", (
     const notifications = await listNotifications(shop.id);
     expect(notifications.length).toBeGreaterThan(0);
   });
+
+  // -------------------------------------------------------------------------
+  // Regressions from the pre-launch audit
+  // -------------------------------------------------------------------------
+
+  /** A minimal paid, mapped, US order, ready to place. */
+  async function orderSnapshot(over: { id: string; name: string; lineItemId: string }) {
+    const product = await prisma.product.findUniqueOrThrow({ where: { id: productId }, include: { variants: true } });
+    const variant = product.variants[1];
+    return {
+      id: over.id,
+      name: over.name,
+      orderNumber: Number(over.name.replace("#", "")),
+      createdAt: new Date().toISOString(),
+      cancelledAt: null,
+      displayFinancialStatus: "PAID",
+      displayFulfillmentStatus: "UNFULFILLED",
+      email: "jane@example.com",
+      phone: null,
+      note: null,
+      tags: [],
+      test: false,
+      riskLevel: "LOW",
+      currencyCode: "USD",
+      totalPrice: "22.99",
+      totalShipping: "0.00",
+      totalTax: "0.00",
+      totalDiscounts: "0.00",
+      customer: { firstName: "Jane", lastName: "Doe", email: "jane@example.com", phone: null },
+      customAttributes: [],
+      shippingAddress: {
+        firstName: "Jane", lastName: "Doe", name: "Jane Doe", company: null,
+        address1: "123 Main St", address2: null, city: "Austin", province: "Texas",
+        provinceCode: "TX", zip: "78701", country: "United States", countryCodeV2: "US",
+        phone: "+15125550100",
+      },
+      lineItems: [
+        {
+          id: over.lineItemId, title: product.title, variantTitle: variant.title, sku: variant.sku,
+          quantity: 1, unfulfilledQuantity: 1, productId: product.shopifyProductId,
+          variantId: variant.shopifyVariantId, image: null, price: "22.99", totalDiscount: "0",
+          requiresShipping: true,
+        },
+      ],
+    };
+  }
+
+  it("never places the same supplier order twice, even from concurrent callers", async () => {
+    const { placeSupplierOrders } = await import("~/services/fulfillment.server");
+    const { upsertOrderFromSnapshot } = await import("~/services/orders.server");
+    const snapshot = await orderSnapshot({ id: "gid://shopify/Order/9101", name: "#9101", lineItemId: "gid://shopify/LineItem/9101" });
+    const order = await upsertOrderFromSnapshot(shop, snapshot);
+    expect(order.stage).toBe("AWAITING_ORDER");
+
+    // The scheduler tick and the merchant's button, at the same moment.
+    const [a, b] = await Promise.all([
+      placeSupplierOrders(shop, order.id, { actor: "auto-place" }),
+      placeSupplierOrders(shop, order.id, { actor: "merchant" }),
+    ]);
+
+    expect(a.ok && b.ok).toBe(true);
+    const pos = await prisma.purchaseOrder.findMany({ where: { orderId: order.id } });
+    expect(pos).toHaveLength(1);
+    // Both callers report the same purchase order.
+    expect(new Set([...a.purchaseOrderIds, ...b.purchaseOrderIds]).size).toBe(1);
+    // The reference sent upstream is stable, not a fresh id per attempt.
+    expect(pos[0].idempotencyKey).toMatch(/^dh-/);
+  });
+
+  it("keeps the customer's own phone number in the stored order", async () => {
+    const { updateShopSettings, getShopById } = await import("~/services/shop.server");
+    const { upsertOrderFromSnapshot } = await import("~/services/orders.server");
+    const { mergeShopSettings } = await import("~/domain/settings/shop-settings");
+
+    const withOverride = await getShopById(shop.id);
+    await updateShopSettings(
+      shop.id,
+      mergeShopSettings(withOverride!.settings, { orders: { overridePhone: true, phoneFallback: "+15550000000" } }),
+    );
+    const overridden = (await getShopById(shop.id))!;
+
+    const snapshot = await orderSnapshot({ id: "gid://shopify/Order/9102", name: "#9102", lineItemId: "gid://shopify/LineItem/9102" });
+    const order = await upsertOrderFromSnapshot(overridden, snapshot);
+    const stored = (await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).shippingAddress as { phone?: string };
+    expect(stored.phone).toBe("+15125550100");
+
+    // The supplier still gets the fallback.
+    const { supplierAddressFor } = await import("~/services/orders.server");
+    expect(supplierAddressFor({ shippingAddress: stored }, overridden.parsedSettings.orders).phone).toBe("+15550000000");
+
+    await updateShopSettings(
+      shop.id,
+      mergeShopSettings(overridden.settings, { orders: { overridePhone: false, phoneFallback: "" } }),
+    );
+  });
+
+  it("attaches a second parcel's tracking instead of re-fulfilling the order", async () => {
+    const { addManualTracking } = await import("~/services/fulfillment.server");
+    const before = fake.calls.filter((c) => c.operation === "DropshipFulfillmentCreate").length;
+
+    await addManualTracking(shop, purchaseOrderId, { number: "LP987654321CN", carrierName: "AliExpress Standard" });
+
+    const after = fake.calls.filter((c) => c.operation === "DropshipFulfillmentCreate").length;
+    // No second fulfilment: the line items were already fulfilled by the first.
+    expect(after).toBe(before);
+    const trackings = await prisma.trackingNumber.findMany({ where: { purchaseOrderId }, orderBy: { createdAt: "asc" } });
+    expect(trackings).toHaveLength(2);
+    // Both are attached to the same Shopify fulfilment, so the customer sees both.
+    expect(trackings[1].syncedToShopify).toBe(true);
+    expect(trackings[1].shopifyFulfillmentId).toBe(trackings[0].shopifyFulfillmentId);
+    expect(fake.calls.some((c) => c.operation === "DropshipTrackingUpdate")).toBe(true);
+  });
+
+  it("keeps the resolution snapshot on a line the evaluator skips", async () => {
+    const { evaluateAndStoreOrder } = await import("~/services/orders.server");
+    const line = await prisma.orderLineItem.findFirstOrThrow({
+      where: { orderId, shopifyLineItemId: "gid://shopify/LineItem/1" },
+    });
+    expect(line.isFulfilled).toBe(true);
+    const snapshot = line.resolution as { ok?: boolean; lines?: unknown[] };
+    expect(snapshot?.ok).toBe(true);
+
+    await evaluateAndStoreOrder(shop, orderId);
+
+    const after = await prisma.orderLineItem.findUniqueOrThrow({ where: { id: line.id } });
+    expect(after.resolution).toEqual(line.resolution);
+  });
 });

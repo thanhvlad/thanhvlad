@@ -1,5 +1,5 @@
 import type { ImportStatus, ImportedProduct, ImportedVariant, Prisma, SupplierProduct, SupplierVariant } from "@prisma/client";
-import prisma from "~/db.server";
+import prisma, { chunkedTransaction } from "~/db.server";
 import { computePrice } from "~/domain/pricing/engine";
 import type { PricingRuleInput } from "~/domain/pricing/types";
 import { errorMessage } from "~/lib/errors";
@@ -68,9 +68,9 @@ export async function addToImportList(
   const created = existing
     ? await prisma.importedProduct.update({
         where: { id: existing.id },
-        data: { ...data, status: "DRAFT", pushError: null, pushedAt: null, pushedProductId: null, variants: { deleteMany: {}, create: variants } },
+        data: { ...data, status: "DRAFT", pushError: null, pushedAt: null, pushedProductId: null, shopifyProductId: null, variants: { deleteMany: {}, create: variants } },
       })
-    : await prisma.importedProduct.create({ data });
+    : await createOrAdopt(shop.id, product.id, data, variants);
 
   await logActivity(shop.id, {
     actor: options.actor,
@@ -81,6 +81,37 @@ export async function addToImportList(
     meta: { supplierProductId: product.id, externalId: product.externalId },
   });
   return (await getImportedProduct(shop.id, created.id))!;
+}
+
+/**
+ * Create the import-list row, or adopt the one a concurrent request just made.
+ *
+ * Read-then-create races against the unique index on (shopId, supplierProductId):
+ * the browser extension double-clicking "add", or a retry overlapping the first
+ * attempt, has both callers miss the read and the loser gets a P2002 the
+ * merchant sees as a 500. The function is meant to be idempotent, so the
+ * duplicate is treated as "already on your list".
+ */
+async function createOrAdopt(
+  shopId: string,
+  supplierProductId: string,
+  data: Prisma.ImportedProductUncheckedCreateInput,
+  variants: Prisma.ImportedVariantUncheckedCreateWithoutImportedProductInput[],
+) {
+  try {
+    return await prisma.importedProduct.create({ data });
+  } catch (error) {
+    if (typeof error !== "object" || error === null || (error as { code?: string }).code !== "P2002") throw error;
+    const winner = await prisma.importedProduct.findUnique({
+      where: { shopId_supplierProductId: { shopId, supplierProductId } },
+    });
+    if (!winner) throw error;
+    if (winner.status !== "ARCHIVED") return winner;
+    return prisma.importedProduct.update({
+      where: { id: winner.id },
+      data: { ...data, status: "DRAFT", pushError: null, pushedAt: null, pushedProductId: null, shopifyProductId: null, variants: { deleteMany: {}, create: variants } },
+    });
+  }
 }
 
 async function buildVariantRows(
@@ -225,7 +256,7 @@ export interface ImportedVariantPatch {
 export async function updateImportedVariants(shopId: string, importedProductId: string, patches: ImportedVariantPatch[]) {
   const product = await prisma.importedProduct.findFirst({ where: { id: importedProductId, shopId }, select: { id: true } });
   if (!product) throw new Error("Imported product not found");
-  await prisma.$transaction(
+  await chunkedTransaction(
     patches.map((p) =>
       prisma.importedVariant.updateMany({
         where: { id: p.id, importedProductId },
@@ -248,7 +279,7 @@ export async function applyPricingRuleToImport(shopId: string, importedProductId
   const product = await getImportedProduct(shopId, importedProductId);
   if (!product) throw new Error("Imported product not found");
   const rule = await resolvePricingRule(shopId, pricingRuleId);
-  await prisma.$transaction(
+  await chunkedTransaction(
     product.variants.map((v) => {
       const priced = computePrice(rule, { cost: v.cost.toString(), shippingCost: v.shippingCost.toString() });
       return prisma.importedVariant.update({
@@ -364,6 +395,9 @@ export async function pushImportedProduct(shop: ShopWithSettings, client: Graphq
     });
 
     const pushed = await createProduct(client, {
+      // Adopt the product a previous attempt already created rather than making
+      // a second listing of the same item. `productSet` upserts on this id.
+      id: product.shopifyProductId,
       title: product.title,
       descriptionHtml: product.description,
       vendor: product.vendor,
@@ -389,10 +423,20 @@ export async function pushImportedProduct(shop: ShopWithSettings, client: Graphq
       collectionIds: product.collections,
     });
 
+    // Recorded before anything else: from here on the product exists in the
+    // merchant's store, and a failure below must not lose track of it.
+    if (product.shopifyProductId !== pushed.id) {
+      await prisma.importedProduct.update({ where: { id: product.id }, data: { shopifyProductId: pushed.id } });
+    }
+
     if (settings.publishOnPush && settings.defaultStatus === "ACTIVE") {
       await publishProduct(client, pushed.id).catch((error) => logger.warn("Publish failed", { productId: pushed.id, error }));
     }
 
+    // The header rows go in one short transaction; the per-variant work runs
+    // outside it. A product with a few hundred variants issued two writes per
+    // variant inside a single interactive transaction, which timed out (P2028)
+    // and rolled the whole mirror back while the Shopify product stayed.
     const local = await prisma.$transaction(async (tx) => {
       const row = await tx.product.upsert({
         where: { shopId_shopifyProductId: { shopId: shop.id, shopifyProductId: pushed.id } },
@@ -408,52 +452,58 @@ export async function pushImportedProduct(shop: ShopWithSettings, client: Graphq
         },
         update: { title: pushed.title, handle: pushed.handle, status: pushed.status, featuredImage: pushed.featuredImage ?? undefined },
       });
-
-      const mapping = await tx.productMapping.upsert({
+      await tx.productMapping.upsert({
         where: { productId: row.id },
         create: { productId: row.id, type: "BASIC" },
         update: {},
       });
-
-      for (const sv of pushed.variants) {
-        const source = matchVariant(variantsToPush, sv.optionValues);
-        const variant = await tx.productVariant.upsert({
-          where: { productId_shopifyVariantId: { productId: row.id, shopifyVariantId: sv.id } },
-          create: {
-            productId: row.id,
-            shopifyVariantId: sv.id,
-            inventoryItemId: sv.inventoryItemId,
-            title: sv.title,
-            sku: sv.sku,
-            optionValues: sv.optionValues as unknown as Prisma.InputJsonValue,
-            price: sv.price,
-            compareAtPrice: sv.compareAtPrice,
-            cost: source ? source.cost : null,
-            inventoryQuantity: source?.inventory ?? 0,
-            position: sv.position,
-          },
-          update: { title: sv.title, sku: sv.sku, price: sv.price, compareAtPrice: sv.compareAtPrice, cost: source?.cost ?? undefined, position: sv.position },
-        });
-        if (source?.supplierVariantId) {
-          await tx.variantMapping.create({
-            data: {
-              productMappingId: mapping.id,
-              productVariantId: variant.id,
-              supplierVariantId: source.supplierVariantId,
-              quantity: 1,
-              priority: 0,
-              shipToCountry: "*",
-              isDefault: true,
-            },
-          });
-        }
-      }
-
-      await tx.importedProduct.update({
-        where: { id: product.id },
-        data: { status: "PUSHED", pushedProductId: row.id, pushedAt: new Date(), pushError: null },
-      });
       return row;
+    });
+
+    const mapping = (await prisma.productMapping.findUnique({ where: { productId: local.id } }))!;
+
+    for (const sv of pushed.variants) {
+      const source = matchVariant(variantsToPush, sv.optionValues);
+      const variant = await prisma.productVariant.upsert({
+        where: { productId_shopifyVariantId: { productId: local.id, shopifyVariantId: sv.id } },
+        create: {
+          productId: local.id,
+          shopifyVariantId: sv.id,
+          inventoryItemId: sv.inventoryItemId,
+          title: sv.title,
+          sku: sv.sku,
+          optionValues: sv.optionValues as unknown as Prisma.InputJsonValue,
+          price: sv.price,
+          compareAtPrice: sv.compareAtPrice,
+          cost: source ? source.cost : null,
+          inventoryQuantity: source?.inventory ?? 0,
+          position: sv.position,
+        },
+        update: { title: sv.title, sku: sv.sku, price: sv.price, compareAtPrice: sv.compareAtPrice, cost: source?.cost ?? undefined, position: sv.position },
+      });
+      if (source?.supplierVariantId) {
+        // Replace rather than append: a re-push of the same product would
+        // otherwise stack a duplicate mapping row per attempt, and
+        // VariantMapping has no unique constraint to stop it (nor could it —
+        // BOGO and bundle mappings legitimately repeat a supplier SKU).
+        await prisma.variantMapping.deleteMany({ where: { productMappingId: mapping.id, productVariantId: variant.id } });
+        await prisma.variantMapping.create({
+          data: {
+            productMappingId: mapping.id,
+            productVariantId: variant.id,
+            supplierVariantId: source.supplierVariantId,
+            quantity: 1,
+            priority: 0,
+            shipToCountry: "*",
+            isDefault: true,
+          },
+        });
+      }
+    }
+
+    await prisma.importedProduct.update({
+      where: { id: product.id },
+      data: { status: "PUSHED", pushedProductId: local.id, pushedAt: new Date(), pushError: null },
     });
 
     await logActivity(shop.id, {

@@ -137,6 +137,10 @@ export async function createPricingRule(shopId: string, input: PricingRuleFormIn
 }
 
 export async function updatePricingRule(shopId: string, id: string, input: PricingRuleFormInput) {
+  // Scoped: the id arrives from a form field, so without the ownership check a
+  // merchant could rewrite another store's pricing rule.
+  const owned = await prisma.pricingRule.findFirst({ where: { id, shopId }, select: { id: true } });
+  if (!owned) throw new Error("Pricing rule not found");
   const rule = await prisma.$transaction(async (tx) => {
     if (input.isDefault) {
       await tx.pricingRule.updateMany({ where: { shopId, isDefault: true, NOT: { id } }, data: { isDefault: false } });
@@ -176,10 +180,13 @@ export async function deletePricingRule(shopId: string, id: string) {
 }
 
 export async function setDefaultPricingRule(shopId: string, id: string) {
-  await prisma.$transaction([
+  const [, updated] = await prisma.$transaction([
     prisma.pricingRule.updateMany({ where: { shopId, isDefault: true }, data: { isDefault: false } }),
-    prisma.pricingRule.update({ where: { id }, data: { isDefault: true } }),
+    // updateMany, not update: scoped to the shop so an id from another store is
+    // a no-op rather than a cross-tenant write.
+    prisma.pricingRule.updateMany({ where: { id, shopId }, data: { isDefault: true } }),
   ]);
+  if (updated.count === 0) throw new Error("Pricing rule not found");
 }
 
 /** Preview a rule against sample costs for the pricing page. */

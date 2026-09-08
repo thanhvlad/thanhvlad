@@ -12,8 +12,21 @@ const STALE_AFTER_MS = 12 * 60 * 60 * 1000;
  * (or 1 when nothing is known) so a provider outage never blocks pricing.
  */
 export async function getRate(base: string, quote: string): Promise<Decimal> {
+  return (await getKnownRate(base, quote)) ?? new Decimal(1);
+}
+
+/**
+ * Exchange rate, or null when no rate is known for the pair.
+ *
+ * `getRate` falls back to 1 so pricing never blocks on a provider outage, which
+ * is right for a markup but wrong for money: recording a CNY cost as if it were
+ * GBP quietly corrupts every profit figure derived from it. Callers that store
+ * a converted amount use this and simply record nothing when it returns null.
+ */
+export async function getKnownRate(base: string, quote: string): Promise<Decimal | null> {
   const from = base.toUpperCase();
   const to = quote.toUpperCase();
+  if (!from || !to) return null;
   if (from === to) return new Decimal(1);
 
   const cached = await prisma.currencyRate.findUnique({ where: { base_quote: { base: from, quote: to } } });
@@ -28,7 +41,7 @@ export async function getRate(base: string, quote: string): Promise<Decimal> {
   } catch (error) {
     logger.warn("Exchange rate refresh failed", { base: from, quote: to, error });
   }
-  return cached ? d(cached.rate) : new Decimal(1);
+  return cached ? d(cached.rate) : null;
 }
 
 /** Pull every rate for a base currency from the provider and store them. */

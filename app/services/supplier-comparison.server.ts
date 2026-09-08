@@ -1,5 +1,5 @@
 import type { Prisma } from "@prisma/client";
-import prisma from "~/db.server";
+import prisma, { chunkedTransaction } from "~/db.server";
 import { matchVariants } from "~/domain/mapping/match";
 import { isWorthSwitching, scoreCandidates, type ScoreInput, type ScoredCandidate } from "~/domain/suppliers/score";
 import { errorMessage } from "~/lib/errors";
@@ -183,7 +183,7 @@ export async function findAlternativeSuppliers(
   }
 
   const scored = scoreCandidates(inputs);
-  await prisma.$transaction(
+  await chunkedTransaction(
     scored.map((s) => {
       const m = meta.get(s.id)!;
       return prisma.supplierCandidate.upsert({
