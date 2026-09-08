@@ -38,10 +38,10 @@ import type {
  *   image search     aliexpress.ds.image.search
  *   feed browse      aliexpress.ds.recommend.feed.get
  *   keyword search   aliexpress.affiliate.product.query   (needs a tracking id)
- *   freight quote    aliexpress.logistics.buyer.freight.get
+ *   freight quote    aliexpress.ds.freight.query
  *   place order      aliexpress.ds.order.create
  *   order detail     aliexpress.trade.ds.order.get
- *   tracking         aliexpress.logistics.ds.trackinginfo.query
+ *   tracking         aliexpress.ds.order.tracking.get
  *   register store   aliexpress.ds.add.info
  *
  * Order creation takes `sku_attr` ("14:350853#Black;5:361386"), while freight
@@ -75,20 +75,33 @@ export function signTopParams(secret: string, params: Record<string, string>, pa
 const ORDER_STATUS_MAP: Record<string, SupplierOrderState> = {
   PLACE_ORDER_SUCCESS: "AWAITING_PAYMENT",
   WAIT_BUYER_PAY: "AWAITING_PAYMENT",
-  RISK_CONTROL: "AWAITING_PAYMENT",
+  // RISK_CONTROL starts 24 hours AFTER the buyer's payment completes, so it is
+  // a paid state. Reading it as unpaid asks the merchant to pay a second time.
+  RISK_CONTROL: "PAID",
   WAIT_SELLER_EXAMINE_MONEY: "PAID",
   FUND_PROCESSING: "PAID",
   IN_FROZEN: "PAID",
   WAIT_SELLER_SEND_GOODS: "PAID",
+  // AliExpress spells the partial-shipment status both ways.
   SELLER_PART_SEND_GOODS: "SHIPPED",
+  SELLER_SEND_PART_GOODS: "SHIPPED",
   WAIT_BUYER_ACCEPT_GOODS: "SHIPPED",
   IN_ISSUE: "SHIPPED",
   FINISH: "DELIVERED",
+  FIN: "DELIVERED",
   IN_CANCEL: "CANCELED",
   CANCEL: "CANCELED",
   CLOSED: "CANCELED",
   ORDER_CANCEL: "CANCELED",
 };
+
+/** `logistics_status` values that mean at least one parcel has left the seller. */
+const SHIPPED_LOGISTICS_STATUSES = new Set([
+  "SELLER_SEND_GOODS",
+  "SELLER_SEND_PART_GOODS",
+  "SELLER_PART_SEND_GOODS",
+  "BUYER_ACCEPT_GOODS",
+]);
 
 /** Documented `error_code` values from order creation, mapped to advice. */
 const ORDER_ERROR_HINTS: Record<string, string> = {
@@ -109,8 +122,20 @@ const ORDER_ERROR_HINTS: Record<string, string> = {
   A006_INVALID_ACCOUNT_INFO: "The AliExpress account information is incomplete. Complete your AliExpress profile.",
 };
 
-/** Errors that mean the merchant must reconnect the account. */
+/**
+ * Codes that mean the merchant must reconnect.
+ *
+ * The api-sg gateway answers with string identifiers (`InvalidCode`,
+ * `InsufficientPermission`, …), not the small integers the legacy Taobao TOP
+ * router used, so both are matched and the message is a last resort.
+ */
 const AUTH_ERROR_CODES = new Set(["15", "25", "26", "27", "40", "41", "42", "43"]);
+
+function isAuthFailure(code: string, message: string): boolean {
+  if (AUTH_ERROR_CODES.has(code)) return true;
+  if (/token|session|auth|permission|InvalidCode|AppCallLimit/i.test(code)) return true;
+  return /session|token|auth|expire|permission/i.test(message);
+}
 
 export class AliExpressAdapter implements SupplierAdapter {
   readonly platform = "ALIEXPRESS" as const;
@@ -218,12 +243,28 @@ export class AliExpressAdapter implements SupplierAdapter {
    * `rsp_code` inside the envelope.
    */
   private unwrap<T>(body: Json, method: string): T {
+    // The api-sg gateway reports signing, timestamp, permission and parameter
+    // failures as a TOP-LEVEL {code, type, message, request_id} with HTTP 200
+    // and no `error_response` wrapper. Without this branch such a response is
+    // handed to the parsers as a perfectly successful empty payload, and the
+    // merchant sees "no results" instead of "your app key is wrong".
+    if (body.code !== undefined && !isSuccessCode(body.code) && body.request_id !== undefined) {
+      const code = String(body.code);
+      const message = String(body.message ?? "AliExpress API error");
+      logger.warn("AliExpress gateway error", { method, code, type: body.type, message, requestId: body.request_id });
+      throw new SupplierError(
+        isAuthFailure(code, message) ? "SUPPLIER_NOT_AUTHORIZED" : "SUPPLIER_API",
+        `${message} (${code})`,
+        { retryable: /rate|limit|busy|timeout|frequen|ISP/i.test(`${code} ${message} ${body.type ?? ""}`), details: body },
+      );
+    }
+
     if (body.error_response) {
       const err = body.error_response as Json;
       const code = String(err.code ?? err.sub_code ?? "UNKNOWN");
       const message = String(err.sub_msg ?? err.msg ?? "AliExpress API error");
       const retryable = /rate|limit|busy|timeout|frequen/i.test(message);
-      const isAuth = AUTH_ERROR_CODES.has(code) || /session|token|auth|expire/i.test(message);
+      const isAuth = isAuthFailure(code, message);
       logger.warn("AliExpress API error", { method, code, message, requestId: err.request_id });
       throw new SupplierError(isAuth ? "SUPPLIER_NOT_AUTHORIZED" : "SUPPLIER_API", `${message} (${code})`, {
         retryable,
@@ -247,11 +288,27 @@ export class AliExpressAdapter implements SupplierAdapter {
       }
       node = resp;
     }
-    const rspCode = node.rsp_code ?? node.resp_code;
-    if (rspCode !== undefined && String(rspCode) !== "200" && String(rspCode) !== "0") {
-      throw new SupplierError("SUPPLIER_API", String(node.rsp_msg ?? node.resp_msg ?? `AliExpress returned ${rspCode}`), {
+    // Business methods carry their own result code, spelled `rsp_code`,
+    // `resp_code` or plain `code` depending on the method, and success is any of
+    // 0 / "0" / "00" / 200.
+    const rspCode = node.rsp_code ?? node.resp_code ?? node.code;
+    if (rspCode !== undefined && !isSuccessCode(rspCode)) {
+      throw new SupplierError("SUPPLIER_API", String(node.rsp_msg ?? node.resp_msg ?? node.msg ?? `AliExpress returned ${rspCode}`), {
         details: node,
       });
+    }
+    // Some DS methods report failure inside `result` instead. The `ret` shape is
+    // deliberately excluded: `aliexpress.ds.order.tracking.get` answers a
+    // not-yet-shipped order with `{ret:false, code:"1001", msg:"TRACKING DATA
+    // NOT FOUND"}`, which is a normal state its caller reads, not an error.
+    const inner = node.result as Json | undefined;
+    if (inner && typeof inner === "object" && inner.ret === undefined) {
+      const innerCode = inner.code;
+      if (inner.success === false || (innerCode !== undefined && !isSuccessCode(innerCode))) {
+        throw new SupplierError("SUPPLIER_API", String(inner.msg ?? inner.message ?? `AliExpress returned ${innerCode}`), {
+          details: inner,
+        });
+      }
     }
     return node as T;
   }
@@ -474,10 +531,13 @@ export class AliExpressAdapter implements SupplierAdapter {
       const stock = Number(sku.sku_available_stock ?? sku.s_k_u_available_stock ?? sku.ipm_sku_stock ?? 0);
       const inStock = String(sku.sku_stock ?? "true") !== "false";
       return {
-        // `id` is the numeric sku id used by freight quotes; `sku_attr` is what
-        // order creation needs.
-        externalSkuId: String(sku.id ?? sku.sku_id ?? ""),
-        skuAttr: (sku.sku_attr as string) ?? attributes.map((a) => a.value).join(";") ?? null,
+        // `sku_id` is the numeric id freight quotes take; `id` is a legacy field
+        // that sometimes holds the attribute string instead, so it comes second.
+        externalSkuId: String(sku.sku_id ?? sku.id ?? ""),
+        // `sku_attr` is what order creation needs. When the response omits it,
+        // it has to be rebuilt from the property ids — joining the human-readable
+        // values ("Red;XL") produces a string AliExpress rejects.
+        skuAttr: (sku.sku_attr as string) ?? skuAttrFromProperties(props),
         sku: (sku.sku_code as string) ?? null,
         attributes,
         image: attributes.find((a) => a.image)?.image ?? null,
@@ -517,39 +577,75 @@ export class AliExpressAdapter implements SupplierAdapter {
     };
   }
 
+  /**
+   * Freight quotes.
+   *
+   * The DS method is `aliexpress.ds.freight.query`, whose single business
+   * parameter is `queryDeliveryReq` — a JSON string with **camelCase** keys, not
+   * the snake_case DTO the legacy buyer-freight methods take. It has no
+   * ship-from input: each returned option reports its own `ship_from_country`.
+   *
+   * The legacy `aliexpress.logistics.buyer.freight.calculate` shape is still
+   * accepted here as a fallback, because the two differ in every field name and
+   * an account provisioned before the DS migration can still answer that way.
+   */
   async getShippingQuotes(params: ShippingQuoteParams): Promise<SupplierShippingQuote[]> {
-    const node = await this.call<Json>("aliexpress.logistics.buyer.freight.get", {
-      aeopFreightCalculateForBuyerDTO: JSON.stringify({
-        product_id: Number(params.externalId),
-        product_num: Math.max(1, params.quantity),
+    const node = await this.call<Json>("aliexpress.ds.freight.query", {
+      queryDeliveryReq: JSON.stringify({
+        productId: String(params.externalId),
+        // Quantity goes over the wire as a string; a JSON number is rejected.
+        quantity: String(Math.max(1, params.quantity)),
+        shipToCountry: params.shipToCountry.toUpperCase(),
         // Freight takes the numeric sku id, unlike order creation.
-        sku_id: params.externalSkuId ?? undefined,
-        country_code: params.shipToCountry.toUpperCase(),
-        province_code: params.province ?? undefined,
-        city_code: undefined,
-        send_goods_country_code: params.shipFromCountry ?? "CN",
-        price_currency: "USD",
+        ...(params.externalSkuId ? { selectedSkuId: String(params.externalSkuId) } : {}),
+        ...(params.province ? { provinceCode: params.province } : {}),
+        language: "en_US",
+        locale: "en_US",
+        currency: "USD",
       }),
     });
     const result = (node.result ?? node) as Json;
     const options =
-      asArray(result.aeop_freight_calculate_result_for_buyer_dtolist, "aeop_freight_calculate_result_for_buyer_d_t_o") ?? [];
+      asArray(result.delivery_options, "delivery_option_d_t_o") ??
+      asArray(
+        result.aeop_freight_calculate_result_for_buyer_d_t_o_list ?? result.aeop_freight_calculate_result_for_buyer_dtolist,
+        "aeop_freight_calculate_result_for_buyer_dto",
+      ) ??
+      [];
+
     return options
       .map((o) => {
-        const freight = (o.freight ?? {}) as Json;
-        const cost = freight.cent !== undefined ? d(freight.cent).dividedBy(100) : d(freight.amount ?? 0);
-        const [min, max] = parseDeliveryWindow(String(o.estimated_delivery_time ?? ""));
+        const legacy = (o.freight ?? null) as Json | null;
+        // `code` doubles as the `logistics_service_name` order creation needs,
+        // so it has to win over the legacy spellings.
+        const carrierCode = String(o.code ?? o.service_name ?? o.shipping_method ?? "");
+        const carrierName = String(o.company ?? o.shipping_method ?? o.service_name ?? carrierCode);
+        // `shipping_fee_cent` is misnamed: it is a decimal string in MAJOR units
+        // ("13.57" alongside "13,57€"), and it is omitted entirely on free
+        // options. Only the legacy `freight.cent` is really cents.
+        const cost = hasValue(o.shipping_fee_cent)
+          ? d(String(o.shipping_fee_cent))
+          : hasValue(legacy?.cent)
+            ? d(String(legacy!.cent)).dividedBy(100)
+            : d(String(legacy?.amount ?? 0));
+        const [fallbackMin, fallbackMax] = parseDeliveryWindow(String(o.estimated_delivery_time ?? ""));
         return {
-          carrierCode: String(o.service_name ?? o.shipping_method ?? ""),
-          carrierName: String(o.shipping_method ?? o.service_name ?? ""),
+          carrierCode,
+          carrierName,
           cost: money(cost),
-          currency: String(freight.currency_code ?? "USD"),
-          shipFromCountry: params.shipFromCountry ?? "CN",
+          currency: String(o.shipping_fee_currency ?? legacy?.currency_code ?? "USD").toUpperCase(),
+          // There is no ship-from input, so the option's own origin is the only
+          // truthful answer; echoing the caller's guess would invent data.
+          shipFromCountry: String(o.ship_from_country ?? params.shipFromCountry ?? "CN").toUpperCase(),
           shipToCountry: params.shipToCountry.toUpperCase(),
-          minDeliveryDays: min,
-          maxDeliveryDays: max,
-          hasTracking: String(o.tracking_available ?? "true") === "true",
-          isFreeShipping: cost.isZero(),
+          minDeliveryDays: toDays(o.min_delivery_days) ?? fallbackMin,
+          maxDeliveryDays: toDays(o.max_delivery_days) ?? fallbackMax,
+          // DS returns a real boolean `tracking`; the legacy field is the string
+          // `tracking_available`.
+          hasTracking: hasValue(o.tracking)
+            ? o.tracking === true || String(o.tracking) === "true"
+            : String(o.tracking_available ?? "true") === "true",
+          isFreeShipping: o.free_shipping === true || String(o.free_shipping ?? "") === "true" || cost.isZero(),
         };
       })
       .filter((o) => o.carrierCode);
@@ -569,34 +665,39 @@ export class AliExpressAdapter implements SupplierAdapter {
       );
     }
 
+    const country = a.countryCode.toUpperCase();
+    const tax = a.taxNumber?.trim() || undefined;
     const payload = {
       logistics_address: {
-        address: a.address1,
-        address2: a.address2 ?? "",
-        city: a.city,
-        province: a.province ?? "",
-        zip: a.zip ?? "",
-        country: a.countryCode,
-        contact_person: a.name,
-        full_name: a.name,
+        address: asciiAddress(a.address1),
+        address2: asciiAddress(a.address2),
+        city: asciiAddress(a.city),
+        province: asciiAddress(a.province),
+        zip: sanitizeZip(a.zip),
+        country,
+        contact_person: asciiAddress(a.name),
+        full_name: asciiAddress(a.name),
         mobile_no: a.phone,
         phone_country: a.phoneCountryCode ?? "",
         locale: "en_US",
         // Destination-specific customs identifiers. AliExpress reads whichever
-        // field matches the country; sending the value in both the generic and
-        // the country-specific slot is what its own SDK samples do.
-        tax_number: a.taxNumber ?? undefined,
-        cpf: a.countryCode === "BR" ? (a.taxNumber ?? undefined) : undefined,
-        passport_no: a.countryCode === "KR" ? (a.taxNumber ?? undefined) : undefined,
-        foreigner_passport_no: a.countryCode === "KR" ? (a.taxNumber ?? undefined) : undefined,
-        vat_no: ["IT", "ES", "TR"].includes(a.countryCode) ? (a.taxNumber ?? undefined) : undefined,
+        // field matches the country, and each country has exactly one right slot:
+        // `cpf` for Brazil, `rut_no` for Chile, `foreigner_passport_no` (paired
+        // with `is_foreigner`) for Korea, `vat_no` for the EU/TR VAT countries.
+        // `passport_no` is the Russia/CIS passport triple and is not Korea's.
+        tax_number: tax,
+        cpf: country === "BR" ? tax : undefined,
+        rut_no: country === "CL" ? tax : undefined,
+        foreigner_passport_no: country === "KR" ? tax : undefined,
+        is_foreigner: country === "KR" && tax ? "true" : undefined,
+        vat_no: ["IT", "ES", "TR"].includes(country) ? tax : undefined,
       },
       product_items: input.items.map((item) => ({
         product_id: Number(item.externalProductId),
         product_count: item.quantity,
         sku_attr: item.externalSkuAttr,
         logistics_service_name: item.carrierCode ?? undefined,
-        order_memo: input.note ?? undefined,
+        order_memo: input.note ? asciiAddress(input.note) : undefined,
       })),
     };
 
@@ -657,91 +758,144 @@ export class AliExpressAdapter implements SupplierAdapter {
   }
 
   async getOrder(externalOrderId: string): Promise<SupplierOrderStatus | null> {
-    const node = await this.call<Json>("aliexpress.trade.ds.order.get", { order_id: externalOrderId });
-    const result = (node.result ?? node) as Json;
-    if (!result.order_status && !result.gmt_create) return null;
+    const result = await this.fetchOrderDetail(externalOrderId);
+    if (!result) return null;
 
     const amount = (result.order_amount ?? {}) as Json;
-    const children = asArray(result.child_order_list, "ae_child_order_info") ?? [];
+    const children = childOrders(result);
     const itemsCost = children.reduce((acc, child) => {
       const price = (child.product_price ?? {}) as Json;
       return acc.plus(d(price.amount ?? 0).times(Number(child.product_count ?? 1)));
     }, d(0));
     const total = d(amount.amount ?? 0);
     const orderStatus = String(result.order_status ?? "");
-    const status = ORDER_STATUS_MAP[orderStatus] ?? "PLACED";
+    let status = ORDER_STATUS_MAP[orderStatus] ?? "PLACED";
     const logisticsStatus = String(result.logistics_status ?? "");
+    // A cancellation surfaces on the child order while the parent status can
+    // still read as live, so the child wins.
+    if (children.some((child) => String(child.end_reason ?? "").toUpperCase() === "CANCELED")) {
+      status = "CANCELED";
+    } else if (status === "PAID" && SHIPPED_LOGISTICS_STATUSES.has(logisticsStatus)) {
+      // The order can be paid while its own status still says "waiting to send".
+      status = "SHIPPED";
+    }
 
     return {
       externalOrderId,
-      // The order can be paid while logistics still says "waiting to send".
-      status:
-        status === "PAID" && ["SELLER_SEND_GOODS", "BUYER_ACCEPT_GOODS"].includes(logisticsStatus) ? "SHIPPED" : status,
+      status,
       itemsCost: itemsCost.isZero() ? null : money(itemsCost),
       shippingCost: itemsCost.isZero() || total.isZero() ? null : money(total.minus(itemsCost)),
       totalCost: total.isZero() ? null : money(total),
       currency: String(amount.currency_code ?? "USD"),
+      // Undocumented on the DS order API and usually absent; read when present
+      // rather than invented, so the stored date is either real or empty.
       paidAt: result.gmt_pay_time ? new Date(String(result.gmt_pay_time)) : null,
-      shippedAt: ["SELLER_SEND_GOODS", "BUYER_ACCEPT_GOODS"].includes(logisticsStatus) ? new Date() : null,
+      // AliExpress exposes no ship timestamp here. Stamping "now" on every poll
+      // would drift the date to whenever the sync ran, so the caller stamps it
+      // once on the transition instead.
+      shippedAt: null,
       paymentUrl: orderPaymentUrl(externalOrderId),
       raw: result,
     };
   }
 
   /**
-   * Tracking is a two-step read: the order carries the logistics numbers, then
-   * each number is queried for its event history.
+   * `aliexpress.trade.ds.order.get` takes a single `single_order_query` DTO, not
+   * a flat `order_id`, and answers with `aeop_`-prefixed wrapper keys.
+   */
+  private async fetchOrderDetail(externalOrderId: string): Promise<Json | null> {
+    const node = await this.call<Json>("aliexpress.trade.ds.order.get", {
+      single_order_query: JSON.stringify({ order_id: Number(externalOrderId) }),
+    });
+    const result = (node.result ?? node) as Json;
+    if (!result.order_status && !result.gmt_create) return null;
+    return result;
+  }
+
+  /**
+   * Tracking is a two-step read: the order detail carries the tracking numbers
+   * and the service code, then `aliexpress.ds.order.tracking.get` adds the
+   * carrier's display name and the event history.
+   *
+   * The two sources disagree often enough that both are read: the order can
+   * already carry a `logistics_no` while the tracking API still answers
+   * "TRACKING DATA NOT FOUND", and the tracking API can carry a `mail_no` the
+   * order has not picked up yet.
    */
   async getTracking(externalOrderId: string): Promise<SupplierTracking[]> {
-    const node = await this.call<Json>("aliexpress.trade.ds.order.get", { order_id: externalOrderId });
-    const result = (node.result ?? node) as Json;
-    const shipments = asArray(result.logistics_info_list, "ae_order_logistics_info") ?? [];
-    const toArea = String((result.receipt_address ?? {}) && ((result.receipt_address as Json)?.country ?? "")) || "";
+    const result = await this.fetchOrderDetail(externalOrderId);
+    const shipments = result ? logisticsLegs(result) : [];
+    const events = await this.fetchTrackingLines(externalOrderId);
 
-    const trackings: SupplierTracking[] = [];
+    const byNumber = new Map<string, SupplierTracking>();
     for (const shipment of shipments) {
       const number = String(shipment.logistics_no ?? "");
       if (!number) continue;
-      const serviceName = String(shipment.logistics_service ?? "");
-      let status: string | null = null;
-      let lastEvent: string | null = null;
-      let lastEventAt: Date | null = null;
-      let officialWebsite: string | null = null;
-
-      try {
-        const detail = await this.call<Json>("aliexpress.logistics.ds.trackinginfo.query", {
-          logistics_no: number,
-          origin: "ESCROW",
-          out_ref: externalOrderId,
-          service_name: serviceName,
-          to_area: toArea || undefined,
-        });
-        const payload = (detail.result ?? detail) as Json;
-        officialWebsite = (payload.official_website as string) ?? null;
-        const events = asArray(payload.details, "details") ?? [];
-        const last = events[events.length - 1];
-        if (last) {
-          lastEvent = String(last.event_desc ?? "");
-          status = String(last.status ?? "") || null;
-          lastEventAt = last.event_date ? new Date(String(last.event_date)) : null;
-        }
-      } catch (error) {
-        // A tracking number that the carrier has not scanned yet returns an
-        // error; the number itself is still worth syncing to Shopify.
-        logger.debug("AliExpress tracking detail unavailable", { externalOrderId, number, error });
-      }
-
-      trackings.push({
+      const serviceCode = String(shipment.logistics_service ?? "") || null;
+      byNumber.set(number, {
         number,
-        carrierCode: serviceName || null,
-        carrierName: serviceName || null,
-        url: officialWebsite ?? `https://global.cainiao.com/detail.htm?mailNoList=${encodeURIComponent(number)}`,
-        status,
-        lastEvent,
-        lastEventAt,
+        carrierCode: serviceCode,
+        // Replaced below by the carrier's real name when tracking has one; the
+        // service code is a placeholder, not a label to show a customer.
+        carrierName: serviceCode,
+        url: cainiaoTrackingUrl(number),
+        status: null,
+        lastEvent: null,
+        lastEventAt: null,
       });
     }
-    return trackings;
+
+    for (const line of events) {
+      const number = String(line.mail_no ?? "");
+      // A line with no mail_no yet still describes the order's only shipment, so
+      // its events are attached to that one rather than dropped.
+      const target = number ? byNumber.get(number) : byNumber.size === 1 ? [...byNumber.values()][0] : undefined;
+      const nodes = asArray(line.detail_node_list, "detail_node") ?? [];
+      // The DS tracking nodes come back newest first.
+      const latest = nodes[0];
+      const carrierName = String(line.carrier_name ?? "") || null;
+      const entry: SupplierTracking = target ?? {
+        number,
+        carrierCode: null,
+        carrierName,
+        url: cainiaoTrackingUrl(number),
+        status: null,
+        lastEvent: null,
+        lastEventAt: null,
+      };
+      if (carrierName) entry.carrierName = carrierName;
+      if (latest) {
+        entry.lastEvent = String(latest.tracking_detail_desc ?? "") || null;
+        entry.status = String(latest.tracking_name ?? "") || null;
+        entry.lastEventAt = epochMillis(latest.time_stamp);
+      }
+      if (!target && number) byNumber.set(number, entry);
+    }
+
+    return [...byNumber.values()];
+  }
+
+  /**
+   * `aliexpress.ds.order.tracking.get` takes `ae_order_id` and a required
+   * `language`; both names changed in a 2026 revision and the older spellings
+   * fail silently. A not-yet-shipped order answers `ret:false` / code 1001,
+   * which is a state, not an error.
+   */
+  private async fetchTrackingLines(externalOrderId: string): Promise<Json[]> {
+    try {
+      const node = await this.call<Json>("aliexpress.ds.order.tracking.get", {
+        ae_order_id: Number(externalOrderId),
+        language: "en_US",
+      });
+      const result = (node.result ?? node) as Json;
+      if (result.ret === false || !result.data) return [];
+      const data = result.data as Json;
+      return asArray(data.tracking_detail_line_list, "tracking_detail") ?? [];
+    } catch (error) {
+      // The numbers from the order detail are still worth syncing to Shopify.
+      logger.debug("AliExpress tracking detail unavailable", { externalOrderId, error });
+      return [];
+    }
   }
 }
 
@@ -754,8 +908,106 @@ export function orderPaymentUrl(orderId: string): string {
   return `https://www.aliexpress.com/p/order/detail.html?orderId=${encodeURIComponent(orderId)}`;
 }
 
-/** The merchant's unpaid-order list, for paying several orders in one visit. */
-export const ALIEXPRESS_UNPAID_ORDERS_URL = "https://www.aliexpress.com/p/order/index.html?orderStatus=await_payment";
+/**
+ * The merchant's order list, for paying several orders in one visit. The page
+ * filters by tab click, not by query string, so it opens on "All orders" — any
+ * `?orderStatus=` parameter is silently ignored.
+ */
+export const ALIEXPRESS_UNPAID_ORDERS_URL = "https://www.aliexpress.com/p/order/index.html";
+
+/** Public carrier-agnostic tracking page, used when AliExpress gives no link. */
+function cainiaoTrackingUrl(number: string): string {
+  return `https://global.cainiao.com/detail.htm?mailNoList=${encodeURIComponent(number)}`;
+}
+
+/**
+ * `aliexpress.trade.ds.order.get` wraps its lists under `aeop_`-prefixed keys;
+ * the newer `aliexpress.ds.trade.order.get` uses `ae_`. The gateway aliases one
+ * onto the other, so both spellings are accepted.
+ */
+function childOrders(result: Json): Json[] {
+  return (
+    asArray(result.child_order_list, "aeop_child_order_info") ??
+    asArray(result.child_order_list, "ae_child_order_info") ??
+    []
+  );
+}
+
+function logisticsLegs(result: Json): Json[] {
+  return (
+    asArray(result.logistics_info_list, "aeop_order_logistics_info") ??
+    asArray(result.logistics_info_list, "ae_order_logistics_info") ??
+    []
+  );
+}
+
+/** Tracking timestamps are epoch milliseconds, as a JSON number or a string. */
+function epochMillis(value: unknown): Date | null {
+  if (!hasValue(value)) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return new Date(n);
+}
+
+/**
+ * Rebuild `sku_attr` from the SKU's properties when the response omits it.
+ *
+ * The wire format is `propertyId:valueId` pairs joined by `;`. Joining the
+ * human-readable values instead yields "Red;XL", which AliExpress rejects with
+ * SKU_NOT_EXIST — so a pair with no value id makes the whole string unusable
+ * and the caller is better off with nothing.
+ */
+function skuAttrFromProperties(props: Json[]): string | null {
+  if (props.length === 0) return null;
+  const pairs: string[] = [];
+  for (const p of props) {
+    const propertyId = p.sku_property_id;
+    const valueId = p.property_value_id ?? p.property_value_id_long;
+    if (!hasValue(propertyId) || !hasValue(valueId)) return null;
+    pairs.push(`${propertyId}:${valueId}`);
+  }
+  return pairs.join(";");
+}
+
+/**
+ * AliExpress validates addresses against a Latin-1 character set and rejects
+ * spaced postal codes, so accents are folded and non-ASCII dropped before the
+ * address is submitted. An address that reduces to nothing is left as-is, so
+ * the failure comes back from AliExpress rather than from an empty field.
+ */
+function asciiAddress(value: string | null | undefined): string {
+  if (!value) return "";
+  const folded = value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\x20-\x7e]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return folded || value.trim();
+}
+
+/** Postal codes go over the wire without separators ("184 36" → "18436"). */
+function sanitizeZip(value: string | null | undefined): string {
+  return value ? value.replace(/[\s-]/g, "").trim() : "";
+}
+
+/** Present and meaningful — `0` and `false` count, `""`/null/undefined do not. */
+function hasValue(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== "";
+}
+
+/** A day count that AliExpress may send as a number or a numeric string. */
+function toDays(value: unknown): number | null {
+  if (!hasValue(value)) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** AliExpress spells success as 0, "0", "00" or 200 depending on the surface. */
+function isSuccessCode(value: unknown): boolean {
+  const text = String(value);
+  return text === "0" || text === "00" || text === "200";
+}
 
 /**
  * The gateway wraps arrays as `{ key: [...] }`, sometimes flattens a single
@@ -768,10 +1020,15 @@ function asArray(container: unknown, key: string): Json[] | null {
   const node = (container as Json)[key];
   if (Array.isArray(node)) return node.filter((n) => n && typeof n === "object") as Json[];
   if (node && typeof node === "object") return [node as Json];
-  // A wrapper object with a single array value (unknown key) still counts.
+  // A wrapper object with a single value under an unexpected key still counts —
+  // AliExpress renames these wrappers between methods and versions, and the
+  // single-object form (one child order, one logistics leg) is the common case.
   const values = Object.values(container as Json);
   if (values.length === 1 && Array.isArray(values[0])) {
     return (values[0] as unknown[]).filter((n) => n && typeof n === "object") as Json[];
+  }
+  if (values.length === 1 && values[0] && typeof values[0] === "object") {
+    return [values[0] as Json];
   }
   return [];
 }

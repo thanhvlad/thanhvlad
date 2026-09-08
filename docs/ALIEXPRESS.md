@@ -64,22 +64,46 @@ stop rather than failing one by one.
 | Keyword search | `aliexpress.affiliate.product.query` (needs a tracking id) |
 | Browse without a keyword | `aliexpress.ds.recommend.feed.get` |
 | Search by image | `aliexpress.ds.image.search` |
-| Shipping quotes | `aliexpress.logistics.buyer.freight.get` |
+| Shipping quotes | `aliexpress.ds.freight.query` |
 | Place an order | `aliexpress.ds.order.create` |
 | Order status and costs | `aliexpress.trade.ds.order.get` |
-| Tracking events | `aliexpress.logistics.ds.trackinginfo.query` |
+| Tracking numbers and events | `aliexpress.ds.order.tracking.get` |
 | Register the store | `aliexpress.ds.add.info` |
 
 Requests are signed HMAC-SHA256 over the parameters sorted by key and concatenated as
 `key + value`, uppercased. The REST endpoints used for tokens prefix the API path to
 that string; the `/sync` gateway does not.
 
+AliExpress has renamed most of these parameters at least once, and a wrong name is
+invisible: the gateway answers HTTP 200 with an empty result rather than an error, so
+the app would show "no shipping options" or "no tracking" instead of a problem. The
+spellings that matter, all pinned by `tests/services/aliexpress-parsing.test.ts`:
+
+- **Freight** takes one parameter, `queryDeliveryReq`, holding a JSON string whose
+  keys are camelCase (`productId`, `selectedSkuId`, `shipToCountry`, and `quantity`
+  as a *string*). It has no ship-from input — each option reports its own
+  `ship_from_country`. Options come back at `result.delivery_options.delivery_option_d_t_o`.
+  The cost field, `shipping_fee_cent`, is misnamed: it is a decimal string in major
+  units (`"13.57"`, alongside a `shipping_fee_format` of `"13,57€"`), and it is absent
+  altogether on a free option. The legacy `aliexpress.logistics.buyer.freight.calculate`
+  shape is still parsed as a fallback, where `freight.cent` really is cents.
+- **Order detail** takes `single_order_query`, a JSON object `{"order_id": <number>}`,
+  not a flat `order_id`, and wraps its lists under `aeop_child_order_info` and
+  `aeop_order_logistics_info`. A single child order or shipment arrives as a bare
+  object rather than a one-element array.
+- **Tracking** takes `ae_order_id` and a required `language`; both names changed in a
+  2026 revision and the older spellings simply stop returning data. A not-yet-shipped
+  order answers `ret: false` / `code: "1001"` — a state, not an error — so the app
+  keeps the tracking number it already has from the order detail.
+
 ### The `sku_attr` trap
 
 Order creation takes **`sku_attr`** — the attribute string, e.g.
 `14:350853#Black;5:361386` — not the numeric `sku_id`. Freight quotes take the
 numeric `sku_id`. The app stores both on every supplier variant and sends the right
-one to each call. If a product was imported before this was fixed, re-import it (open
+one to each call. When a product response omits `sku_attr`, the app rebuilds it from
+the SKU's `propertyId:valueId` pairs — joining the readable values ("Red;XL") would
+produce a string AliExpress rejects with `SKU_NOT_EXIST`. If a product was imported before this was fixed, re-import it (open
 the product, paste the supplier link again) so the attribute string is captured;
 otherwise placing the order fails with a clear message telling you to do exactly that.
 
@@ -89,6 +113,14 @@ Keyword search lives on the affiliate surface, not the DS surface. With
 `ALIEXPRESS_TRACKING_ID` set you get real keyword search. Without it the app browses
 the DS recommendation feed and filters locally, and says so in a banner — usable, but
 narrow. Importing by URL or ID always works either way, as does image search.
+
+### Addresses
+
+Address fields are transliterated to ASCII and postal codes stripped of spaces before
+submission, because AliExpress validates against a Latin character set and rejects a
+spaced code. The customs identifier goes in exactly one country-specific slot — `cpf`
+for Brazil, `rut_no` for Chile, `foreigner_passport_no` (with `is_foreigner`) for
+Korea, `vat_no` for Italy, Spain and Türkiye — alongside the generic `tax_number`.
 
 ### Payment
 
