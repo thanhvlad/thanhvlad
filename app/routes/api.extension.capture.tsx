@@ -1,5 +1,6 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import prisma from "~/db.server";
+import { rateLimit } from "~/lib/rate-limit.server";
 import { errorMessage } from "~/lib/errors";
 import { bootJobs } from "~/services/jobs/index.server";
 import { addToImportList } from "~/services/import.server";
@@ -44,6 +45,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const shopRow = await prisma.shop.findUnique({ where: { apiToken: token } });
   if (!shopRow || !shopRow.isActive) return json({ ok: false, error: "Invalid token" }, 401);
   const shop = withSettings(shopRow);
+
+  // Each reference below is a supplier API round trip, so an unthrottled caller
+  // burns the merchant's supplier quota and holds request slots open.
+  const limited = rateLimit(`extension-capture:${shopRow.id}`, { limit: 30, windowMs: 60000 });
+  if (!limited.allowed) {
+    return new Response(
+      JSON.stringify({ ok: false, error: `Too many requests. Try again in ${limited.retryAfter}s.` }),
+      { status: 429, headers: { "Content-Type": "application/json", "Retry-After": String(limited.retryAfter), ...CORS } },
+    );
+  }
 
   let body: { url?: string; urls?: string[]; pricingRuleId?: string } = {};
   try {

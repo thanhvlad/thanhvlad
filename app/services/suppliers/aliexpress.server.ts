@@ -167,7 +167,7 @@ export class AliExpressAdapter implements SupplierAdapter {
   private async call<T = Json>(
     method: string,
     params: Record<string, string | number | undefined | null>,
-    options: { requireSession?: boolean } = {},
+    options: { requireSession?: boolean; idempotent?: boolean } = {},
   ): Promise<T> {
     if (!this.isConfigured()) {
       throw new SupplierError("SUPPLIER_NOT_CONFIGURED", "AliExpress app key and secret are not configured on the server.");
@@ -183,7 +183,14 @@ export class AliExpressAdapter implements SupplierAdapter {
     }
     form.sign = this.sign(form);
 
-    const body = await httpJson<Json>(this.syncBase, { method: "POST", form, retries: 2, timeoutMs: 30_000 });
+    const body = await httpJson<Json>(this.syncBase, {
+      method: "POST",
+      form,
+      timeoutMs: 30_000,
+      // Reads retry; anything that creates or cancels an order does not, or a
+      // timed-out order would be placed a second time by the transport itself.
+      ...(options.idempotent === false ? { idempotent: false } : { retries: 2 }),
+    });
     return this.unwrap<T>(body, method);
   }
 
@@ -595,10 +602,14 @@ export class AliExpressAdapter implements SupplierAdapter {
       ...(this.trackingId ? { promotion: { promotion_channel_info: this.trackingId } } : {}),
     };
 
-    const node = await this.call<Json>("aliexpress.ds.order.create", {
-      param_place_order_request4_open_api_d_t_o: JSON.stringify(payload),
-      ds_extend_request: JSON.stringify(extend),
-    });
+    const node = await this.call<Json>(
+      "aliexpress.ds.order.create",
+      {
+        param_place_order_request4_open_api_d_t_o: JSON.stringify(payload),
+        ds_extend_request: JSON.stringify(extend),
+      },
+      { idempotent: false },
+    );
 
     const result = (node.result ?? node) as Json;
     if (String(result.is_success ?? "false") !== "true") {

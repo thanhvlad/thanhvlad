@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import type { Prisma, SupplierPlatform } from "@prisma/client";
 import prisma from "~/db.server";
 import { decryptSecret, encryptSecret } from "~/lib/crypto.server";
+import { env } from "~/lib/env.server";
 import { SupplierError } from "~/lib/errors";
 import { logActivity } from "./activity.server";
 import { notify } from "./notifications.server";
@@ -42,13 +43,42 @@ export async function beginOAuth(shopId: string, platform: SupplierPlatform): Pr
     throw new SupplierError("SUPPLIER_NO_OAUTH", `${platform} does not use OAuth.`);
   }
   const nonce = crypto.randomBytes(12).toString("hex");
-  const state = Buffer.from(JSON.stringify({ shopId, platform, nonce, ts: Date.now() })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({ shopId, platform, nonce, ts: Date.now() })).toString("base64url");
+  const state = `${payload}.${signState(payload)}`;
   return { url: adapter.getAuthorizationUrl(state), state };
+}
+
+/**
+ * Sign the OAuth state.
+ *
+ * The callback is an unauthenticated GET, and the state is the only thing
+ * saying which shop the returning token belongs to. Unsigned, anyone could hand
+ * the callback a state naming a shop that is not theirs and bind a supplier
+ * connection — or their own token — to it.
+ */
+function signState(payload: string): string {
+  return crypto.createHmac("sha256", stateSecret()).update(payload).digest("base64url");
+}
+
+function stateSecret(): string {
+  const config = env();
+  // The app's own client secret is already required, already secret, and stable
+  // across restarts and instances.
+  return config.SHOPIFY_API_SECRET || config.ENCRYPTION_KEY || "";
 }
 
 export function parseOAuthState(state: string): { shopId: string; platform: SupplierPlatform; nonce: string; ts: number } | null {
   try {
-    const parsed = JSON.parse(Buffer.from(state, "base64url").toString("utf8"));
+    const [payload, signature] = state.split(".");
+    if (!payload || !signature) return null;
+    const expected = signState(payload);
+    if (
+      signature.length !== expected.length ||
+      !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
+    ) {
+      return null;
+    }
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
     if (!parsed.shopId || !parsed.platform) return null;
     if (Date.now() - Number(parsed.ts) > 30 * 60_000) return null;
     return parsed;
@@ -134,8 +164,22 @@ export async function createCredentiallessAccount(shopId: string, platform: Supp
   });
 }
 
+/**
+ * A supplier account reachable from this shop.
+ *
+ * The account id arrives from a form field, so every mutation is scoped: by
+ * primary key alone another organisation's OAuth connection could be made
+ * default, tested with their token, or deleted outright.
+ */
+async function ownedSupplierAccount(shopId: string, id: string) {
+  const shop = await prisma.shop.findUnique({ where: { id: shopId }, select: { accountId: true } });
+  return prisma.supplierAccount.findFirst({
+    where: { id, OR: [{ shopId }, ...(shop?.accountId ? [{ accountId: shop.accountId }] : [])] },
+  });
+}
+
 export async function setDefaultSupplierAccount(shopId: string, id: string) {
-  const target = await prisma.supplierAccount.findUnique({ where: { id } });
+  const target = await ownedSupplierAccount(shopId, id);
   if (!target) return;
   await prisma.$transaction([
     prisma.supplierAccount.updateMany({ where: { accountId: target.accountId, platform: target.platform, isDefault: true }, data: { isDefault: false } }),
@@ -145,7 +189,7 @@ export async function setDefaultSupplierAccount(shopId: string, id: string) {
 }
 
 export async function disconnectSupplierAccount(shopId: string, id: string) {
-  const target = await prisma.supplierAccount.findUnique({ where: { id } });
+  const target = await ownedSupplierAccount(shopId, id);
   if (!target) return;
   await prisma.supplierAccount.delete({ where: { id } });
   await logActivity(shopId, { action: "supplier.disconnected", entity: "SupplierAccount", entityId: id, message: `${target.platform} account "${target.label}" disconnected.` });
@@ -156,8 +200,8 @@ export async function touchSupplierAccount(id: string) {
 }
 
 /** Health check used by the Suppliers page. */
-export async function testSupplierAccount(id: string): Promise<{ ok: boolean; message: string }> {
-  const account = await prisma.supplierAccount.findUnique({ where: { id } });
+export async function testSupplierAccount(shopId: string, id: string): Promise<{ ok: boolean; message: string }> {
+  const account = await ownedSupplierAccount(shopId, id);
   if (!account) return { ok: false, message: "Account not found" };
   const adapter = getAdapter(account.platform, {
     accessToken: decryptSecret(account.accessToken),

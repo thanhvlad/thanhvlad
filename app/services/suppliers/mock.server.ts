@@ -60,6 +60,17 @@ const CARRIERS = [
 
 /** Placed mock orders, so `getOrder` and `getTracking` behave across calls. */
 const ORDERS = new Map<string, { placedAt: number; input: PlaceOrderInput; result: PlaceOrderResult; canceled?: boolean }>();
+/** Bounded: this map lives for the process lifetime. */
+const MAX_MOCK_ORDERS = 500;
+
+function rememberOrder(key: string, value: { placedAt: number; input: PlaceOrderInput; result: PlaceOrderResult }) {
+  ORDERS.set(key, value);
+  while (ORDERS.size > MAX_MOCK_ORDERS) {
+    const oldest = ORDERS.keys().next();
+    if (oldest.done) break;
+    ORDERS.delete(oldest.value);
+  }
+}
 
 function hash(input: string): number {
   return parseInt(crypto.createHash("md5").update(input).digest("hex").slice(0, 8), 16);
@@ -89,7 +100,10 @@ function buildVariants(seed: MockProductSeed): SupplierVariantDetail[] {
     const skuId = `${seed.id}-${index + 1}`;
     const priceDrift = drift(`price:${skuId}`, 0.08);
     const price = seed.basePrice * (1 + index * 0.05) * (1 + priceDrift);
-    const stock = Math.max(0, Math.round(120 + drift(`stock:${skuId}`, 140)));
+    // Floored well above zero: an amplitude that could reach 0 made the mock
+    // supplier report the whole catalogue out of stock during some hours of the
+    // day, so the order tests passed or failed by wall clock.
+    const stock = Math.max(25, Math.round(120 + drift(`stock:${skuId}`, 60)));
     return {
       externalSkuId: skuId,
       skuAttr: values.map((v, i) => `${seed.options[i].name}:${v}`).join(";"),
@@ -280,7 +294,7 @@ export class MockSupplierAdapter implements SupplierAdapter {
       currency: "USD",
       paymentUrl: `https://example.com/pay/${externalOrderId}`,
     };
-    ORDERS.set(input.reference, { placedAt: Date.now(), input, result });
+    rememberOrder(input.reference, { placedAt: Date.now(), input, result });
     ORDERS.set(externalOrderId, { placedAt: Date.now(), input, result });
     return result;
   }

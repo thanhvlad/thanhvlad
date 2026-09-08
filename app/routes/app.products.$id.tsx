@@ -174,7 +174,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       }
       case "auto-map": {
         const useAi = get("useAi") === "true";
-        const suggestion = await suggestMappingForProduct(id, get("supplierProductId"), { useAi });
+        const suggestion = await suggestMappingForProduct(id, get("supplierProductId"), { useAi, shopId: shop.id });
         const parts = [`${suggestion.rows.length} variant(s) matched`];
         if (suggestion.aiUsed) parts.push("AI resolved the harder ones");
         if (suggestion.unresolved) parts.push(`${suggestion.unresolved} still need you`);

@@ -19,7 +19,7 @@ import { StatusBadge } from "~/components/StatusBadge";
 import { STAGE_ORDER } from "~/domain/orders/pipeline";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { formatMoney, relativeTime } from "~/lib/format";
-import { createJobRun } from "~/services/jobs.server";
+import { findOrCreateJobRun } from "~/services/jobs.server";
 import { enqueue } from "~/services/jobs/index.server";
 import { listNotifications } from "~/services/notifications.server";
 import { getDashboardStats } from "~/services/reports.server";
@@ -47,14 +47,18 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const { shop } = await requireShop(request);
   const { intent } = await readForm(request);
   if (intent === "sync-orders") {
-    const job = await createJobRun({ shopId: shop.id, type: "sync-orders", payload: { days: 30 } });
-    await enqueue("sync-orders", { shopId: shop.id, days: 30, jobRunId: job.id }, { dedupeKey: `sync-orders-${shop.id}` });
-    return { ok: true, jobRunId: job.id };
+    const { job, reused } = await findOrCreateJobRun({ shopId: shop.id, type: "sync-orders", payload: { days: 30 } });
+    if (!reused) {
+      await enqueue("sync-orders", { shopId: shop.id, days: 30, jobRunId: job.id }, { dedupeKey: `sync-orders-${shop.id}` });
+    }
+    return { ok: true, jobRunId: job.id, message: reused ? "A sync is already running." : undefined };
   }
   if (intent === "sync-suppliers") {
-    const job = await createJobRun({ shopId: shop.id, type: "sync-purchase-orders" });
-    await enqueue("sync-purchase-orders", { shopId: shop.id, jobRunId: job.id }, { dedupeKey: `sync-po-manual-${shop.id}` });
-    return { ok: true, jobRunId: job.id };
+    const { job, reused } = await findOrCreateJobRun({ shopId: shop.id, type: "sync-purchase-orders" });
+    if (!reused) {
+      await enqueue("sync-purchase-orders", { shopId: shop.id, jobRunId: job.id }, { dedupeKey: `sync-po-manual-${shop.id}` });
+    }
+    return { ok: true, jobRunId: job.id, message: reused ? "A supplier check is already running." : undefined };
   }
   return { ok: false };
 };

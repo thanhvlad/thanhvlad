@@ -27,15 +27,31 @@ export async function inviteStaff(
   return row;
 }
 
+/**
+ * A staff row on the account that owns this shop.
+ *
+ * Both mutations below take an id from a form field, so without the scope any
+ * signed-in merchant could promote or remove a member of another organisation.
+ */
+async function ownedStaff(shopId: string, id: string) {
+  const shop = await prisma.shop.findUnique({ where: { id: shopId }, select: { accountId: true } });
+  if (!shop?.accountId) throw new Error("Staff member not found");
+  const row = await prisma.staffAccount.findFirst({ where: { id, accountId: shop.accountId } });
+  if (!row) throw new Error("Staff member not found");
+  return row;
+}
+
 export async function updateStaffRole(shopId: string, id: string, role: StaffRole, shopScopes?: string[]) {
-  const row = await prisma.staffAccount.update({ where: { id }, data: { role, ...(shopScopes ? { shopScopes } : {}) } });
+  const owned = await ownedStaff(shopId, id);
+  const row = await prisma.staffAccount.update({ where: { id: owned.id }, data: { role, ...(shopScopes ? { shopScopes } : {}) } });
   await logActivity(shopId, { action: "staff.updated", entity: "StaffAccount", entityId: id, message: `${row.email} is now ${role}.` });
   return row;
 }
 
 export async function removeStaff(shopId: string, id: string) {
-  const row = await prisma.staffAccount.delete({ where: { id } });
-  await logActivity(shopId, { action: "staff.removed", entity: "StaffAccount", entityId: id, message: `${row.email} removed.` });
+  const owned = await ownedStaff(shopId, id);
+  await prisma.staffAccount.delete({ where: { id: owned.id } });
+  await logActivity(shopId, { action: "staff.removed", entity: "StaffAccount", entityId: id, message: `${owned.email} removed.` });
 }
 
 /** Role for the current Shopify user, defaulting to OWNER for the store owner. */

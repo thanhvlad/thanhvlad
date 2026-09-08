@@ -1,6 +1,7 @@
 import { SupplierError } from "~/lib/errors";
 import { env } from "~/lib/env.server";
 import { money } from "~/lib/money";
+import { logger } from "~/lib/logger.server";
 import { httpJson } from "./http.server";
 import type {
   PlaceOrderInput,
@@ -46,6 +47,11 @@ const STATUS_MAP: Record<string, SupplierOrderState> = {
   CANCELED: "CANCELED",
 };
 
+/** Variants CJ's per-variant stock endpoint is called for on one product read. */
+const STOCK_PROBE_LIMIT = 60;
+/** Nominal stock for a variant whose real quantity could not be read. */
+const UNKNOWN_STOCK = 50;
+
 export class CjDropshippingAdapter implements SupplierAdapter {
   readonly platform = "CJ_DROPSHIPPING" as const;
   readonly displayName = "CJ Dropshipping";
@@ -71,7 +77,7 @@ export class CjDropshippingAdapter implements SupplierAdapter {
     return Boolean(this.token || (env().CJ_EMAIL && env().CJ_API_KEY));
   }
 
-  private async request<T>(path: string, options: { method?: "GET" | "POST"; query?: Record<string, string | number | undefined>; body?: unknown; auth?: boolean } = {}): Promise<T> {
+  private async request<T>(path: string, options: { method?: "GET" | "POST"; query?: Record<string, string | number | undefined>; body?: unknown; auth?: boolean; idempotent?: boolean } = {}): Promise<T> {
     if (options.auth !== false && !this.token) {
       throw new SupplierError("SUPPLIER_NOT_AUTHORIZED", "Connect a CJ Dropshipping account first.");
     }
@@ -80,12 +86,24 @@ export class CjDropshippingAdapter implements SupplierAdapter {
       query: options.query,
       body: options.body,
       headers: this.token && options.auth !== false ? { "CJ-Access-Token": this.token } : {},
+      // Order creation and cancellation are attempted once: a retry after a
+      // timeout can commit the same order twice at the supplier.
+      ...(options.idempotent === false ? { idempotent: false } : {}),
     });
     if (!envelope || envelope.result === false || (envelope.code && envelope.code !== 200)) {
       const message = envelope?.message ?? "CJ API error";
       const authFailure = /token|login|unauthor/i.test(message) || envelope?.code === 1600100 || envelope?.code === 1600200;
       throw new SupplierError(authFailure ? "SUPPLIER_NOT_AUTHORIZED" : "SUPPLIER_API", message, {
         retryable: /too many|limit|frequent/i.test(message),
+        details: envelope as unknown as Json,
+      });
+    }
+    // A success envelope with no data is not a success for the caller: it was
+    // dereferenced blind, and placeOrder persisted the literal string "null" as
+    // the supplier's order id.
+    if (envelope.data === null || envelope.data === undefined) {
+      throw new SupplierError("SUPPLIER_API", `CJ returned no data for ${path}.`, {
+        retryable: true,
         details: envelope as unknown as Json,
       });
     }
@@ -172,20 +190,34 @@ export class CjDropshippingAdapter implements SupplierAdapter {
     if (!data || !data.pid) return null;
     const variants = ((data.variants as Json[]) ?? []);
     const optionNames: string[] = [];
+    // CJ has no bulk stock endpoint, so stock is probed per variant and the
+    // probe is capped. A variant we did not probe, or whose probe was rate
+    // limited, has *unknown* stock — recording it as 0 would take a sellable
+    // SKU off sale and block every order for it.
     const stockByVid = new Map<string, number>();
+    const probed = new Set<string>();
     await Promise.all(
-      variants.slice(0, 60).map(async (v) => {
+      variants.slice(0, STOCK_PROBE_LIMIT).map(async (v) => {
         try {
           const stock = await this.request<Array<{ totalInventoryNum?: number; storageNum?: number }>>(
             "/product/stock/queryByVid",
             { query: { vid: String(v.vid) } },
           );
           stockByVid.set(String(v.vid), stock.reduce((n, s) => n + Number(s.totalInventoryNum ?? s.storageNum ?? 0), 0));
-        } catch {
-          stockByVid.set(String(v.vid), 0);
+          probed.add(String(v.vid));
+        } catch (error) {
+          logger.warn("CJ stock probe failed; treating stock as unknown", { vid: String(v.vid), error });
         }
       }),
     );
+    if (variants.length > STOCK_PROBE_LIMIT) {
+      logger.info("CJ product has more variants than the stock probe covers", {
+        pid: String(data.pid),
+        variants: variants.length,
+        probed: STOCK_PROBE_LIMIT,
+      });
+    }
+    const productAvailable = String(data.status ?? "3") === "3";
 
     const detail: SupplierProductDetail = {
       externalId: String(data.pid),
@@ -205,7 +237,11 @@ export class CjDropshippingAdapter implements SupplierAdapter {
           if (!optionNames.includes(name)) optionNames.push(name);
           return { name, value, image: null };
         });
-        const stock = stockByVid.get(String(v.vid)) ?? 0;
+        const known = probed.has(String(v.vid));
+        // Unknown stock follows the product's own availability flag and reports
+        // a nominal quantity, so the SKU stays orderable and the supplier is the
+        // one to say no.
+        const stock = known ? (stockByVid.get(String(v.vid)) ?? 0) : productAvailable ? UNKNOWN_STOCK : 0;
         return {
           externalSkuId: String(v.vid),
           skuAttr: (v.variantKey as string) ?? null,
@@ -215,7 +251,7 @@ export class CjDropshippingAdapter implements SupplierAdapter {
           price: money(v.variantSellPrice ?? 0),
           currency: "USD",
           stock,
-          isAvailable: stock > 0,
+          isAvailable: known ? stock > 0 : productAvailable,
           weightGrams: v.variantWeight ? Number(v.variantWeight) : null,
         };
       }),
@@ -265,6 +301,7 @@ export class CjDropshippingAdapter implements SupplierAdapter {
     const a = input.address;
     const orderId = await this.request<string>("/shopping/order/createOrder", {
       method: "POST",
+      idempotent: false,
       body: {
         orderNumber: input.reference,
         shippingZip: a.zip ?? "",

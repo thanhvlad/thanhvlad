@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Queue, Worker, type JobsOptions, type Processor } from "bullmq";
 import IORedis from "ioredis";
 import { env } from "~/lib/env.server";
@@ -15,7 +16,19 @@ import type { EnqueueOptions, JobName, JobPayloads } from "./types";
 
 export type JobHandler<N extends JobName> = (payload: JobPayloads[N], meta: { jobId: string; attempt: number }) => Promise<unknown>;
 
-const handlers = new Map<JobName, JobHandler<JobName>>();
+declare global {
+  // eslint-disable-next-line no-var
+  var __dropshipJobHandlers: Map<JobName, JobHandler<JobName>> | undefined;
+}
+
+// On globalThis, like the Prisma client: Vite re-evaluates server modules on
+// every HMR update, and a module-scoped Map would be replaced by an empty one
+// while the boot flag that guards registration survives — every job would then
+// fail with "no handler registered" until the dev server is restarted.
+const handlers: Map<JobName, JobHandler<JobName>> =
+  globalThis.__dropshipJobHandlers ?? new Map<JobName, JobHandler<JobName>>();
+globalThis.__dropshipJobHandlers = handlers;
+
 const QUEUE_NAME = "dropship-hub";
 
 let connection: IORedis | null = null;
@@ -61,17 +74,23 @@ const inlineRunning = new Set<string>();
 export async function enqueue<N extends JobName>(name: N, payload: JobPayloads[N], options: EnqueueOptions = {}): Promise<string> {
   const q = getQueue();
   if (q) {
+    // Keys are added only when they carry a value. BullMQ merges the per-job
+    // options over defaultJobOptions, so an explicit `undefined` overwrites the
+    // default — passing `attempts: undefined` silently reduced every job to a
+    // single attempt and no job in the app was ever retried.
     const opts: JobsOptions = {
-      delay: options.delayMs,
-      attempts: options.attempts,
-      priority: options.priority,
-      ...(options.dedupeKey ? { jobId: sanitizeJobId(options.dedupeKey) } : {}),
+      ...(options.delayMs !== undefined ? { delay: options.delayMs } : {}),
+      ...(options.attempts !== undefined ? { attempts: options.attempts } : {}),
+      ...(options.priority !== undefined ? { priority: options.priority } : {}),
+      ...(options.dedupeKey ? { jobId: dedupeJobId(options.dedupeKey, dedupeWindow(options)) } : {}),
     };
     const job = await q.add(name, payload, opts);
     return job.id ?? name;
   }
 
-  const id = options.dedupeKey ? sanitizeJobId(options.dedupeKey) : `${name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const id = options.dedupeKey
+    ? dedupeJobId(options.dedupeKey, dedupeWindow(options))
+    : `${name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   if (options.dedupeKey && inlineRunning.has(id)) return id;
   inlineRunning.add(id);
   const run = async () => {
@@ -86,16 +105,30 @@ export async function enqueue<N extends JobName>(name: N, payload: JobPayloads[N
   return id;
 }
 
+/** Attempts an inline job gets, matching the queue's `defaultJobOptions`. */
+const INLINE_ATTEMPTS = 3;
+
 async function runInline<N extends JobName>(name: N, payload: JobPayloads[N], id: string) {
   const handler = handlers.get(name);
   if (!handler) {
     logger.warn("No handler registered for inline job", { name });
     return;
   }
-  try {
-    await handler(payload, { jobId: id, attempt: 1 });
-  } catch (error) {
-    logger.error("Inline job failed", { name, id, error });
+  // Inline mode retries too. Without it a webhook that failed once was never
+  // reprocessed: its WebhookEvent kept processedAt null forever and nothing in
+  // the app went back for it.
+  for (let attempt = 1; attempt <= INLINE_ATTEMPTS; attempt += 1) {
+    try {
+      await handler(payload, { jobId: id, attempt });
+      return;
+    } catch (error) {
+      if (attempt === INLINE_ATTEMPTS) {
+        logger.error("Inline job failed", { name, id, attempt, error });
+        return;
+      }
+      logger.warn("Inline job failed; retrying", { name, id, attempt, error });
+      await new Promise((resolve) => setTimeout(resolve, 2_000 * attempt).unref?.());
+    }
   }
 }
 
@@ -116,6 +149,9 @@ export function startWorker(options: { concurrency?: number } = {}): Worker | nu
     prefix: env().QUEUE_PREFIX,
     concurrency: options.concurrency ?? 5,
   });
+  // Without an 'error' listener a Redis blip is an unhandled EventEmitter
+  // 'error' event, which takes the whole worker process down.
+  worker.on("error", (error) => logger.error("Queue worker error", { error }));
   worker.on("failed", (job, error) => logger.error("Job failed", { name: job?.name, id: job?.id, attempt: job?.attemptsMade, error }));
   worker.on("completed", (job) => logger.debug("Job completed", { name: job.name, id: job.id }));
   logger.info("Queue worker started", { concurrency: options.concurrency ?? 5 });
@@ -173,7 +209,33 @@ export async function queueStats(): Promise<QueueStats> {
   };
 }
 
+/** Default window a dedupe key collapses duplicates over. */
+const DEFAULT_DEDUPE_WINDOW_MS = 5 * 60_000;
+
+function dedupeWindow(options: EnqueueOptions): number {
+  return options.dedupeWindowMs ?? DEFAULT_DEDUPE_WINDOW_MS;
+}
+
+/**
+ * Job id for a dedupe key, valid for one window.
+ *
+ * BullMQ refuses a job whose id it already holds, and completed jobs are kept
+ * for a day. A bare dedupe key as the job id therefore did not collapse
+ * duplicates — it made the job run at most once every 24 hours. Every periodic
+ * sync silently degraded to daily, and a merchant's manual "sync orders" button
+ * was a no-op until the next day. Bucketing by time makes the key mean what it
+ * says: one run per window.
+ */
+function dedupeJobId(key: string, windowMs: number): string {
+  const bucket = Math.floor(Date.now() / Math.max(1_000, windowMs));
+  return sanitizeJobId(`${key}-${bucket}`);
+}
+
 function sanitizeJobId(key: string) {
-  // BullMQ job ids cannot contain ":".
-  return key.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 200);
+  // BullMQ job ids cannot contain ":". Hashing the overflow keeps two long keys
+  // that share a prefix from collapsing onto one id.
+  const safe = key.replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (safe.length <= 180) return safe;
+  const digest = createHash("sha1").update(key).digest("hex").slice(0, 16);
+  return `${safe.slice(0, 163)}-${digest}`;
 }

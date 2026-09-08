@@ -27,3 +27,13 @@ CREATE UNIQUE INDEX "PurchaseOrder_orderId_idempotencyKey_key" ON "PurchaseOrder
 -- CreateIndex
 CREATE INDEX "PurchaseOrderItem_orderLineItemId_idx" ON "PurchaseOrderItem"("orderLineItemId");
 
+-- DropIndex
+DROP INDEX "SupplierShippingOption_supplierProductId_shipFromCountry_sh_key";
+
+-- AlterTable
+ALTER TABLE "SupplierShippingOption" ADD COLUMN     "externalSkuId" TEXT NOT NULL DEFAULT '',
+ADD COLUMN     "quantity" INTEGER NOT NULL DEFAULT 1;
+
+-- CreateIndex
+CREATE UNIQUE INDEX "SupplierShippingOption_supplierProductId_shipFromCountry_sh_key" ON "SupplierShippingOption"("supplierProductId", "shipFromCountry", "shipToCountry", "carrierCode", "quantity", "externalSkuId");
+

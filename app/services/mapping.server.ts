@@ -139,10 +139,15 @@ export interface MappingSuggestionResult {
 export async function suggestMappingForProduct(
   productId: string,
   supplierProductId: string,
-  options: { useAi?: boolean; threshold?: number } = {},
+  options: { useAi?: boolean; threshold?: number; shopId?: string } = {},
 ): Promise<MappingSuggestionResult> {
   const [product, supplier] = await Promise.all([
-    prisma.product.findUnique({ where: { id: productId }, select: { title: true, variants: { orderBy: { position: "asc" } } } }),
+    // Scoped when the caller knows the shop: the product id comes from the URL
+    // and would otherwise read another store's catalogue.
+    prisma.product.findFirst({
+      where: { id: productId, ...(options.shopId ? { shopId: options.shopId } : {}) },
+      select: { title: true, variants: { orderBy: { position: "asc" } } },
+    }),
     getSupplierProductWithVariants(supplierProductId),
   ]);
   if (!product || !supplier) {

@@ -195,7 +195,14 @@ export async function adapterForShop(shopId: string, platform: SupplierPlatform)
       isActive: true,
       OR: [{ shopId }, ...(shop?.accountId ? [{ accountId: shop.accountId, shopId: null }] : [])],
     },
-    orderBy: [{ isDefault: "desc" }, { shopId: "desc" }, { lastUsedAt: "desc" }],
+    // `nulls: "last"` matters: Postgres puts NULLs first on a DESC sort, so an
+    // org-wide account (shopId null) would outrank the shop's own account and
+    // the wrong supplier login would place the order.
+    orderBy: [
+      { isDefault: "desc" },
+      { shopId: { sort: "desc", nulls: "last" } },
+      { lastUsedAt: { sort: "desc", nulls: "last" } },
+    ],
   });
   const chosen = candidates[0];
   if (!chosen) return { adapter: getAdapter(platform), account: null };

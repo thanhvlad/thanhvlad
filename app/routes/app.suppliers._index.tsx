@@ -52,7 +52,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         await disconnectSupplierAccount(shop.id, get("id"));
         return { ok: true, message: "Account disconnected." };
       case "test": {
-        const result = await testSupplierAccount(get("id"));
+        const result = await testSupplierAccount(shop.id, get("id"));
         return { ok: result.ok, message: result.ok ? result.message : undefined, error: result.ok ? undefined : result.message };
       }
       default:

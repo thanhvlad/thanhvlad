@@ -15,7 +15,9 @@ export async function handleWebhookRequest({ request }: ActionFunctionArgs) {
   try {
     const event = await recordWebhook({ shopDomain: shop, topic, webhookId, payload });
     if (event) {
-      await enqueue("process-webhook", { webhookEventId: event.id }, { dedupeKey: `webhook-${event.id}` });
+      // A long window: Shopify re-delivers the same event id for up to two days,
+      // and each delivery must collapse onto the one job.
+      await enqueue("process-webhook", { webhookEventId: event.id }, { dedupeKey: `webhook-${event.id}`, dedupeWindowMs: 24 * 60 * 60_000 });
     }
   } catch (error) {
     // Still 200: Shopify would otherwise retry and we already logged it.

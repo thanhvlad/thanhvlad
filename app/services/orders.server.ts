@@ -147,7 +147,9 @@ export async function evaluateAndStoreOrder(shop: ShopWithSettings, orderId: str
       },
     },
   });
-  if (!order) throw new Error("Order not found");
+  // Scoped here rather than at each call site: every order mutation funnels
+  // through this function, and the ids reach it straight from form fields.
+  if (!order || order.shopId !== shop.id) throw new Error("Order not found");
   const settings = shop.parsedSettings.orders;
 
   const stored = order.shippingAddress as ShippingAddress;

@@ -9,6 +9,14 @@ export interface HttpOptions {
   form?: Record<string, string>;
   timeoutMs?: number;
   retries?: number;
+  /**
+   * Set on a call that changes state at the supplier (creating an order,
+   * cancelling one). A retry of such a call after a timeout can place the order
+   * twice, because a lost response says nothing about whether the supplier
+   * committed it. Non-idempotent calls are attempted exactly once and their
+   * failures are surfaced as retryable so the caller can decide.
+   */
+  idempotent?: boolean;
 }
 
 /**
@@ -32,7 +40,8 @@ export async function httpJson<T>(url: string, options: HttpOptions = {}): Promi
     body = JSON.stringify(options.body);
   }
 
-  const retries = options.retries ?? 2;
+  // A state-changing call is never retried inside the transport.
+  const retries = options.idempotent === false ? 0 : (options.retries ?? 2);
   let attempt = 0;
   let lastError: unknown;
 

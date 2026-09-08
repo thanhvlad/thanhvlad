@@ -26,6 +26,29 @@ export async function createJobRun(input: {
 }
 
 /**
+ * Reuse the run already in flight for this shop and type, or start a new one.
+ *
+ * A manual "sync now" button creates a JobRun and then enqueues with a dedupe
+ * key. When the key suppresses the enqueue — because a sync is already running
+ * — the new JobRun would be orphaned at QUEUED forever, and the progress banner
+ * would never finish. Handing back the running job instead shows the merchant
+ * the sync that is actually happening.
+ */
+export async function findOrCreateJobRun(input: {
+  shopId: string;
+  type: string;
+  total?: number;
+  payload?: Record<string, unknown>;
+}): Promise<{ job: JobRun; reused: boolean }> {
+  const existing = await prisma.jobRun.findFirst({
+    where: { shopId: input.shopId, type: input.type, status: { in: ["QUEUED", "RUNNING"] } },
+    orderBy: { createdAt: "desc" },
+  });
+  if (existing) return { job: existing, reused: true };
+  return { job: await createJobRun(input), reused: false };
+}
+
+/**
  * Mark a run as started.
  *
  * The counters are reset: the queue retries a failed job up to three times with

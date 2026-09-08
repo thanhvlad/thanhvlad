@@ -31,6 +31,9 @@ export async function recordWebhook(input: { shopDomain: string; topic: string; 
   }
 }
 
+/** How long a webhook waits for its shop to appear before being given up on. */
+const WEBHOOK_ORPHAN_TIMEOUT_MS = 60 * 60_000;
+
 /** Handle a stored webhook. Idempotent per event row. */
 export async function processWebhookEvent(webhookEventId: string) {
   const event = await prisma.webhookEvent.findUnique({ where: { id: webhookEventId }, include: { shop: true } });
@@ -40,8 +43,22 @@ export async function processWebhookEvent(webhookEventId: string) {
   try {
     const shop = event.shop ? await getShopByDomain(event.shop.domain) : null;
     if (!shop) {
-      await prisma.webhookEvent.update({ where: { id: event.id }, data: { processedAt: new Date(), error: "shop not found" } });
-      return;
+      // Not marked processed. A webhook can legitimately arrive before the
+      // install finishes writing the Shop row, and permanently retiring it here
+      // silently dropped the delivery — including GDPR topics, which must not
+      // be lost. It is retried until the shop appears or the delivery ages out.
+      const age = Date.now() - event.createdAt.getTime();
+      const message = `shop not found (waiting ${Math.round(age / 60_000)} min)`;
+      if (age > WEBHOOK_ORPHAN_TIMEOUT_MS) {
+        await prisma.webhookEvent.update({
+          where: { id: event.id },
+          data: { processedAt: new Date(), error: "shop not found; gave up" },
+        });
+        logger.warn("Dropping webhook for an unknown shop", { topic: event.topic, id: event.id });
+        return;
+      }
+      await prisma.webhookEvent.update({ where: { id: event.id }, data: { error: message } });
+      throw new Error(message);
     }
 
     switch (event.topic) {
@@ -58,6 +75,9 @@ export async function processWebhookEvent(webhookEventId: string) {
       case "ORDERS_CANCELLED": {
         const client = await offlineClient(shop.domain);
         const shopifyOrderId = gid("Order", String(payload.admin_graphql_api_id ?? payload.id ?? ""));
+        // Same empty-id guard the other order topics have: without an id the
+        // gid is a bare prefix and the Admin API lookup errors out.
+        if (shopifyOrderId.endsWith("/")) break;
         const order = await refreshOrderFromShopify(shop, client, shopifyOrderId);
         if (order && shop.parsedSettings.orders.cancelSupplierOnCancel) {
           const pos = await prisma.purchaseOrder.findMany({ where: { orderId: order.id, status: { in: ["PLACED", "AWAITING_PAYMENT", "PAID"] } } });

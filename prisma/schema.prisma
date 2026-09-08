@@ -291,11 +291,17 @@ model SupplierShippingOption {
   hasTracking     Boolean @default(true)
   isFreeShipping  Boolean @default(false)
 
+  /// Quantity and SKU the quote was priced for. Suppliers price per parcel, so
+  /// a 1-unit quote served for a 5-unit order understates the shipping cost and
+  /// can point at a carrier that will not take the parcel.
+  quantity      Int     @default(1)
+  externalSkuId String  @default("")
+
   fetchedAt DateTime @default(now())
 
   supplierProduct SupplierProduct @relation(fields: [supplierProductId], references: [id], onDelete: Cascade)
 
-  @@unique([supplierProductId, shipFromCountry, shipToCountry, carrierCode])
+  @@unique([supplierProductId, shipFromCountry, shipToCountry, carrierCode, quantity, externalSkuId])
   @@index([supplierProductId, shipToCountry])
 }
 

@@ -40,8 +40,15 @@ export type JobName = keyof JobPayloads;
 export interface EnqueueOptions {
   /** Delay before the job runs. */
   delayMs?: number;
-  /** Collapse duplicates: two enqueues with the same key run once. */
+  /** Collapse duplicates: two enqueues with the same key inside one window run once. */
   dedupeKey?: string;
+  /**
+   * How long that key collapses duplicates for. Defaults to five minutes.
+   *
+   * It must be shorter than the interval a periodic job runs on, or the job is
+   * refused as a duplicate of its own previous run.
+   */
+  dedupeWindowMs?: number;
   attempts?: number;
   priority?: number;
 }

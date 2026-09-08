@@ -88,21 +88,25 @@ export async function cacheSupplierProduct(
   }
   // SKUs the supplier dropped are marked unavailable rather than deleted so
   // existing mappings can surface a clear "supplier removed this SKU" error.
-  await prisma.supplierVariant.updateMany({
-    where: { supplierProductId: product.id, externalSkuId: { notIn: [...seen] } },
-    data: { isAvailable: false, stock: 0 },
-  });
+  //
+  // Only when the response actually carried variants. `notIn: []` matches every
+  // row, so a response we could not parse — or one the supplier truncated —
+  // would mark the entire product unavailable and stop every order for it.
+  if (seen.size > 0) {
+    await prisma.supplierVariant.updateMany({
+      where: { supplierProductId: product.id, externalSkuId: { notIn: [...seen] } },
+      data: { isAvailable: false, stock: 0 },
+    });
+  } else {
+    logger.warn("Supplier returned no variants; keeping the cached ones", {
+      supplierProductId: product.id,
+      platform: product.platform,
+      externalId: product.externalId,
+    });
+  }
 
   if (detail.variants.length > 0) {
-    await prisma.supplierPriceSnapshot.createMany({
-      data: detail.variants.map((v) => ({
-        supplierProductId: product.id,
-        externalSkuId: v.externalSkuId,
-        price: v.price,
-        currency: v.currency,
-        stock: v.stock,
-      })),
-    });
+    await recordPriceSnapshots(product.id, detail.variants);
   }
 
   const variants = await prisma.supplierVariant.findMany({
@@ -110,6 +114,43 @@ export async function cacheSupplierProduct(
     orderBy: { createdAt: "asc" },
   });
   return { ...product, variants };
+}
+
+/** Keep at most one snapshot per SKU per hour, and only when something moved. */
+const SNAPSHOT_INTERVAL_MS = 60 * 60_000;
+
+async function recordPriceSnapshots(
+  supplierProductId: string,
+  variants: Array<{ externalSkuId: string; price: string | number; currency: string; stock: number }>,
+) {
+  const since = new Date(Date.now() - SNAPSHOT_INTERVAL_MS);
+  const recent = await prisma.supplierPriceSnapshot.findMany({
+    where: { supplierProductId, capturedAt: { gte: since } },
+    orderBy: { capturedAt: "desc" },
+  });
+  const latest = new Map<string, (typeof recent)[number]>();
+  for (const row of recent) {
+    if (!latest.has(row.externalSkuId)) latest.set(row.externalSkuId, row);
+  }
+
+  // Every fetch used to write a row per variant, forever. The history is only
+  // useful when it records a change.
+  const fresh = variants.filter((v) => {
+    const previous = latest.get(v.externalSkuId);
+    if (!previous) return true;
+    return String(previous.price) !== String(v.price) || previous.stock !== v.stock;
+  });
+  if (fresh.length === 0) return;
+
+  await prisma.supplierPriceSnapshot.createMany({
+    data: fresh.map((v) => ({
+      supplierProductId,
+      externalSkuId: v.externalSkuId,
+      price: v.price,
+      currency: v.currency,
+      stock: v.stock,
+    })),
+  });
 }
 
 function sanitizeRaw(detail: SupplierProductDetail): Prisma.InputJsonValue {
@@ -165,19 +206,27 @@ export async function refreshSupplierProduct(
   }
 }
 
-export async function cacheShippingOptions(supplierProductId: string, quotes: SupplierShippingQuote[]) {
+export async function cacheShippingOptions(
+  supplierProductId: string,
+  quotes: SupplierShippingQuote[],
+  key: { quantity: number; externalSkuId: string } = { quantity: 1, externalSkuId: "" },
+) {
   for (const quote of quotes) {
     await prisma.supplierShippingOption.upsert({
       where: {
-        supplierProductId_shipFromCountry_shipToCountry_carrierCode: {
+        supplierProductId_shipFromCountry_shipToCountry_carrierCode_quantity_externalSkuId: {
           supplierProductId,
           shipFromCountry: quote.shipFromCountry,
           shipToCountry: quote.shipToCountry,
           carrierCode: quote.carrierCode,
+          quantity: key.quantity,
+          externalSkuId: key.externalSkuId,
         },
       },
       create: {
         supplierProductId,
+        quantity: key.quantity,
+        externalSkuId: key.externalSkuId,
         shipFromCountry: quote.shipFromCountry,
         shipToCountry: quote.shipToCountry,
         carrierCode: quote.carrierCode,
@@ -214,8 +263,19 @@ export async function getShippingOptions(
   const country = params.shipToCountry.toUpperCase();
   const maxAge = (params.maxAgeMinutes ?? 360) * 60_000;
 
+  // The cache key carries the quantity and SKU the quote was priced for:
+  // suppliers price per parcel, so serving a 1-unit quote for a 5-unit order
+  // understates the cost and can pick a carrier that will not take the parcel.
+  const quantity = Math.max(1, Math.trunc(params.quantity ?? 1));
+  const externalSkuId = params.externalSkuId ?? "";
   const cached = await prisma.supplierShippingOption.findMany({
-    where: { supplierProductId, shipToCountry: country, fetchedAt: { gte: new Date(Date.now() - maxAge) } },
+    where: {
+      supplierProductId,
+      shipToCountry: country,
+      quantity,
+      externalSkuId,
+      fetchedAt: { gte: new Date(Date.now() - maxAge) },
+    },
   });
   if (cached.length > 0) {
     return cached.map((o) => ({
@@ -235,11 +295,11 @@ export async function getShippingOptions(
   const { adapter } = await adapterForShop(shopId, product.platform);
   const quotes = await adapter.getShippingQuotes({
     externalId: product.externalId,
-    externalSkuId: params.externalSkuId ?? null,
-    quantity: params.quantity ?? 1,
+    externalSkuId: externalSkuId || null,
+    quantity,
     shipToCountry: country,
   });
-  await cacheShippingOptions(supplierProductId, quotes);
+  await cacheShippingOptions(supplierProductId, quotes, { quantity, externalSkuId });
   return quotes;
 }
 
