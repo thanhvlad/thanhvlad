@@ -185,6 +185,7 @@ export async function ensureSchedules() {
     await q.upsertJobScheduler(`tick-${tick.kind}`, { every: tick.every }, { name: "scheduler-tick", data: { kind: tick.kind } });
   }
   await q.upsertJobScheduler("refresh-rates-usd", { every: 12 * 60 * 60_000 }, { name: "refresh-rates", data: { base: "USD" } });
+  await q.upsertJobScheduler("purge-uninstalled", { every: 24 * 60 * 60_000 }, { name: "purge-uninstalled", data: {} });
   logger.info("Repeatable schedules registered");
 }
 

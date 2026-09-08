@@ -7,6 +7,7 @@ import { addToImportList, pushImportedProduct } from "../import.server";
 import { runInventorySync } from "../inventory-sync.server";
 import { runJob } from "../jobs.server";
 import { hasFeature } from "../billing.server";
+import { purgeUninstalledShops } from "../compliance.server";
 import { notify, sendDigest } from "../notifications.server";
 import { checkPayments, sendPaymentReminders } from "../payments.server";
 import { syncOrdersFromShopify } from "../orders.server";
@@ -183,6 +184,12 @@ export function registerAllHandlers() {
     const shop = await prisma.shop.findUnique({ where: { id: shopId }, select: { id: true, name: true, domain: true, settings: true, timezone: true, isActive: true } });
     if (!shop || !shop.isActive) return;
     return sendDigest(shop);
+  });
+
+  registerHandler("purge-uninstalled", async ({ retentionDays }) => {
+    const result = await purgeUninstalledShops(new Date(), retentionDays);
+    if (result.purged.length > 0) logger.info("Purged uninstalled stores", { shops: result.purged });
+    return result;
   });
 
   registerHandler("refresh-rates", async ({ base }) => {

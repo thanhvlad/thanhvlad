@@ -33,6 +33,8 @@ export interface JobPayloads {
   "rollup-metrics": { shopId: string; days: number };
   /** Send the daily notification digest for a shop, if it is due. */
   "email-digest": { shopId: string };
+  /** Erase stores still uninstalled after the retention window. */
+  "purge-uninstalled": { retentionDays?: number };
   /** Fan-out tick: enqueue the per-shop periodic jobs for every active shop. */
   "scheduler-tick": { kind: "purchase-orders" | "inventory" | "metrics" | "auto-place" | "tracking" | "payments" | "email-digest" };
 }

@@ -58,6 +58,13 @@ export default function NotificationsPage() {
                             {n.body}
                           </Text>
                         )}
+                        {Boolean((n.meta as { dataRequest?: unknown } | null)?.dataRequest) && (
+                          <InlineStack>
+                            <Button size="slim" url={`/app/notifications/${n.id}/export`} target="_blank">
+                              {t("notifications.downloadExport")}
+                            </Button>
+                          </InlineStack>
+                        )}
                         <Text as="p" tone="subdued" variant="bodySm">
                           {relativeTime(n.createdAt)}
                         </Text>

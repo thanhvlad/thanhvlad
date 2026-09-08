@@ -300,6 +300,7 @@ const en = {
   "notifications.emptyBody": "Failed orders, supplier price changes, stock-outs and finished jobs show up here.",
   "notifications.markAllRead": "Mark all read",
   "notifications.markRead": "Mark read",
+  "notifications.downloadExport": "Download customer data export (JSON)",
 
   // ---- orders --------------------------------------------------------------
   "orders.address.address1": "Address 1",
@@ -1277,6 +1278,7 @@ const vi: Partial<Record<I18nKey, string>> = {
   "notifications.emptyBody": "Đơn đặt lỗi, nhà cung cấp đổi giá, hết hàng và tác vụ chạy xong sẽ hiện ở đây.",
   "notifications.markAllRead": "Đánh dấu đã đọc tất cả",
   "notifications.markRead": "Đã đọc",
+  "notifications.downloadExport": "Tải dữ liệu khách hàng (JSON)",
 
   // ---- orders --------------------------------------------------------------
   "orders.address.address1": "Địa chỉ 1",

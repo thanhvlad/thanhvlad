@@ -4,6 +4,7 @@ import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
 import { logActivity } from "./activity.server";
 import { applySubscriptionWebhook } from "./billing.server";
+import { handleCustomerDataRequest, redactCustomer, redactShop } from "./compliance.server";
 import { cancelPurchaseOrder } from "./fulfillment.server";
 import { handleFulfillmentRequest } from "./fulfillment-service.server";
 import { refreshOrderFromShopify } from "./orders.server";
@@ -127,36 +128,16 @@ export async function processWebhookEvent(webhookEventId: string) {
         break;
       }
       case "CUSTOMERS_DATA_REQUEST": {
-        await logActivity(shop.id, { action: "gdpr.data_request", message: "Customer data request received.", meta: { customerId: payload.customer } });
+        await handleCustomerDataRequest(shop, payload);
         break;
       }
       case "CUSTOMERS_REDACT": {
-        const orderIds = ((payload.orders_to_redact as number[] | undefined) ?? []).map((id) => gid("Order", id));
-        await prisma.order.updateMany({
-          where: { shopId: shop.id, shopifyOrderId: { in: orderIds } },
-          data: { customerName: null, customerEmail: null, phone: null, shippingAddress: {} },
-        });
-        await logActivity(shop.id, { action: "gdpr.customer_redact", message: `Redacted ${orderIds.length} order(s).` });
+        await redactCustomer(shop, payload);
         break;
       }
       case "SHOP_REDACT": {
-        // Deleting the Shop row is not erasure on its own. Session rows are
-        // keyed by the raw domain with no relation to Shop, so no cascade
-        // reaches them and the store's live access token would survive a
-        // request for erasure; the Account row and its account-scoped supplier
-        // tokens are orphaned the same way.
-        const { domain, accountId } = shop;
-        await prisma.session.deleteMany({ where: { shop: domain } });
-        await prisma.shop.delete({ where: { id: shop.id } }).catch(() => undefined);
-        if (accountId) {
-          const remaining = await prisma.shop.count({ where: { accountId } });
-          if (remaining === 0) {
-            // Cascades to StaffAccount and the account-scoped SupplierAccount
-            // rows holding encrypted supplier tokens.
-            await prisma.account.delete({ where: { id: accountId } }).catch(() => undefined);
-          }
-        }
-        await logActivity(shop.id, { action: "gdpr.shop_redact", message: `Store ${domain} redacted.` }).catch(() => undefined);
+        await logActivity(shop.id, { action: "gdpr.shop_redact", message: `Store ${shop.domain} redacted.` }).catch(() => undefined);
+        await redactShop(shop, "shop/redact webhook");
         // The WebhookEvent row cascaded away with the Shop, so there is nothing
         // left to mark processed.
         return;
