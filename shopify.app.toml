@@ -2,14 +2,14 @@
 # Run `shopify app config link` to bind this file to an app in your Partner dashboard;
 # the CLI fills in client_id and application_url.
 
-name = "DropshipHub"
-handle = "dropship-hub"
+name = "WS Fullfill App"
+handle = "ws-fullfill-app"
 client_id = ""
-application_url = "https://example.com"
+application_url = "https://dropship.windspace.agency"
 embedded = true
 
 [build]
-automatically_update_urls_on_dev = true
+automatically_update_urls_on_dev = false
 include_config_on_deploy = true
 
 [webhooks]
@@ -54,9 +54,8 @@ scopes = "read_products,write_products,read_publications,write_publications,read
 
 [auth]
 redirect_urls = [
-  "https://example.com/auth/callback",
-  "https://example.com/auth/shopify/callback",
-  "https://example.com/api/auth/callback"
+  "https://dropship.windspace.agency/auth/callback",
+  "https://dropship.windspace.agency/auth/shopify/callback"
 ]
 
 [pos]

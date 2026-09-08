@@ -5,6 +5,7 @@ import { Badge, Banner, BlockStack, Button, Card, EmptyState, IndexTable, Inline
 import type { OrderStage } from "@prisma/client";
 import { JobProgress } from "~/components/JobProgress";
 import { useJobRun } from "~/lib/use-job-run";
+import { downloadAuthed } from "~/lib/download.client";
 import { Paginator } from "~/components/Paginator";
 import { StatusBadge } from "~/components/StatusBadge";
 import { STAGE_ORDER } from "~/domain/orders/pipeline";
@@ -110,7 +111,7 @@ export default function OrdersPage() {
       secondaryActions={[
         { content: t("orders.syncFromShopify"), onAction: () => fetcher.submit({ intent: "sync", days: "30" }, { method: "post" }) },
         { content: t("orders.checkSupplierStatus"), onAction: () => fetcher.submit({ intent: "sync-suppliers" }, { method: "post" }) },
-        { content: t("action.export"), url: `/app/orders/export?${params.toString()}`, external: true },
+        { content: t("action.export"), onAction: () => downloadAuthed(`/app/orders/export?${params.toString()}`, "orders.csv") },
       ]}
     >
       <Layout>

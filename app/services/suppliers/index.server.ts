@@ -42,7 +42,6 @@ export function getAdapter(platform: SupplierPlatform, credentials: SupplierCred
 }
 
 export function listPlatforms(): PlatformInfo[] {
-  const mockMode = env().SUPPLIER_DRIVER === "mock";
   const ali = new AliExpressAdapter();
   const cj = new CjDropshippingAdapter();
   return [
@@ -51,7 +50,7 @@ export function listPlatforms(): PlatformInfo[] {
       displayName: "AliExpress",
       description: "Official Dropshipping API. Search, import, place orders and track shipments.",
       authMode: "oauth",
-      configured: mockMode || ali.isConfigured(),
+      configured: ali.isConfigured(),
       capabilities: ali.capabilities,
     },
     {
@@ -59,7 +58,7 @@ export function listPlatforms(): PlatformInfo[] {
       displayName: "CJ Dropshipping",
       description: "Warehouses in CN/US/EU, POD and branding services.",
       authMode: "apikey",
-      configured: mockMode || cj.isConfigured(),
+      configured: cj.isConfigured(),
       capabilities: cj.capabilities,
     },
     {

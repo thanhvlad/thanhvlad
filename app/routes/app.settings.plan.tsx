@@ -3,12 +3,11 @@ import { useFetcher, useLoaderData, useSearchParams } from "@remix-run/react";
 import { Badge, Banner, BlockStack, Box, Button, Card, InlineGrid, InlineStack, Layout, List, ProgressBar, Text } from "@shopify/polaris";
 import { PLANS, PLAN_ORDER, planRank, usageFraction, type LimitedResource, type PlanId } from "~/domain/billing/plans";
 import { readForm, requireShop } from "~/lib/auth.server";
-import { env } from "~/lib/env.server";
 import { errorMessage } from "~/lib/errors";
 import { formatDate, formatMoney } from "~/lib/format";
 import type { I18nKey } from "~/lib/i18n";
 import { useErrorMessage, useLocale, useMessage, useT } from "~/lib/use-t";
-import { cancelSubscription, getAccountBilling, syncSubscription, type BillingApi } from "~/services/billing.server";
+import { cancelSubscription, getAccountBilling, syncSubscription } from "~/services/billing.server";
 
 /**
  * Plans and usage.
@@ -18,8 +17,7 @@ import { cancelSubscription, getAccountBilling, syncSubscription, type BillingAp
  * after they approve a charge and Shopify sends them back here.
  */
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { shop, admin } = await requireShop(request);
-  const billing = (admin as unknown as { billing?: BillingApi }).billing;
+  const { shop, billing } = await requireShop(request);
   let syncError: string | null = null;
   if (billing) {
     try {
@@ -41,9 +39,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { shop, admin, actor } = await requireShop(request);
-  const billing = (admin as unknown as { billing?: BillingApi }).billing;
-  if (!billing) return { ok: false, error: "Billing is not available on this session." };
+  const { shop, billing, actor } = await requireShop(request);
   const { intent, get } = await readForm(request);
   const account = await getAccountBilling(shop);
   try {
@@ -57,7 +53,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         await billing.request({
           plan: PLANS[plan].displayName,
           isTest: account.isTest,
-          returnUrl: `${env().SHOPIFY_APP_URL}/app/settings/plan?billing=return`,
+          returnUrl: `https://admin.shopify.com/store/${shop.domain.replace(/\.myshopify\.com$/, "")}/apps/ws-fullfill-app/app/settings/plan?billing=return`,
         });
         return { ok: true };
       }

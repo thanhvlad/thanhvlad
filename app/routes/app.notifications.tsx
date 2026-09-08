@@ -4,6 +4,7 @@ import { Badge, BlockStack, Box, Button, Card, EmptyState, InlineStack, Layout, 
 import { readForm, requireShop } from "~/lib/auth.server";
 import { relativeTime } from "~/lib/format";
 import { useT } from "~/lib/use-t";
+import { downloadAuthed } from "~/lib/download.client";
 import { archiveNotifications, listNotifications, markRead } from "~/services/notifications.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -60,7 +61,7 @@ export default function NotificationsPage() {
                         )}
                         {Boolean((n.meta as { dataRequest?: unknown } | null)?.dataRequest) && (
                           <InlineStack>
-                            <Button size="slim" url={`/app/notifications/${n.id}/export`} target="_blank">
+                            <Button size="slim" onClick={() => downloadAuthed(`/app/notifications/${n.id}/export`, `customer-data-request-${n.id}.json`)}>
                               {t("notifications.downloadExport")}
                             </Button>
                           </InlineStack>

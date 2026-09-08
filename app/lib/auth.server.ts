@@ -9,11 +9,11 @@ import type { GraphqlClient } from "~/services/shopify/graphql.server";
  */
 export async function requireShop(request: Request) {
   bootJobs();
-  const { admin, session } = await authenticate.admin(request);
+  const { admin, billing, session } = await authenticate.admin(request);
   const shop: ShopWithSettings = await getOrCreateShop(session.shop);
   const graphql = admin.graphql as unknown as GraphqlClient;
   const actor = session.onlineAccessInfo?.associated_user?.email ?? "merchant";
-  return { admin, session, shop, graphql, actor };
+  return { admin, billing, session, shop, graphql, actor };
 }
 
 export type RequireShopResult = Awaited<ReturnType<typeof requireShop>>;

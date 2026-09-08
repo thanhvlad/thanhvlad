@@ -12,6 +12,7 @@ import { PrismaSessionStorage } from "@shopify/shopify-app-session-storage-prism
 import prisma from "./db.server";
 import { PAID_PLANS, PLANS } from "./domain/billing/plans";
 import { env } from "./lib/env.server";
+import { logger } from "./lib/logger.server";
 import { onShopInstalled } from "./services/shop.server";
 
 const config = env();
@@ -70,8 +71,19 @@ const shopify = shopifyApp({
   },
   hooks: {
     afterAuth: async ({ session, admin }) => {
-      await shopify.registerWebhooks({ session });
-      await onShopInstalled({ session, admin });
+      // Subscriptions are declared in shopify.app.toml and created by the CLI on
+      // deploy. registerWebhooks() discovers existing subscriptions with the
+      // `webhookSubscriptions` query, which returns only shop-scoped ones, so
+      // calling it here cannot see the app-scoped subscriptions and creates a
+      // second subscription per topic - every event then arrives twice.
+      //
+      // Install work is best-effort: an uncaught throw here becomes a bodyless
+      // 500 inside the merchant's iframe on their very first open.
+      try {
+        await onShopInstalled({ session, admin });
+      } catch (error) {
+        logger.error("onShopInstalled failed", { shop: session.shop, error });
+      }
     },
   },
   ...(config.SHOP_CUSTOM_DOMAIN ? { customShopDomains: [config.SHOP_CUSTOM_DOMAIN] } : {}),

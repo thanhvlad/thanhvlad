@@ -78,7 +78,14 @@ describe("supplier registry", () => {
   it("lists platforms with configuration state", () => {
     const platforms = listPlatforms();
     expect(platforms.map((p) => p.platform)).toEqual(["ALIEXPRESS", "CJ_DROPSHIPPING", "MOCK"]);
-    expect(platforms.every((p) => p.configured)).toBe(true);
+    // In mock mode every platform is SERVED by the mock adapter, which has no
+    // getAuthorizationUrl. Reporting AliExpress and CJ as configured here is
+    // what made the Suppliers page render an enabled Connect button that
+    // dead-ends with "ALIEXPRESS does not use OAuth." Only a platform that can
+    // actually be connected may report itself configured.
+    expect(platforms.find((p) => p.platform === "ALIEXPRESS")?.configured).toBe(false);
+    expect(platforms.find((p) => p.platform === "CJ_DROPSHIPPING")?.configured).toBe(false);
+    expect(platforms.find((p) => p.platform === "MOCK")?.configured).toBe(true);
   });
 
   it("detects the platform from a reference", () => {
