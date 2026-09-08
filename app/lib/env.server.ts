@@ -36,6 +36,10 @@ const schema = z.object({
   CJ_API_KEY: z.string().optional(),
 
   ENCRYPTION_KEY: z.string().optional(),
+
+  /** Optional: enables AI-assisted variant mapping and supplier picking. */
+  ANTHROPIC_API_KEY: z.string().optional(),
+  AI_MAPPING_MODEL: z.string().default("claude-opus-5"),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
   EXCHANGE_RATE_API_URL: z.string().default("https://open.er-api.com/v6/latest"),
 });

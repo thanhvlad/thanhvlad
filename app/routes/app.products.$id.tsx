@@ -27,7 +27,9 @@ import { FAILURE_LABELS } from "~/domain/mapping/resolve";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { adminUrl, formatMoney, legacyId, relativeTime } from "~/lib/format";
-import { addSupplierProductForMapping, autoMapByOptions, getMapping, getSupplierProductWithVariants, resolveForVariant, saveMapping, supplierProductsForProduct, type MappingRowInput } from "~/services/mapping.server";
+import { addSupplierProductForMapping, getMapping, getSupplierProductWithVariants, resolveForVariant, saveMapping, suggestMappingForProduct, supplierProductsForProduct, type MappingRowInput, type MappingSuggestionRow } from "~/services/mapping.server";
+import { aiMappingAvailable } from "~/services/ai-mapping.server";
+import { dismissCandidate, findAlternativeSuppliers, getComparison, switchSupplier } from "~/services/supplier-comparison.server";
 import { listPricingRules } from "~/services/pricing.server";
 import { deleteProducts, getProduct, repriceProduct, setAutoUpdate, syncProductFromShopify } from "~/services/products.server";
 import { priceHistory } from "~/services/suppliers/catalog.server";
@@ -44,7 +46,12 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const url = new URL(request.url);
   const product = await getProduct(shop.id, params.id!);
   if (!product) throw new Response("Not found", { status: 404 });
-  const [mapping, pool, rules] = await Promise.all([getMapping(product.id), supplierProductsForProduct(product.id), listPricingRules(shop.id)]);
+  const [mapping, pool, rules, comparison] = await Promise.all([
+    getMapping(product.id),
+    supplierProductsForProduct(product.id),
+    listPricingRules(shop.id),
+    getComparison(shop, product.id),
+  ]);
 
   // Extra supplier products added this session (via ?supplier=id) but not yet mapped.
   const extraIds = (url.searchParams.get("suppliers") ?? "").split(",").filter(Boolean);
@@ -61,6 +68,37 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     country: shop.country ?? "US",
     loadedSuppliers: extraIds,
     loadedMessage: url.searchParams.get("loaded"),
+    aiAvailable: aiMappingAvailable(),
+    comparison: {
+      shipToCountry: comparison.shipToCountry,
+      evaluatedAt: comparison.evaluatedAt,
+      betterOptionId: comparison.betterOption?.supplierProductId ?? null,
+      rows: comparison.rows.map((r) => ({
+        supplierProductId: r.supplierProductId,
+        platform: r.platform,
+        title: r.title,
+        url: r.url,
+        image: r.image,
+        storeName: r.storeName,
+        itemCost: String(r.itemCost),
+        shippingCost: String(r.shippingCost),
+        landedCost: r.landedCost,
+        currency: r.currency,
+        deliveryDays: r.deliveryDays,
+        carrierName: r.carrierName,
+        rating: r.rating,
+        orderCount: r.orderCount,
+        score: r.score,
+        savingsVsCurrent: r.savingsVsCurrent,
+        savingsPercent: r.savingsPercent,
+        isCurrent: Boolean(r.isCurrent),
+        isBest: r.isBest,
+        isAvailable: r.isAvailable,
+        matchedVariants: r.matchedVariants,
+        totalVariants: r.totalVariants,
+        dismissed: r.dismissed,
+      })),
+    },
     product: {
       id: product.id,
       title: product.title,
@@ -88,6 +126,8 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
             bundleGroup: r.bundleGroup,
             isDefault: r.isDefault,
             isEnabled: r.isEnabled,
+            source: r.source,
+            confidence: r.confidence,
           })),
         }
       : { type: "BASIC" as MappingType, isEnabled: true, notes: "", rows: [] },
@@ -133,8 +173,30 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         throw redirect(`/app/products/${id}?suppliers=${suppliers}&loaded=${encodeURIComponent(sp.title)}`);
       }
       case "auto-map": {
-        const rows = await autoMapByOptions(id, get("supplierProductId"));
-        return { ok: true, message: `${rows.length} variant(s) matched by option values.`, autoRows: rows };
+        const useAi = get("useAi") === "true";
+        const suggestion = await suggestMappingForProduct(id, get("supplierProductId"), { useAi });
+        const parts = [`${suggestion.rows.length} variant(s) matched`];
+        if (suggestion.aiUsed) parts.push("AI resolved the harder ones");
+        if (suggestion.unresolved) parts.push(`${suggestion.unresolved} still need you`);
+        if (suggestion.aiError) parts.push(`AI unavailable: ${suggestion.aiError}`);
+        return { ok: true, message: `${parts.join(" · ")}.`, autoRows: suggestion.rows };
+      }
+      case "compare-suppliers": {
+        const result = await findAlternativeSuppliers(shop, id, { actor });
+        return {
+          ok: true,
+          message: result.rows.length
+            ? `Compared ${result.rows.length} supplier(s).${result.betterOption ? ` A cheaper one saves ${result.betterOption.savingsVsCurrent} per unit.` : " The current supplier is still the best."}`
+            : "No comparable suppliers were found.",
+        };
+      }
+      case "switch-supplier": {
+        const suggestion = await switchSupplier(shop, id, get("supplierProductId"), actor);
+        return { ok: true, message: `Switched supplier; ${suggestion.rows.length} variant(s) mapped${suggestion.unresolved ? `, ${suggestion.unresolved} left for you` : ""}.` };
+      }
+      case "dismiss-candidate": {
+        await dismissCandidate(shop, id, get("supplierProductId"));
+        return { ok: true, message: "Hidden from the comparison." };
       }
       case "preview": {
         const product = await getProduct(shop.id, id);
@@ -183,6 +245,8 @@ type Row = {
   bundleGroup: string | null;
   isDefault: boolean;
   isEnabled: boolean;
+  source?: "MANUAL" | "AUTO" | "AI";
+  confidence?: number | null;
 };
 
 export default function ProductDetailPage() {
@@ -198,10 +262,26 @@ export default function ProductDetailPage() {
   const [previewQty, setPreviewQty] = useState("1");
   const [ruleId, setRuleId] = useState("");
 
-  const result = fetcher.data as { ok?: boolean; message?: string; error?: string; autoRows?: MappingRowInput[] } | undefined;
+  const result = fetcher.data as { ok?: boolean; message?: string; error?: string; autoRows?: MappingSuggestionRow[] } | undefined;
   if (result?.autoRows && result.autoRows.length && !rows.some((r) => r.key.startsWith("auto"))) {
-    const supplierProductId = data.supplierProducts.find((sp) => sp.variants.some((v) => v.id === result.autoRows![0].supplierVariantId))?.id ?? "";
-    setRows(result.autoRows.map((r, i) => ({ key: `auto${i}`, productVariantId: r.productVariantId, supplierProductId, supplierVariantId: r.supplierVariantId, quantity: 1, priority: 0, shipToCountry: "*", minQuantity: null, maxQuantity: null, bundleGroup: null, isDefault: true, isEnabled: true })));
+    setRows(
+      result.autoRows.map((r, i) => ({
+        key: `auto${i}`,
+        productVariantId: r.productVariantId,
+        supplierProductId: data.supplierProducts.find((sp) => sp.variants.some((v) => v.id === r.supplierVariantId))?.id ?? "",
+        supplierVariantId: r.supplierVariantId,
+        quantity: 1,
+        priority: 0,
+        shipToCountry: "*",
+        minQuantity: null,
+        maxQuantity: null,
+        bundleGroup: null,
+        isDefault: true,
+        isEnabled: true,
+        source: r.source,
+        confidence: r.confidence,
+      })),
+    );
   }
 
   const supplierById = useMemo(() => new Map(data.supplierProducts.map((sp) => [sp.id, sp])), [data.supplierProducts]);
@@ -216,7 +296,13 @@ export default function ProductDetailPage() {
 
   const save = () =>
     fetcher.submit(
-      { intent: "save-mapping", type, isEnabled: String(enabled), notes, rows: JSON.stringify(rows.filter((r) => r.supplierVariantId).map(({ key: _k, supplierProductId: _s, ...r }) => r)) },
+      {
+        intent: "save-mapping",
+        type,
+        isEnabled: String(enabled),
+        notes,
+        rows: JSON.stringify(rows.filter((r) => r.supplierVariantId).map(({ key: _k, supplierProductId: _s, ...r }) => r)),
+      },
       { method: "post" },
     );
 
@@ -314,9 +400,18 @@ export default function ProductDetailPage() {
                               {!sp.isAvailable && <Badge tone="critical">Unavailable</Badge>}
                               <Badge>{`${sp.variants.length} SKUs`}</Badge>
                             </InlineStack>
-                            <InlineStack gap="200">
-                              <Button size="slim" onClick={() => fetcher.submit({ intent: "auto-map", supplierProductId: sp.id }, { method: "post" })}>
-                                Auto-map by options
+                            <InlineStack gap="200" wrap>
+                              <Button size="slim" onClick={() => fetcher.submit({ intent: "auto-map", supplierProductId: sp.id, useAi: "false" }, { method: "post" })}>
+                                Auto-map
+                              </Button>
+                              <Button
+                                size="slim"
+                                variant="primary"
+                                disabled={!data.aiAvailable}
+                                loading={fetcher.state !== "idle"}
+                                onClick={() => fetcher.submit({ intent: "auto-map", supplierProductId: sp.id, useAi: "true" }, { method: "post" })}
+                              >
+                                {data.aiAvailable ? "Match with AI" : "AI (no API key)"}
                               </Button>
                               {sp.url && (
                                 <Button size="slim" url={sp.url} external>
@@ -392,6 +487,11 @@ export default function ProductDetailPage() {
                                   {type === "ADVANCED" && <Checkbox label="Default" checked={row.isDefault} onChange={(c) => updateRow(row.key, { isDefault: c })} />}
                                   <Checkbox label="Enabled" checked={row.isEnabled} onChange={(c) => updateRow(row.key, { isEnabled: c })} />
                                   {sv && <Badge tone={sv.isAvailable && sv.stock > 0 ? "success" : "critical"}>{sv.isAvailable && sv.stock > 0 ? `In stock (${sv.stock})` : "Out of stock"}</Badge>}
+                                  {row.source && row.source !== "MANUAL" && (
+                                    <Badge tone={(row.confidence ?? 0) >= 0.9 ? "success" : "attention"}>
+                                      {`${row.source === "AI" ? "AI" : "Auto"} ${Math.round((row.confidence ?? 0) * 100)}%`}
+                                    </Badge>
+                                  )}
                                 </InlineStack>
                                 <Button size="slim" tone="critical" onClick={() => removeRow(row.key)}>
                                   Remove
@@ -406,6 +506,125 @@ export default function ProductDetailPage() {
                 ))}
               </BlockStack>
               <TextField label="Notes" value={notes} onChange={setNotes} autoComplete="off" multiline={2} placeholder="Internal notes about this supplier setup" />
+            </BlockStack>
+          </Card>
+        </Layout.Section>
+
+        <Layout.Section>
+          <Card>
+            <BlockStack gap="400">
+              <InlineStack align="space-between" blockAlign="center" wrap>
+                <BlockStack gap="050">
+                  <Text as="h2" variant="headingMd">
+                    Compare suppliers
+                  </Text>
+                  <Text as="p" tone="subdued" variant="bodySm">
+                    Landed cost = item + shipping to {data.comparison.shipToCountry}, in {data.currency}.
+                    {data.comparison.evaluatedAt ? ` Last checked ${relativeTime(data.comparison.evaluatedAt)}.` : ""}
+                  </Text>
+                </BlockStack>
+                <Button onClick={() => fetcher.submit({ intent: "compare-suppliers" }, { method: "post" })} loading={fetcher.state !== "idle"}>
+                  {data.comparison.rows.length ? "Re-check suppliers" : "Find cheaper suppliers"}
+                </Button>
+              </InlineStack>
+
+              {data.comparison.betterOptionId && (
+                <Banner tone="success" title="A better supplier is available">
+                  <p>
+                    {(() => {
+                      const best = data.comparison.rows.find((r) => r.supplierProductId === data.comparison.betterOptionId);
+                      return best
+                        ? `${best.title.slice(0, 70)} saves ${formatMoney(best.savingsVsCurrent ?? 0, data.currency)} per unit (${best.savingsPercent}%) and covers ${best.matchedVariants}/${best.totalVariants} variants.`
+                        : "";
+                    })()}
+                  </p>
+                </Banner>
+              )}
+
+              {data.comparison.rows.length === 0 ? (
+                <Text as="p" tone="subdued">
+                  No comparison yet. Find cheaper suppliers searches the marketplace for the same item, prices each one
+                  delivered to your market, and checks how many of your variants it can actually cover.
+                </Text>
+              ) : (
+                <BlockStack gap="200">
+                  {data.comparison.rows.filter((r) => !r.dismissed).map((row) => (
+                    <Box
+                      key={row.supplierProductId}
+                      padding="300"
+                      borderRadius="200"
+                      borderColor={row.isCurrent ? "border-emphasis" : "border"}
+                      borderWidth="025"
+                      background={row.isBest && !row.isCurrent ? "bg-surface-success" : undefined}
+                    >
+                      <InlineGrid columns={{ xs: 1, md: ["twoThirds", "oneThird"] }} gap="300">
+                        <InlineStack gap="300" blockAlign="start" wrap={false}>
+                          <Thumb src={row.image} alt={row.title} />
+                          <BlockStack gap="100">
+                            <InlineStack gap="100" blockAlign="center" wrap>
+                              <PlatformBadge platform={row.platform} />
+                              {row.isCurrent && <Badge tone="info">Current</Badge>}
+                              {row.isBest && !row.isCurrent && <Badge tone="success">Best score</Badge>}
+                              {!row.isAvailable && <Badge tone="critical">Out of stock</Badge>}
+                              <Badge>{`Score ${row.score}`}</Badge>
+                            </InlineStack>
+                            <Text as="p" fontWeight="semibold">
+                              {row.title.slice(0, 90)}
+                            </Text>
+                            <Text as="p" tone="subdued" variant="bodySm">
+                              {row.storeName ? `${row.storeName} · ` : ""}
+                              {row.rating ? `★ ${row.rating.toFixed(1)} · ` : ""}
+                              {row.orderCount ? `${row.orderCount.toLocaleString()} orders · ` : ""}
+                              covers {row.matchedVariants}/{row.totalVariants} variants
+                            </Text>
+                            <Text as="p" variant="bodySm">
+                              Item {formatMoney(row.itemCost, data.currency)} + shipping {formatMoney(row.shippingCost, data.currency)}
+                              {row.carrierName ? ` (${row.carrierName}` : ""}
+                              {row.deliveryDays ? `${row.carrierName ? ", " : " ("}${row.deliveryDays} days)` : row.carrierName ? ")" : ""}
+                            </Text>
+                          </BlockStack>
+                        </InlineStack>
+                        <BlockStack gap="200" inlineAlign="end">
+                          <Text as="p" variant="headingMd">
+                            {formatMoney(row.landedCost, data.currency)}
+                          </Text>
+                          {row.savingsVsCurrent && Number(row.savingsVsCurrent) > 0 && (
+                            <Badge tone="success">{`Saves ${formatMoney(row.savingsVsCurrent, data.currency)} (${row.savingsPercent}%)`}</Badge>
+                          )}
+                          {row.savingsVsCurrent && Number(row.savingsVsCurrent) < 0 && (
+                            <Text as="span" tone="subdued" variant="bodySm">
+                              {formatMoney(Math.abs(Number(row.savingsVsCurrent)), data.currency)} dearer
+                            </Text>
+                          )}
+                          <InlineStack gap="100">
+                            {row.url && (
+                              <Button size="slim" url={row.url} external>
+                                View
+                              </Button>
+                            )}
+                            {!row.isCurrent && (
+                              <>
+                                <Button
+                                  size="slim"
+                                  variant="primary"
+                                  disabled={!row.isAvailable || row.matchedVariants === 0}
+                                  loading={fetcher.state !== "idle"}
+                                  onClick={() => fetcher.submit({ intent: "switch-supplier", supplierProductId: row.supplierProductId }, { method: "post" })}
+                                >
+                                  Switch
+                                </Button>
+                                <Button size="slim" onClick={() => fetcher.submit({ intent: "dismiss-candidate", supplierProductId: row.supplierProductId }, { method: "post" })}>
+                                  Hide
+                                </Button>
+                              </>
+                            )}
+                          </InlineStack>
+                        </BlockStack>
+                      </InlineGrid>
+                    </Box>
+                  ))}
+                </BlockStack>
+              )}
             </BlockStack>
           </Card>
         </Layout.Section>

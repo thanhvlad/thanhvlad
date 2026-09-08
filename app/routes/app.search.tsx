@@ -22,7 +22,7 @@ import { PlatformBadge } from "~/components/StatusBadge";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatMoney } from "~/lib/format";
-import { addToImportList } from "~/services/import.server";
+import { addToImportList, pushImportedProduct } from "~/services/import.server";
 import { adapterForShop, listPlatforms } from "~/services/suppliers/index.server";
 import type { SupplierPlatform, SupplierSearchResult } from "~/services/suppliers/types";
 
@@ -55,13 +55,27 @@ interface SearchActionData {
   title?: string;
   reference?: string;
   error?: string;
+  /** Set when the product went straight to Shopify. */
+  productId?: string;
   bulk?: Array<{ reference: string; ok: boolean; title?: string; error?: string }>;
 }
 
 export const action = async ({ request }: ActionFunctionArgs): Promise<SearchActionData> => {
-  const { shop, actor } = await requireShop(request);
+  const { shop, actor, graphql } = await requireShop(request);
   const { intent, get, getAll } = await readForm(request);
   const platform = (get("platform") || undefined) as SupplierPlatform | undefined;
+
+  // Import and push in one step, for merchants who do not want to edit first.
+  if (intent === "add-and-push") {
+    try {
+      const product = await addToImportList(shop, get("reference"), { platform, actor });
+      const pushed = await pushImportedProduct(shop, graphql, product.id, actor);
+      if (!pushed.ok) return { ok: false, error: pushed.error, reference: get("reference") };
+      return { ok: true, id: product.id, productId: pushed.productId, title: product.title, reference: get("reference") };
+    } catch (e) {
+      return { ok: false, error: errorMessage(e), reference: get("reference") };
+    }
+  }
 
   if (intent === "add") {
     try {
@@ -183,6 +197,11 @@ export default function SearchPage() {
               <p>{data.error}</p>
             </Banner>
           )}
+          {data.results?.notice && (
+            <Banner tone="warning">
+              <p>{data.results.notice}</p>
+            </Banner>
+          )}
           {!data.results && !data.error && (
             <Card>
               <EmptyState heading="Search a supplier catalog" image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png">
@@ -222,6 +241,7 @@ function withPage(params: URLSearchParams, page: number) {
 
 function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["items"][number]; platform: SupplierPlatform; currency: string }) {
   const fetcher = useFetcher<typeof action>();
+  const [pushing, setPushing] = useState(false);
   const result = fetcher.data as SearchActionData | undefined;
   const added = result?.ok && result.reference === item.url;
   const failed = result && !result.ok && result.reference === item.url;
@@ -252,26 +272,55 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
             {item.rating ? <Badge>{`★ ${item.rating.toFixed(1)}`}</Badge> : null}
             {item.orderCount ? <Badge>{`${item.orderCount.toLocaleString()} orders`}</Badge> : null}
           </InlineStack>
+          <Text as="p" variant="bodySm" tone="subdued">
+            {item.shippingFrom !== null && item.shippingFrom !== undefined
+              ? Number(item.shippingFrom) === 0
+                ? "Free shipping"
+                : `+ ${formatMoney(item.shippingFrom, currency)} shipping`
+              : "Shipping shown at import"}
+            {item.shipToDays ? ` · ~${item.shipToDays} days` : ""}
+          </Text>
           {item.storeName && (
             <Text as="p" tone="subdued" variant="bodySm" truncate>
               {item.storeName}
             </Text>
           )}
           <Divider />
-          <InlineStack gap="200" align="space-between" blockAlign="center">
+          <InlineStack gap="100" align="space-between" blockAlign="center" wrap>
             <Button size="slim" url={item.url} target="_blank" external>
               View
             </Button>
-            <Button
-              size="slim"
-              variant="primary"
-              disabled={Boolean(added)}
-              loading={fetcher.state !== "idle"}
-              onClick={() => fetcher.submit({ intent: "add", reference: item.url, platform }, { method: "post" })}
-            >
-              {added ? "Added" : "Import"}
-            </Button>
+            <InlineStack gap="100">
+              <Button
+                size="slim"
+                disabled={Boolean(added)}
+                loading={fetcher.state !== "idle" && !pushing}
+                onClick={() => {
+                  setPushing(false);
+                  fetcher.submit({ intent: "add", reference: item.url, platform }, { method: "post" });
+                }}
+              >
+                {added && !result?.productId ? "In list" : "Import"}
+              </Button>
+              <Button
+                size="slim"
+                variant="primary"
+                disabled={Boolean(result?.productId)}
+                loading={fetcher.state !== "idle" && pushing}
+                onClick={() => {
+                  setPushing(true);
+                  fetcher.submit({ intent: "add-and-push", reference: item.url, platform }, { method: "post" });
+                }}
+              >
+                {result?.productId ? "In shop" : "Add to shop"}
+              </Button>
+            </InlineStack>
           </InlineStack>
+          {result?.productId && (
+            <Button size="micro" variant="plain" url={`/app/products/${result.productId}`}>
+              Open in the app
+            </Button>
+          )}
           {failed && (
             <Text as="p" tone="critical" variant="bodySm">
               {result?.error}

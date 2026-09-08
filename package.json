@@ -30,6 +30,7 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.124.0",
     "@prisma/client": "^6.19.3",
     "@remix-run/dev": "^2.17.5",
     "@remix-run/node": "^2.17.5",

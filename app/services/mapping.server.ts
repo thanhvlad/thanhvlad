@@ -3,12 +3,17 @@ import prisma from "~/db.server";
 import { resolveMapping } from "~/domain/mapping/resolve";
 import type { ResolveResult, SupplierVariantSnapshot, VariantMappingRow } from "~/domain/mapping/types";
 import { logActivity } from "./activity.server";
+import type { MatchCandidate, MatchTarget } from "~/domain/mapping/match";
+import { aiMappingAvailable, suggestMapping } from "./ai-mapping.server";
 import { fetchAndCacheByReference } from "./suppliers/catalog.server";
 import type { SupplierPlatform } from "./suppliers/types";
 
 export interface MappingRowInput {
   productVariantId: string;
   supplierVariantId: string;
+  /** How the row was produced; shown as a badge and stored for auditing. */
+  source?: "MANUAL" | "AUTO" | "AI";
+  confidence?: number | null;
   quantity?: number;
   priority?: number;
   shipToCountry?: string;
@@ -57,6 +62,8 @@ export async function saveMapping(shopId: string, productId: string, input: { ty
       bundleGroup: input.type === "BUNDLE" ? (r.bundleGroup || "default") : null,
       isDefault,
       isEnabled: r.isEnabled ?? true,
+      source: r.source ?? "MANUAL",
+      confidence: r.confidence ?? null,
     };
   });
 
@@ -104,30 +111,96 @@ export async function getSupplierProductWithVariants(id: string) {
   return prisma.supplierProduct.findUnique({ where: { id }, include: { variants: { orderBy: { createdAt: "asc" } } } });
 }
 
+export interface MappingSuggestionRow extends MappingRowInput {
+  confidence: number;
+  source: "AUTO" | "AI";
+  reason: string;
+  /** For the UI: what the two sides actually say. */
+  variantLabel: string;
+  supplierLabel: string;
+}
+
+export interface MappingSuggestionResult {
+  rows: MappingSuggestionRow[];
+  unresolved: number;
+  aiUsed: boolean;
+  aiAvailable: boolean;
+  aiError: string | null;
+}
+
 /**
- * Suggest a BASIC mapping by matching option values: "Red / XL" on Shopify to
- * the supplier SKU whose attribute values are {Red, XL}. Order-insensitive and
- * case-insensitive; falls back to the sole supplier SKU when there is only one.
+ * Propose a mapping between a product's variants and a supplier product's SKUs.
+ *
+ * The deterministic matcher handles synonyms, translations and reordered
+ * options; anything it leaves open is offered to the AI mapper when a key is
+ * configured. Every row carries a confidence so the merchant can see what to
+ * check before saving.
  */
-export async function autoMapByOptions(productId: string, supplierProductId: string): Promise<MappingRowInput[]> {
-  const [variants, supplier] = await Promise.all([
-    prisma.productVariant.findMany({ where: { productId }, orderBy: { position: "asc" } }),
+export async function suggestMappingForProduct(
+  productId: string,
+  supplierProductId: string,
+  options: { useAi?: boolean; threshold?: number } = {},
+): Promise<MappingSuggestionResult> {
+  const [product, supplier] = await Promise.all([
+    prisma.product.findUnique({ where: { id: productId }, select: { title: true, variants: { orderBy: { position: "asc" } } } }),
     getSupplierProductWithVariants(supplierProductId),
   ]);
-  if (!supplier) return [];
-  const normalise = (values: string[]) => values.map((v) => v.trim().toLowerCase()).filter(Boolean).sort().join("|");
-  const bySignature = new Map<string, string>();
-  for (const sv of supplier.variants) {
-    const attrs = (sv.attributes as unknown as Array<{ value: string }>) ?? [];
-    bySignature.set(normalise(attrs.map((a) => a.value)), sv.id);
+  if (!product || !supplier) {
+    return { rows: [], unresolved: 0, aiUsed: false, aiAvailable: aiMappingAvailable(), aiError: null };
   }
-  const rows: MappingRowInput[] = [];
-  for (const variant of variants) {
-    const values = (variant.optionValues as unknown as string[]) ?? [];
-    const match = bySignature.get(normalise(values)) ?? bySignature.get(normalise(variant.title.split("/"))) ?? (supplier.variants.length === 1 ? supplier.variants[0].id : undefined);
-    if (match) rows.push({ productVariantId: variant.id, supplierVariantId: match, quantity: 1, isDefault: true });
-  }
-  return rows;
+
+  const targets: MatchTarget[] = product.variants.map((v) => ({
+    id: v.id,
+    values: ((v.optionValues as unknown as string[]) ?? []).filter(Boolean),
+    label: v.title,
+  }));
+  const candidates: MatchCandidate[] = supplier.variants.map((sv) => ({
+    id: sv.id,
+    values: (((sv.attributes as unknown as Array<{ value: string }>) ?? []).map((a) => a.value)).filter(Boolean),
+    label: sv.sku ?? sv.externalSkuId,
+    isAvailable: sv.isAvailable && sv.stock > 0,
+  }));
+  const optionNames = [...new Set((((supplier.variants[0]?.attributes as unknown as Array<{ name: string }>) ?? []).map((a) => a.name)))];
+
+  const result = await suggestMapping(
+    { productTitle: product.title, supplierTitle: supplier.title, optionNames, targets, candidates },
+    options,
+  );
+
+  const labelFor = (id: string, list: Array<{ id: string; values: string[]; label?: string }>) => {
+    const item = list.find((x) => x.id === id);
+    if (!item) return id;
+    return item.values.length ? item.values.join(" / ") : (item.label ?? id);
+  };
+
+  return {
+    rows: result.suggestions.map((s) => ({
+      productVariantId: s.targetId,
+      supplierVariantId: s.candidateId!,
+      quantity: 1,
+      isDefault: true,
+      confidence: s.confidence,
+      source: s.source,
+      reason: s.reason,
+      variantLabel: labelFor(s.targetId, targets),
+      supplierLabel: labelFor(s.candidateId!, candidates),
+    })),
+    unresolved: result.unresolved,
+    aiUsed: result.aiUsed,
+    aiAvailable: aiMappingAvailable(),
+    aiError: result.aiError,
+  };
+}
+
+/** Backwards-compatible shape used by callers that only need the rows. */
+export async function autoMapByOptions(productId: string, supplierProductId: string): Promise<MappingRowInput[]> {
+  const result = await suggestMappingForProduct(productId, supplierProductId, { useAi: false });
+  return result.rows.map(({ productVariantId, supplierVariantId, quantity, isDefault }) => ({
+    productVariantId,
+    supplierVariantId,
+    quantity,
+    isDefault,
+  }));
 }
 
 /** Build the pure-resolver context for one Shopify variant. */
