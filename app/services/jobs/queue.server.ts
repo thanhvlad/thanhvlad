@@ -10,8 +10,10 @@ import type { EnqueueOptions, JobName, JobPayloads } from "./types";
  *
  * With REDIS_URL set, jobs go through BullMQ and are processed by the worker
  * process (`npm run worker`) or in-process when RUN_WORKER_IN_WEB=true. Without
- * Redis, jobs run inline on the next tick — fine for development and tiny
- * stores, but a restart loses whatever was queued.
+ * Redis, jobs run inline on the next tick and the periodic schedule runs on
+ * plain timers in whichever process booted with the worker role — enough for a
+ * single-service deployment, but a restart loses whatever was queued and a
+ * second instance would double the periodic work.
  */
 
 export type JobHandler<N extends JobName> = (payload: JobPayloads[N], meta: { jobId: string; attempt: number }) => Promise<unknown>;
@@ -19,6 +21,8 @@ export type JobHandler<N extends JobName> = (payload: JobPayloads[N], meta: { jo
 declare global {
   // eslint-disable-next-line no-var
   var __dropshipJobHandlers: Map<JobName, JobHandler<JobName>> | undefined;
+  // eslint-disable-next-line no-var
+  var __dropshipInlineTimers: NodeJS.Timeout[] | undefined;
 }
 
 // On globalThis, like the Prisma client: Vite re-evaluates server modules on
@@ -168,28 +172,84 @@ export function startWorker(options: { concurrency?: number } = {}): Worker | nu
   return worker;
 }
 
+/**
+ * The periodic work, in one table so the Redis scheduler and the timer-based
+ * fallback below cannot drift apart. These intervals are what makes the app
+ * feel automatic: without them tracking numbers never reach Shopify on their
+ * own and a merchant has to press buttons.
+ */
+const SCHEDULE_TICKS: Array<{ kind: JobPayloads["scheduler-tick"]["kind"]; every: number }> = [
+  { kind: "purchase-orders", every: 30 * 60_000 },
+  { kind: "tracking", every: 15 * 60_000 },
+  { kind: "inventory", every: 60 * 60_000 },
+  { kind: "auto-place", every: 10 * 60_000 },
+  { kind: "metrics", every: 60 * 60_000 },
+  { kind: "payments", every: 20 * 60_000 },
+  { kind: "email-digest", every: 60 * 60_000 },
+];
+
+const GLOBAL_TICKS: Array<{ id: string; every: number; run: () => Promise<unknown> }> = [
+  { id: "refresh-rates-usd", every: 12 * 60 * 60_000, run: () => enqueue("refresh-rates", { base: "USD" }) },
+  { id: "purge-uninstalled", every: 24 * 60 * 60_000, run: () => enqueue("purge-uninstalled", {}) },
+];
+
 /** Register the repeatable scheduler ticks. Safe to call on every boot. */
 export async function ensureSchedules() {
   const q = getQueue();
   if (!q) return;
-  const ticks: Array<{ kind: JobPayloads["scheduler-tick"]["kind"]; every: number }> = [
-    { kind: "purchase-orders", every: 30 * 60_000 },
-    { kind: "tracking", every: 15 * 60_000 },
-    { kind: "inventory", every: 60 * 60_000 },
-    { kind: "auto-place", every: 10 * 60_000 },
-    { kind: "metrics", every: 60 * 60_000 },
-    { kind: "payments", every: 20 * 60_000 },
-    { kind: "email-digest", every: 60 * 60_000 },
-  ];
-  for (const tick of ticks) {
+  for (const tick of SCHEDULE_TICKS) {
     await q.upsertJobScheduler(`tick-${tick.kind}`, { every: tick.every }, { name: "scheduler-tick", data: { kind: tick.kind } });
   }
   await q.upsertJobScheduler("refresh-rates-usd", { every: 12 * 60 * 60_000 }, { name: "refresh-rates", data: { base: "USD" } });
   await q.upsertJobScheduler("purge-uninstalled", { every: 24 * 60 * 60_000 }, { name: "purge-uninstalled", data: {} });
-  logger.info("Repeatable schedules registered");
+  logger.info("Repeatable schedules registered", { mode: "redis" });
+}
+
+/**
+ * The same schedule on plain timers, for a deployment with no Redis.
+ *
+ * BullMQ owns the repeatable jobs when Redis is there; without it nothing did,
+ * so a single-service deployment ran no periodic work at all — supplier status,
+ * tracking sync, auto-place and the digests were all silently dead, and the
+ * only symptom was tracking numbers that never appeared in Shopify.
+ *
+ * Correct only while a single process holds the schedule, which is exactly the
+ * case this exists for: without Redis there is no queue to share and no second
+ * consumer. The dedupe key on each enqueue still collapses an overlap if a
+ * deployment does briefly run two.
+ */
+export function startInlineSchedules(): boolean {
+  if (hasRedis()) return false;
+  if (globalThis.__dropshipInlineTimers) return true;
+  const timers: NodeJS.Timeout[] = [];
+  for (const tick of SCHEDULE_TICKS) {
+    const timer = setInterval(() => {
+      void enqueue("scheduler-tick", { kind: tick.kind }, { dedupeKey: `tick-${tick.kind}`, dedupeWindowMs: Math.floor(tick.every * 0.9) }).catch((error) =>
+        logger.error("Inline schedule tick failed", { kind: tick.kind, error }),
+      );
+    }, tick.every);
+    timer.unref?.();
+    timers.push(timer);
+  }
+  for (const tick of GLOBAL_TICKS) {
+    const timer = setInterval(() => {
+      void tick.run().catch((error) => logger.error("Inline schedule tick failed", { id: tick.id, error }));
+    }, tick.every);
+    timer.unref?.();
+    timers.push(timer);
+  }
+  globalThis.__dropshipInlineTimers = timers;
+  logger.info("Repeatable schedules registered", { mode: "timers", ticks: SCHEDULE_TICKS.length + GLOBAL_TICKS.length });
+  return true;
+}
+
+export function stopInlineSchedules() {
+  for (const timer of globalThis.__dropshipInlineTimers ?? []) clearInterval(timer);
+  globalThis.__dropshipInlineTimers = undefined;
 }
 
 export async function shutdownQueue() {
+  stopInlineSchedules();
   await worker?.close();
   await queue?.close();
   connection?.disconnect();

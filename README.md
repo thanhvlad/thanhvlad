@@ -100,9 +100,14 @@ npm run worker
 
 It consumes the queue and owns the repeatable schedules (supplier order polling every
 30 min, tracking sync every 15 min, auto-update per policy interval, auto-place every
-10 min, metrics hourly, FX rates twice a day). Without Redis, jobs run inline in the web
-process (fine for development). `RUN_WORKER_IN_WEB=true` runs the worker inside the web
-process for single-dyno hosting.
+10 min, metrics hourly, FX rates twice a day).
+
+**One process is enough to start.** Set `RUN_WORKER_IN_WEB=true` and the web process
+does the background work too. With Redis it consumes the queue; without Redis it runs
+the same schedule on plain timers and jobs execute inline. That is a single service and
+a database — no Redis, no second process — and everything still runs automatically.
+Move to a separate worker and Redis when order volume makes a restart losing queued
+work matter: a queued job survives a deploy only when Redis is holding it.
 
 ### See the whole flow without a Shopify store
 
@@ -141,7 +146,7 @@ All settings are environment variables; see [`.env.example`](.env.example).
 | --- | --- |
 | `SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`, `SHOPIFY_APP_URL`, `SCOPES` | Standard Shopify app config (the CLI fills these). |
 | `DATABASE_URL` | PostgreSQL connection string. |
-| `REDIS_URL`, `QUEUE_PREFIX`, `RUN_WORKER_IN_WEB` | Queue. Leave `REDIS_URL` empty for inline jobs. |
+| `REDIS_URL`, `QUEUE_PREFIX`, `RUN_WORKER_IN_WEB` | Queue. With Redis, a separate `npm run worker` process does the background work. Without it, set `RUN_WORKER_IN_WEB=true` and the web process runs the schedule on timers — enough for one instance, but a restart loses whatever was queued. |
 | `SUPPLIER_DRIVER` | `mock` (sample catalog) or `live`. |
 | `ALIEXPRESS_APP_KEY`, `ALIEXPRESS_APP_SECRET`, `ALIEXPRESS_REDIRECT_URI`, `ALIEXPRESS_TRACKING_ID` | AliExpress Open Platform (Dropshipping solution). Redirect URI must be `https://<app>/app/suppliers/callback/aliexpress`. |
 | `CJ_EMAIL`, `CJ_API_KEY` | Optional server-wide CJ credentials (merchants can also enter their own in the UI). |

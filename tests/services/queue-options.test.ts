@@ -5,7 +5,7 @@
  * the queue accepted the work, it just never retried it and refused to run a
  * periodic job more than once a day.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildJobOptions, dedupeJobId } from "~/services/jobs/queue.server";
 
 describe("buildJobOptions", () => {
@@ -66,5 +66,62 @@ describe("dedupeJobId", () => {
     const a = dedupeJobId(`${prefix}alpha`, WINDOW, 1_000_000_000);
     const b = dedupeJobId(`${prefix}beta`, WINDOW, 1_000_000_000);
     expect(a).not.toBe(b);
+  });
+});
+
+/**
+ * The periodic schedule without Redis.
+ *
+ * BullMQ owns the repeatable jobs when Redis is configured. Without it nothing
+ * did, so a single-service deployment ran no periodic work at all and the only
+ * symptom was tracking numbers that never reached Shopify on their own.
+ */
+describe("startInlineSchedules", () => {
+  afterEach(async () => {
+    const { stopInlineSchedules } = await import("~/services/jobs/queue.server");
+    stopInlineSchedules();
+    vi.useRealTimers();
+  });
+
+  it("runs the whole schedule on timers and stops cleanly", async () => {
+    vi.useFakeTimers();
+    const queue = await import("~/services/jobs/queue.server");
+    const seen: string[] = [];
+    for (const name of ["scheduler-tick", "refresh-rates", "purge-uninstalled"] as const) {
+      queue.registerHandler(name, async (payload) => {
+        seen.push(name === "scheduler-tick" ? `tick:${(payload as { kind: string }).kind}` : name);
+      });
+    }
+
+    expect(queue.startInlineSchedules()).toBe(true);
+    // Calling it twice must not double every timer.
+    expect(queue.startInlineSchedules()).toBe(true);
+
+    // A full day covers every interval, the 24-hour purge included.
+    // `runAllTimers` never returns on a repeating interval, so advance a fixed
+    // span instead: just past a day, so the 24-hour purge — the slowest of
+    // them — has fired at least once.
+    await vi.advanceTimersByTimeAsync(25 * 60 * 60_000);
+
+    // Each kind the app schedules fired, and the two global jobs with it.
+    for (const kind of ["purchase-orders", "tracking", "inventory", "auto-place", "metrics", "payments", "email-digest"]) {
+      expect(seen, `missing tick for ${kind}`).toContain(`tick:${kind}`);
+    }
+    expect(seen).toContain("refresh-rates");
+    expect(seen).toContain("purge-uninstalled");
+
+    // Tracking is the 15-minute one and must fire far more often than the
+    // hourly jobs; a schedule that collapses to one tick per key is the bug
+    // the dedupe window caused before.
+    const tracking = seen.filter((s) => s === "tick:tracking").length;
+    const metrics = seen.filter((s) => s === "tick:metrics").length;
+    expect(tracking).toBeGreaterThan(metrics);
+
+    queue.stopInlineSchedules();
+    // Jobs already handed to the inline runner still finish; count after they do.
+    await vi.advanceTimersByTimeAsync(1000);
+    const before = seen.length;
+    await vi.advanceTimersByTimeAsync(25 * 60 * 60_000);
+    expect(seen.length).toBe(before);
   });
 });

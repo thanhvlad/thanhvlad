@@ -18,8 +18,11 @@ For AliExpress, register the app on <https://openservice.aliexpress.com> under t
 ## 2. Infrastructure
 
 - **PostgreSQL 14+** — `DATABASE_URL`.
-- **Redis 6+** — `REDIS_URL` (strongly recommended in production; without it jobs run in
-  the web process and are lost on restart).
+- **Redis 6+** — `REDIS_URL`. Optional: without it, a web process started with
+  `RUN_WORKER_IN_WEB=true` runs the same schedule on timers and executes jobs inline.
+  What Redis buys is durability (a queued job survives a restart) and the ability to run
+  more than one instance. Start without it; add it when losing queued work on a deploy
+  would cost you an order.
 - **Web process** — `npm run start` (after `npm run setup` which runs migrations).
 - **Worker process** — `npm run worker` (at least one instance).
 
