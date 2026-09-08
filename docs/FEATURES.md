@@ -46,6 +46,9 @@
 | CSV export of orders | ✅ | `/app/orders/export` |
 | AliExpress affiliate / cashback | ⚠️ tracking id is passed on order creation (`ALIEXPRESS_TRACKING_ID`); no cashback dashboard |
 | Supplier payment | ⚠️ done on the supplier site, as with DSers. AliExpress does not let an app charge the merchant's account, so the app never tries: it places the order unpaid and hands over deep links. See `/app/payments`. |
-| Email notifications | ⚠️ settings exist; sender not wired (in-app feed only) |
+| Email notifications | ✅ instant or daily digest (08:00 shop time) via SMTP or Resend; per-type toggles, critical notices always sent | Settings → General → Notifications |
+| Plans & billing | ✅ Basic / Advanced / Pro / Enterprise through the Shopify Billing API, 14-day trial, caps on products/stores/staff across the account, AI mapping and auto-place on paid plans | `/app/settings/plan` |
+| GDPR / privacy webhooks | ✅ data request → downloadable export, customer redact, shop redact, 30-day purge of uninstalled stores | `services/compliance.server.ts` |
+| Help center, privacy policy, terms | ✅ public pages in English and Vietnamese | `/support`, `/privacy`, `/terms` |
 | Temu / other marketplaces | ⚠️ adapter contract ready; only AliExpress, CJ and mock implemented |
 | Multi-language UI | ✅ English and Vietnamese across the admin; switch under Settings → General. English is the source of truth and a missing key falls back to it, so a partial translation is always safe. | `app/lib/i18n.ts` |

@@ -64,8 +64,8 @@ export function listPlatforms(): PlatformInfo[] {
     },
     {
       platform: "MOCK",
-      displayName: "Mock supplier",
-      description: "Sample catalog for testing the full flow without credentials.",
+      displayName: "Demo supplier",
+      description: "Built-in sample catalogue that behaves like AliExpress, for trying the full flow without credentials.",
       authMode: "none",
       configured: true,
       capabilities: mock.capabilities,

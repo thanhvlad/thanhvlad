@@ -75,3 +75,25 @@
 .list li + li {
   margin-top: 0.5rem;
 }
+
+.prose {
+  line-height: 1.6;
+  color: #202223;
+}
+
+.prose p {
+  margin: 0 0 0.75rem;
+}
+
+.prose ul {
+  margin: 0 0 0.75rem;
+  padding-left: 1.25rem;
+}
+
+.prose li + li {
+  margin-top: 0.35rem;
+}
+
+.prose a {
+  color: #005bd3;
+}

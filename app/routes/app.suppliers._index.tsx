@@ -43,7 +43,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         throw redirect("/app/suppliers?connected=1");
       }
       case "mock": {
-        await createCredentiallessAccount(shop.id, "MOCK", get("label") || "Mock supplier");
+        await createCredentiallessAccount(shop.id, "MOCK", get("label") || "Demo supplier");
         throw redirect("/app/suppliers?connected=1");
       }
       case "default":
@@ -72,7 +72,7 @@ export default function SuppliersPage() {
   const result = fetcher.data as { ok?: boolean; message?: string; error?: string; redirect?: string } | undefined;
   const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
   const [cj, setCj] = useState({ email: "", apiKey: "", label: "", share: true });
-  const [mockLabel, setMockLabel] = useState("Mock supplier");
+  const [mockLabel, setMockLabel] = useState("Demo supplier");
 
   // OAuth must leave the embedded iframe: open the supplier's consent page at
   // top level. In an effect keyed on the URL, not in the render body — a render

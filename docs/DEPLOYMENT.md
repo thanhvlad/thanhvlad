@@ -39,6 +39,21 @@ Two services from the same image: `web` (`npm run docker-start`) and `worker`
 `.env.example`, and point `SHOPIFY_APP_URL` at the web service's public URL.
 Single-instance hosting can set `RUN_WORKER_IN_WEB=true` instead of a worker service.
 
+- **Fly.io**: `fly.toml` defines both process groups and the health check. `fly launch
+  --no-deploy`, attach Postgres and Redis, `fly secrets set ...`, `fly deploy`.
+- **Render**: `render.yaml` is a blueprint for web + worker + Postgres + Redis; fill the
+  `sync: false` secrets in the dashboard after the first deploy.
+
+### Health and boot checks
+
+`GET /healthz` answers `200 {"ok":true}` when the database responds and, with Redis
+configured, the queue does too; `503` otherwise with the failing component named. Point
+the host's health check at it (the Dockerfile, `fly.toml` and `render.yaml` already do).
+
+In production the app refuses to boot — with a message naming the variable — without
+`SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`, an `https` `SHOPIFY_APP_URL`, `DATABASE_URL`,
+`ENCRYPTION_KEY`, and supplier keys when `SUPPLIER_DRIVER=live`.
+
 ## 3. Production checklist
 
 - [ ] `ENCRYPTION_KEY` set (`openssl rand -base64 32`) so supplier tokens are encrypted.
@@ -49,6 +64,12 @@ Single-instance hosting can set `RUN_WORKER_IN_WEB=true` instead of a worker ser
       supplier → Awaiting shipment → tracking → Fulfilled.
 - [ ] Auto-update policy reviewed under **Auto updates** (defaults: notify on price,
       zero inventory when supplier is out of stock, unpublish when removed).
+- [ ] `SUPPORT_EMAIL` set; `/privacy`, `/terms`, `/support` open in a browser.
+- [ ] `EMAIL_FROM` + `RESEND_API_KEY` or `SMTP_URL` if merchants should get emails.
+- [ ] Billing tested on a development store (Settings → Plan → Upgrade, then Downgrade).
+- [ ] Compliance webhooks triggered once with `shopify app webhook trigger` (see
+      `PUBLISHING.md`).
+- [ ] Host monitoring alerts on `/healthz` returning 503.
 - [ ] Database backups scheduled.
 
 ## 4. Upgrading

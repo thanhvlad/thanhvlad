@@ -32,7 +32,10 @@ cost and profit — across several stores under one account.
 | **Reports** | Revenue / cost / profit / margin KPIs, daily chart, top products, destinations, recalculation. |
 | **Multi-store & staff** | Several Shopify stores under one account (shared supplier connections), staff roles (Owner/Admin/Staff/Read-only). |
 | **Notifications & activity** | In-app notification feed with dedupe, full activity log, background job list with progress, queue/webhook status. |
-| **Settings** | Orders, fulfilment, products defaults, currency (live FX with buffer/manual rate), notifications, UI language (English / Tiếng Việt), extension API token, system status. |
+| **Plans & billing** | Basic (free), Advanced, Pro and Enterprise through the Shopify Billing API with a 14-day trial; caps on products, stores and staff across the account; AI mapping and auto-place on paid plans; usage meters and upgrade/downgrade under Settings → Plan. |
+| **Email** | Instant notification emails or a daily digest at 08:00 shop time, via SMTP or Resend; critical notices always go out. |
+| **Privacy & retention** | Mandatory compliance webhooks: data requests produce a downloadable export, redaction erases personal fields, shop redact and a 30-day purge erase the store. |
+| **Settings** | Orders, fulfilment, products defaults, currency (live FX with buffer/manual rate), notifications, UI language (English / Tiếng Việt, auto-detected from the admin), plan, support, extension API token, system status. |
 | **Extension** | Minimal MV3 Chrome extension (`extension/`) that sends the current AliExpress/CJ product page to the import list. |
 
 A detailed DSers feature-by-feature comparison is in [`docs/FEATURES.md`](docs/FEATURES.md).
@@ -128,7 +131,10 @@ All settings are environment variables; see [`.env.example`](.env.example).
 | `SUPPLIER_DRIVER` | `mock` (sample catalog) or `live`. |
 | `ALIEXPRESS_APP_KEY`, `ALIEXPRESS_APP_SECRET`, `ALIEXPRESS_REDIRECT_URI`, `ALIEXPRESS_TRACKING_ID` | AliExpress Open Platform (Dropshipping solution). Redirect URI must be `https://<app>/app/suppliers/callback/aliexpress`. |
 | `CJ_EMAIL`, `CJ_API_KEY` | Optional server-wide CJ credentials (merchants can also enter their own in the UI). |
-| `ENCRYPTION_KEY` | 32-byte base64 key (`openssl rand -base64 32`); supplier tokens are AES-256-GCM encrypted at rest. **Required in production** — without it the app refuses to store a supplier token rather than writing it in plaintext. |
+| `ENCRYPTION_KEY` | 32-byte base64 key (`openssl rand -base64 32`); supplier tokens are AES-256-GCM encrypted at rest. **Required in production** — the app refuses to boot without it. |
+| `EMAIL_FROM`, `SMTP_URL` or `RESEND_API_KEY`, `EMAIL_PROVIDER` | Notification emails and the daily digest. Leave unset for in-app notifications only. |
+| `SUPPORT_EMAIL` | Shown on the public support page and used as the reply-to address. |
+| `BILLING_TEST` | Force Shopify Billing test mode on a staging deployment; automatic outside production and on development stores. |
 | `ANTHROPIC_API_KEY`, `AI_MAPPING_MODEL` | Optional. Enables the AI pass on variant matching for the variants the deterministic matcher cannot place. Without a key the deterministic matcher is used alone. |
 | `EXCHANGE_RATE_API_URL` | FX provider (default open.er-api.com). |
 
@@ -142,18 +148,26 @@ See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for Docker, Fly.io/Render/Railway
 Shopify app configuration (`shopify app deploy` registers the webhooks declared in
 `shopify.app.toml`) and production checklist.
 
+## Publishing
+
+[`docs/PUBLISHING.md`](docs/PUBLISHING.md) walks through the App Store submission:
+Partner Dashboard configuration, the scope justifications reviewers ask for,
+protected customer data, billing test mode, proving the compliance webhooks, the
+listing copy and the test instructions for the reviewer (the built-in Demo supplier
+lets anyone run the whole flow without an AliExpress account).
+
 ## Status and known limits
 
-- AliExpress and CJ adapters implement the documented request/response shapes of their
-  public APIs, but were written against the docs rather than a live account — expect to
-  adjust field mappings once you have credentials. The mock adapter and the integration
-  suite prove the rest of the pipeline end to end.
+- The AliExpress adapter follows the live Dropshipping API's wire format as captured by
+  independent integrations (see `docs/ALIEXPRESS.md`); the CJ adapter follows its public
+  docs. Run one real order end to end after connecting your account — the parsing tests
+  say exactly where to adjust if your account answers differently.
 - Supplier payment is done on the supplier site (as with DSers); the app links you to
   the payment page and tracks status afterwards.
-- Email delivery for notifications is not wired (in-app feed only); the settings exist so
-  an SMTP/SendGrid sender can be added in `services/notifications.server.ts`.
-- Vietnamese UI strings cover navigation, statuses and common actions; the rest of the UI
-  is English. The i18n scaffold (`app/lib/i18n.ts`) is ready to extend.
+- The Chrome extension is minimal (send the current supplier page to the import list);
+  it is not published to the Chrome Web Store.
+- Only AliExpress, CJ Dropshipping and the Demo supplier are implemented; Temu and
+  others fit the adapter contract but have no adapter yet.
 
 ## Hướng dẫn nhanh (VI)
 

@@ -149,7 +149,7 @@ function buildProduct(seed: MockProductSeed): SupplierProductDetail {
 
 export class MockSupplierAdapter implements SupplierAdapter {
   readonly platform = "MOCK" as const;
-  readonly displayName = "Mock supplier (development)";
+  readonly displayName = "Demo supplier";
   readonly capabilities = {
     search: true,
     imageSearch: false,
