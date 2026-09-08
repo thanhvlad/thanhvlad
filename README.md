@@ -163,7 +163,8 @@ fulfilment options, product defaults, currency buffer, notifications, UI) lives 
 
 ## Deployment
 
-See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for Docker, Fly.io/Render/Railway notes,
+Runs on Linux or Windows Server; `scripts/setup-windows.ps1` does the Windows setup.
+See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for Docker, Windows, Fly.io/Render/Railway notes,
 Shopify app configuration (`shopify app deploy` registers the webhooks declared in
 `shopify.app.toml`) and production checklist.
 

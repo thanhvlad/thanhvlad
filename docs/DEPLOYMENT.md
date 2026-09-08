@@ -35,6 +35,33 @@ docker run --env-file .env -p 3000:3000 dropship-hub                 # web (runs
 docker run --env-file .env dropship-hub npm run worker               # worker
 ```
 
+### Windows Server
+
+The app is plain Node with no shell calls, POSIX paths or platform checks, so it runs
+natively on Windows — no Docker, no WSL. `scripts/setup-windows.ps1` does the setup:
+it checks Node, git and PostgreSQL, fetches the code, creates the database, writes a
+`.env` with a generated `ENCRYPTION_KEY`, installs, migrates, builds, and writes a Caddy
+config. Run it in an elevated PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1 -Domain your-domain.com -PgPassword 'postgres-password'
+```
+
+It deliberately installs nothing itself; each missing prerequisite is reported with the
+`winget` command that fixes it.
+
+Two things Windows needs that Linux hosts give you:
+
+- **HTTPS.** Shopify requires a trusted certificate. Caddy is one `caddy.exe` plus a
+  three-line `Caddyfile` and gets a Let's Encrypt certificate on its own; the script
+  writes the config.
+- **Staying up.** Register the server and Caddy as Windows services with
+  [NSSM](https://nssm.cc) so they survive a reboot. The script prints both commands.
+
+`SIGTERM` is not delivered on Windows the way it is on Unix, so stopping the service
+skips the graceful queue shutdown. Without Redis there is no queued work to lose, so it
+only matters once you add one.
+
 ### Fly.io / Render / Railway
 
 Two services from the same image: `web` (`npm run docker-start`) and `worker`
