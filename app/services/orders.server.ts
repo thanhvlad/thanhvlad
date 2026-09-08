@@ -288,7 +288,7 @@ export async function listOrders(
 export async function countOrdersByStage(shopId: string): Promise<Record<OrderStage, number>> {
   const rows = await prisma.order.groupBy({ by: ["stage"], where: { shopId }, _count: { _all: true } });
   const base: Record<OrderStage, number> = {
-    PENDING: 0, AWAITING_ORDER: 0, AWAITING_PAYMENT: 0, AWAITING_SHIPMENT: 0, AWAITING_DELIVERY: 0, FULFILLED: 0, CANCELED: 0, FAILED: 0,
+    PENDING: 0, AWAITING_ORDER: 0, AWAITING_PAYMENT: 0, AWAITING_SHIPMENT: 0, AWAITING_DELIVERY: 0, FULFILLED: 0, CANCELED: 0, FAILED: 0, IGNORED: 0,
   };
   for (const r of rows) base[r.stage] = r._count._all;
   return base;

@@ -137,7 +137,14 @@ export function mergeShopSettings(current: unknown, patch: DeepPartial<ShopSetti
   const merged: Record<string, unknown> = { ...base };
   for (const [section, values] of Object.entries(patch)) {
     if (values && typeof values === "object" && !Array.isArray(values)) {
-      merged[section] = { ...(base as Record<string, unknown>)[section] as object, ...values };
+      // Drop explicitly-undefined leaves before spreading. Zod treats a present
+      // but undefined key exactly like a missing one and substitutes the field's
+      // default, so leaving them in would silently reset the merchant's stored
+      // choice — including safety settings such as "hold orders until paid".
+      const defined = Object.fromEntries(
+        Object.entries(values as Record<string, unknown>).filter(([, v]) => v !== undefined),
+      );
+      merged[section] = { ...((base as Record<string, unknown>)[section] as object), ...defined };
     } else if (values !== undefined) {
       merged[section] = values;
     }

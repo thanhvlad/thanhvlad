@@ -107,14 +107,27 @@ export function computePrice(
 
   let compareAtPrice: Decimal | null = null;
   if (compareOp !== "NONE" && compareValueRaw !== null && compareValueRaw !== undefined) {
-    let candidate = applyOp(price, compareOp, d(compareValueRaw));
-    if (rule.centsEnding !== null && rule.centsEnding !== undefined) {
-      candidate = applyCentsEnding(candidate, rule.centsEnding);
+    const raw = applyOp(price, compareOp, d(compareValueRaw));
+    // The merchant asked for a compare-at only if the markup is actually above
+    // the price before any rounding. Judge that on the raw figure: a markup
+    // smaller than one whole unit would otherwise be floored back onto the price
+    // by the cents ending and silently dropped.
+    if (raw.greaterThan(price)) {
+      let candidate = raw;
+      if (rule.centsEnding !== null && rule.centsEnding !== undefined) {
+        candidate = round2(applyCentsEnding(candidate, rule.centsEnding));
+        if (!candidate.greaterThan(price)) {
+          // The ending pulled it onto the price. Step up a whole unit so the
+          // crossed-out price keeps both the ending and its meaning.
+          candidate = round2(applyCentsEnding(raw.plus(1), rule.centsEnding));
+        }
+      } else {
+        candidate = round2(candidate);
+      }
+      // Shopify rejects a compare-at below the price; it would also read as a
+      // price *increase* to a shopper.
+      compareAtPrice = candidate.greaterThan(price) ? candidate : null;
     }
-    candidate = round2(candidate);
-    // Shopify rejects a compare-at below the price; it would also read as a
-    // price *increase* to a shopper.
-    compareAtPrice = candidate.greaterThan(price) ? candidate : null;
   }
 
   const profit = price.minus(effectiveCost);

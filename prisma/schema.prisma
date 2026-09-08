@@ -183,6 +183,15 @@ model SupplierAccount {
   isDefault Boolean  @default(false)
   isActive  Boolean  @default(true)
   lastUsedAt DateTime?
+
+  /// Set when the platform rejected our token; the UI then asks the merchant
+  /// to reconnect instead of failing every order silently.
+  needsReauth   Boolean   @default(false)
+  lastErrorCode String?
+  lastErrorAt   DateTime?
+  /// Store registered with the platform's dropshipping programme.
+  storeRegisteredAt DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -669,6 +678,8 @@ enum OrderStage {
   FULFILLED
   CANCELED
   FAILED
+  /// No line item on the order is managed by the app, so there is nothing to do.
+  IGNORED
 }
 
 model Order {

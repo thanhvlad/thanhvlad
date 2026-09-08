@@ -126,13 +126,20 @@ export function planVariantSync(
   const outOfStock = !supplier.isAvailable || supplier.stock <= policy.lowStockThreshold;
   switch (policy.stockAction) {
     case "UPDATE_QUANTITY": {
-      const quantity = Math.max(0, Math.min(supplier.stock, policy.maxInventoryPushed));
+      // A delisted or paused SKU often still reports a stale positive stock
+      // count, so `outOfStock` decides, not the raw number.
+      const quantity = outOfStock
+        ? 0
+        : Math.max(0, Math.min(supplier.stock, policy.maxInventoryPushed));
       if (quantity !== input.currentInventory) {
         actions.push({
           ...base,
           type: "UPDATE_INVENTORY",
           quantity,
-          reason: `Supplier stock is ${supplier.stock}; syncing ${quantity} (cap ${policy.maxInventoryPushed}).`,
+          reason: outOfStock
+            ? `The supplier SKU cannot be bought (stock ${supplier.stock}${supplier.isAvailable ? "" : ", unavailable"}); setting 0.`
+            : `Supplier stock is ${supplier.stock}; syncing ${quantity} (cap ${policy.maxInventoryPushed}).`,
+          ...(outOfStock ? { severity: "warning" as const } : {}),
         });
       }
       break;
@@ -147,14 +154,17 @@ export function planVariantSync(
           severity: "warning",
         });
       } else if (!outOfStock && input.currentInventory === 0) {
-        // Restock: put the variant back on sale.
-        const quantity = Math.max(1, Math.min(supplier.stock, policy.maxInventoryPushed));
-        actions.push({
-          ...base,
-          type: "UPDATE_INVENTORY",
-          quantity,
-          reason: "The supplier SKU is back in stock.",
-        });
+        // Restock: put the variant back on sale. The merchant's cap wins — a cap
+        // of 0 means "never push inventory", not "push one unit".
+        const quantity = Math.max(0, Math.min(supplier.stock, policy.maxInventoryPushed));
+        if (quantity > 0) {
+          actions.push({
+            ...base,
+            type: "UPDATE_INVENTORY",
+            quantity,
+            reason: "The supplier SKU is back in stock.",
+          });
+        }
       }
       break;
     }
@@ -186,6 +196,12 @@ export function planVariantSync(
   }
 
   // ---- Price ---------------------------------------------------------------
+  // Whatever Shopify's "Cost per item" is set to, it must be the same number on
+  // both paths below — otherwise it flips between the item cost and the
+  // shipping-inclusive cost across sync runs and every margin report drifts.
+  const shopifyCost = money(
+    pricingRule?.includeShipping ? newCost.plus(d(supplier.shippingCost ?? 0)) : newCost,
+  );
   const threshold = d(policy.priceThresholdPercent);
   const movedEnough = changePercent.abs().greaterThanOrEqualTo(threshold) && !newCost.equals(oldCost);
 
@@ -209,7 +225,7 @@ export function planVariantSync(
           type: "UPDATE_PRICE",
           price: computed.price,
           compareAtPrice: computed.compareAtPrice,
-          cost: computed.effectiveCost,
+          cost: shopifyCost,
           reason: `Supplier cost moved ${changePercent.toFixed(2)}%; repriced to ${computed.price}.`,
         });
       }
@@ -217,14 +233,14 @@ export function planVariantSync(
   }
 
   // Keep Shopify's "Cost per item" honest even when the sell price is frozen.
-  const costChanged = !newCost.equals(d(input.currentCost ?? 0));
+  const costChanged = !d(shopifyCost).equals(d(input.currentCost ?? 0));
   const alreadyRepricing = actions.some((a) => a.type === "UPDATE_PRICE");
   if (costChanged && !alreadyRepricing) {
     actions.push({
       ...base,
       type: "UPDATE_COST",
-      cost: money(newCost),
-      reason: `Supplier cost is now ${money(newCost)}.`,
+      cost: shopifyCost,
+      reason: `Supplier cost is now ${shopifyCost}.`,
     });
   }
 

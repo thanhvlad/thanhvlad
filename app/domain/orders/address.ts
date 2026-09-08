@@ -1,3 +1,5 @@
+import { toCountryCode } from "./countries";
+
 export interface ShippingAddress {
   firstName?: string | null;
   lastName?: string | null;
@@ -54,13 +56,21 @@ const PROVINCE_REQUIRED = new Set([
   "US", "CA", "AU", "CN", "JP", "IT", "ES", "MX", "BR", "IN", "MY", "AR", "ID", "TH", "IE",
 ]);
 
-/** Destinations that genuinely have no postal codes. */
+/**
+ * Destinations that genuinely have no postal codes.
+ *
+ * South Africa (4-digit codes) and Ireland (Eircode, since 2015) are NOT in this
+ * list even though they are often mistaken for postal-code-free countries —
+ * carriers reject their addresses without one, and the supplier order fails far
+ * later than validation would have. Netherlands Antilles ("AN") is gone since
+ * 2010 and is not listed either.
+ */
 const NO_ZIP = new Set([
   "AE", "AO", "AG", "AW", "BS", "BZ", "BJ", "BW", "BF", "BI", "CM", "CF", "KM", "CG", "CD",
-  "CK", "CI", "DJ", "DM", "GQ", "ER", "FJ", "TF", "GM", "GH", "GD", "GY", "HK", "IE", "JM",
-  "KE", "KI", "KP", "LY", "MO", "MW", "ML", "MR", "MU", "MS", "NR", "AN", "NU", "KP", "PA",
-  "QA", "RW", "KN", "LC", "ST", "SC", "SL", "SB", "SO", "ZA", "SR", "SY", "TZ", "TL", "TK",
-  "TO", "TT", "TV", "UG", "AE", "VU", "YE", "ZW",
+  "CK", "CI", "DJ", "DM", "GQ", "ER", "FJ", "TF", "GM", "GH", "GD", "GY", "HK", "JM",
+  "KE", "KI", "KP", "LY", "MO", "MW", "ML", "MR", "MU", "MS", "NR", "NU", "PA",
+  "QA", "RW", "KN", "LC", "ST", "SC", "SL", "SB", "SO", "SR", "SY", "TZ", "TL", "TK",
+  "TO", "TT", "TV", "UG", "VU", "YE", "ZW",
 ]);
 
 /**
@@ -101,13 +111,22 @@ const ZIP_PATTERNS: Record<string, RegExp> = {
   PL: /^\d{2}-?\d{3}$/,
   SE: /^\d{3}\s?\d{2}$/,
   MX: /^\d{5}$/,
+  ZA: /^\d{4}$/,
+  // Eircode: routing key + 4 alphanumerics, e.g. "D02 AF30".
+  IE: /^[A-Za-z]\d{2}\s?[A-Za-z\d]{4}$/,
 };
 
 /** Most suppliers reject an address line longer than this. */
 const MAX_ADDRESS1 = 128;
+const MAX_ADDRESS2 = 128;
 const MAX_NAME = 50;
 
-const LATIN_ONLY = /^[\p{Script=Latin}\p{Nd}\p{P}\p{Zs}\p{S}]*$/u;
+/**
+ * `\p{M}` is required: accented Latin text in NFD form (what macOS, iOS and some
+ * checkout inputs produce) is a base letter plus a combining mark, and without it
+ * an ordinary "José" is flagged as non-Latin.
+ */
+const LATIN_ONLY = /^[\p{Script=Latin}\p{M}\p{Nd}\p{P}\p{Zs}\p{S}]*$/u;
 
 export function fullName(address: ShippingAddress): string {
   if (address.name?.trim()) return address.name.trim();
@@ -116,6 +135,10 @@ export function fullName(address: ShippingAddress): string {
 
 function digitsOnly(value: string): string {
   return value.replace(/\D/g, "");
+}
+
+function joinAddress2(overflow: string, existing?: string | null): string {
+  return [overflow, existing].filter(Boolean).join(", ");
 }
 
 /**
@@ -129,7 +152,10 @@ export function validateAddress(
   options: { requireLatin?: boolean; requireTaxId?: boolean } = {},
 ): AddressValidationResult {
   const issues: AddressIssue[] = [];
-  const country = (input.countryCode ?? input.country ?? "").trim().toUpperCase();
+  // Never let a display name ("United States") reach downstream code as if it
+  // were an ISO code: it matches no country rule and the supplier rejects it.
+  const country = toCountryCode(input.countryCode, input.country) ?? "";
+  const rawCountry = (input.countryCode ?? input.country ?? "").trim();
 
   const normalized: ShippingAddress = {
     ...input,
@@ -167,7 +193,9 @@ export function validateAddress(
       code: "MISSING_COUNTRY",
       field: "countryCode",
       severity: "error",
-      message: "The destination country is missing.",
+      message: rawCountry
+        ? `"${rawCountry}" is not a country we recognise. Set the destination country on the order.`
+        : "The destination country is missing.",
     });
   }
 
@@ -180,14 +208,22 @@ export function validateAddress(
     });
   } else if (normalized.address1.length > MAX_ADDRESS1) {
     // Overflow into address2 rather than truncating away part of the address.
+    // A suggestion is only offered when the overflow actually fits on line 2 —
+    // otherwise the "fix" would silently drop part of the street address and
+    // re-validation would report the order as clean.
     const cut = normalized.address1.slice(0, MAX_ADDRESS1);
     const boundary = cut.lastIndexOf(" ");
+    const keep = (boundary > 40 ? cut.slice(0, boundary) : cut).trim();
+    const line2 = joinAddress2(normalized.address1.slice(keep.length).trim(), normalized.address2);
+    const fits = line2.length <= MAX_ADDRESS2;
     issues.push({
       code: "ADDRESS1_TOO_LONG",
       field: "address1",
       severity: "error",
-      message: `Address line 1 is ${normalized.address1.length} characters; the limit is ${MAX_ADDRESS1}. Move the overflow to line 2.`,
-      suggestion: (boundary > 40 ? cut.slice(0, boundary) : cut).trim(),
+      message: fits
+        ? `Address line 1 is ${normalized.address1.length} characters; the limit is ${MAX_ADDRESS1}. Move the overflow to line 2.`
+        : `Address line 1 is ${normalized.address1.length} characters and the overflow does not fit on line 2 either (${MAX_ADDRESS1} each). Shorten the address before ordering.`,
+      ...(fits ? { suggestion: keep } : {}),
     });
   }
 
@@ -306,10 +342,16 @@ export function applySuggestions(
   for (const issue of issues) {
     if (!issue.suggestion) continue;
     if (issue.code === "ADDRESS1_TOO_LONG") {
-      const original = address.address1 ?? "";
-      const overflow = original.slice(issue.suggestion.length).trim();
+      const original = (address.address1 ?? "").trim().replace(/\s+/g, " ");
+      // Only split when the suggestion is genuinely a prefix of the address and
+      // the remainder fits on line 2. Anything else is left for the merchant to
+      // correct — shipping a silently truncated street address is worse than
+      // blocking the order.
+      if (!original.startsWith(issue.suggestion)) continue;
+      const line2 = joinAddress2(original.slice(issue.suggestion.length).trim(), address.address2);
+      if (line2.length > MAX_ADDRESS2) continue;
       next.address1 = issue.suggestion;
-      next.address2 = [overflow, address.address2].filter(Boolean).join(", ").slice(0, MAX_ADDRESS1);
+      next.address2 = line2;
       continue;
     }
     (next as Record<string, unknown>)[issue.field] = issue.suggestion;
@@ -317,4 +359,12 @@ export function applySuggestions(
   return next;
 }
 
-export const ADDRESS_RULES = { PROVINCE_REQUIRED, NO_ZIP, TAX_ID_RULES, ZIP_PATTERNS, MAX_ADDRESS1, MAX_NAME };
+export const ADDRESS_RULES = {
+  PROVINCE_REQUIRED,
+  NO_ZIP,
+  TAX_ID_RULES,
+  ZIP_PATTERNS,
+  MAX_ADDRESS1,
+  MAX_ADDRESS2,
+  MAX_NAME,
+};

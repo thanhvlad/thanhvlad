@@ -11,6 +11,7 @@ const STAGE_TONES: Record<string, Tone> = {
   FULFILLED: "success",
   CANCELED: undefined,
   FAILED: "critical",
+  IGNORED: undefined,
   // Purchase orders
   DRAFT: undefined,
   SUBMITTING: "info",
@@ -42,6 +43,7 @@ const LABELS: Record<string, string> = {
   FULFILLED: "Fulfilled",
   CANCELED: "Canceled",
   FAILED: "Failed",
+  IGNORED: "Not ours",
   DRAFT: "Draft",
   SUBMITTING: "Submitting",
   PLACED: "Placed",
