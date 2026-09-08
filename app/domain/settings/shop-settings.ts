@@ -116,6 +116,11 @@ export const shopSettingsSchema = z.object({
   ui: z
     .object({
       locale: z.enum(["en", "vi"]).default("en"),
+      /**
+       * Until the merchant picks a language in Settings, the UI follows the
+       * language of the Shopify admin they open it from.
+       */
+      localeChosen: z.boolean().default(false),
       ordersPageSize: z.number().int().min(10).max(250).default(50),
       dismissedTips: z.array(z.string()).default([]),
     })

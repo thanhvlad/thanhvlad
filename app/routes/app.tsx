@@ -6,9 +6,11 @@ import { NavMenu } from "@shopify/app-bridge-react";
 import polarisStyles from "@shopify/polaris/build/esm/styles.css?url";
 import { requireShop } from "~/lib/auth.server";
 import { env } from "~/lib/env.server";
+import { mergeShopSettings } from "~/domain/settings/shop-settings";
 import { countUnread } from "~/services/notifications.server";
 import { countUnpaid } from "~/services/payments.server";
-import { makeT } from "~/lib/i18n";
+import { updateShopSettings } from "~/services/shop.server";
+import { makeT, type Locale } from "~/lib/i18n";
 
 export const links = () => [{ rel: "stylesheet", href: polarisStyles }];
 
@@ -16,10 +18,23 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
   const [unread, unpaid] = await Promise.all([countUnread(shop.id), countUnpaid(shop.id)]);
 
+  // Shopify passes the admin's language as `locale` when it opens the app. A
+  // merchant running a Vietnamese admin gets a Vietnamese app from the first
+  // screen, and can still pin a language under Settings.
+  let locale: Locale = shop.parsedSettings.ui.locale;
+  const adminLocale = new URL(request.url).searchParams.get("locale");
+  if (!shop.parsedSettings.ui.localeChosen && adminLocale) {
+    const detected: Locale = /^vi/i.test(adminLocale) ? "vi" : "en";
+    if (detected !== locale) {
+      locale = detected;
+      await updateShopSettings(shop.id, mergeShopSettings(shop.settings, { ui: { locale } }));
+    }
+  }
+
   return {
     apiKey: env().SHOPIFY_API_KEY,
     shopDomain: shop.domain,
-    locale: shop.parsedSettings.ui.locale,
+    locale,
     unread,
     unpaid,
   };

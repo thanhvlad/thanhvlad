@@ -20,6 +20,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const { json } = await readForm(request);
   try {
     const patch = json<Partial<ShopSettings>>("settings", {});
+    if (patch.ui?.locale && patch.ui.locale !== shop.parsedSettings.ui.locale) {
+      patch.ui = { ...patch.ui, localeChosen: true };
+    }
     if (patch.orders?.autoPlaceOrders && !shop.parsedSettings.orders.autoPlaceOrders) {
       await requireFeature(shop, "autoPlaceOrders");
     }

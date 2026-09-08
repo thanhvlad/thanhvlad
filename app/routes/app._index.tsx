@@ -2,6 +2,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { Link, useFetcher, useLoaderData } from "@remix-run/react";
 import {
   Badge,
+  Banner,
   BlockStack,
   Box,
   Button,
@@ -27,16 +28,20 @@ import { getDashboardStats } from "~/services/reports.server";
 import { listSupplierAccounts } from "~/services/supplier-accounts.server";
 import { listPricingRules } from "~/services/pricing.server";
 import { PLANS } from "~/domain/billing/plans";
+import { mergeShopSettings } from "~/domain/settings/shop-settings";
 import { getAccountBilling } from "~/services/billing.server";
+import { listShippingPreferences } from "~/services/shipping.server";
+import { updateShopSettings } from "~/services/shop.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
-  const [stats, notifications, suppliers, rules, billing] = await Promise.all([
+  const [stats, notifications, suppliers, rules, billing, shipping] = await Promise.all([
     getDashboardStats(shop.id),
     listNotifications(shop.id, { limit: 6 }),
     listSupplierAccounts(shop.id),
     listPricingRules(shop.id),
     getAccountBilling(shop),
+    listShippingPreferences(shop.id),
   ]);
   const plan = {
     name: PLANS[billing.plan].displayName,
@@ -46,10 +51,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const onboarding = {
     supplier: suppliers.length > 0,
     pricing: rules.length > 0,
+    shipping: shipping.length > 0,
+    fulfillmentService: Boolean(shop.fulfillmentServiceId),
     product: stats.products.total > 0,
     order: Object.values(stats.stages).some((n) => n > 0),
   };
-  return { shop: { name: shop.name ?? shop.domain, currency: shop.currency }, stats, notifications, onboarding, plan };
+  const showWelcome = !shop.parsedSettings.ui.dismissedTips.includes("welcome");
+  return { shop: { name: shop.name ?? shop.domain, currency: shop.currency }, stats, notifications, onboarding, plan, showWelcome };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -62,6 +70,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
     return { ok: true, jobRunId: job.id, message: reused ? "A sync is already running." : undefined };
   }
+  if (intent === "dismiss-welcome") {
+    const tips = shop.parsedSettings.ui.dismissedTips;
+    if (!tips.includes("welcome")) {
+      await updateShopSettings(shop.id, mergeShopSettings(shop.settings, { ui: { dismissedTips: [...tips, "welcome"] } }));
+    }
+    return { ok: true };
+  }
   if (intent === "sync-suppliers") {
     const { job, reused } = await findOrCreateJobRun({ shopId: shop.id, type: "sync-purchase-orders" });
     if (!reused) {
@@ -73,12 +88,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function Dashboard() {
-  const { shop, stats, notifications, onboarding, plan } = useLoaderData<typeof loader>();
+  const { shop, stats, notifications, onboarding, plan, showWelcome } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const t = useT();
   const steps = [
     { done: onboarding.supplier, label: t("dashboard.onboarding.supplier"), to: "/app/suppliers" },
     { done: onboarding.pricing, label: t("dashboard.onboarding.pricing"), to: "/app/pricing" },
+    { done: onboarding.shipping, label: t("dashboard.onboarding.shipping"), to: "/app/shipping" },
+    { done: onboarding.fulfillmentService, label: t("dashboard.onboarding.fulfillmentService"), to: "/app/settings/fulfillment" },
     { done: onboarding.product, label: t("dashboard.onboarding.product"), to: "/app/search" },
     { done: onboarding.order, label: t("dashboard.onboarding.order"), to: "/app/orders" },
   ];
@@ -95,6 +112,23 @@ export default function Dashboard() {
       ]}
     >
       <Layout>
+        {showWelcome && (
+          <Layout.Section>
+            <Banner title={t("dashboard.welcome.title")} tone="info" onDismiss={() => fetcher.submit({ intent: "dismiss-welcome" }, { method: "post" })}>
+              <BlockStack gap="200">
+                <Text as="p">{t("dashboard.welcome.body")}</Text>
+                <InlineStack gap="200">
+                  <Button url="/support" target="_blank" variant="plain">
+                    {t("dashboard.welcome.support")}
+                  </Button>
+                  <Button url="/app/settings/plan" variant="plain">
+                    {t("dashboard.welcome.plan")}
+                  </Button>
+                </InlineStack>
+              </BlockStack>
+            </Banner>
+          </Layout.Section>
+        )}
         {completed < steps.length && (
           <Layout.Section>
             <Card>

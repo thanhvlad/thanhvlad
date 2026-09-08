@@ -88,6 +88,32 @@ export async function onShopInstalled({
   if (shop.uninstalledAt) {
     await logActivity(shop.id, { action: "shop.reinstalled", message: "App reinstalled." });
   }
+
+  await backfillOrdersOnInstall(shop.id);
+}
+
+/**
+ * A fresh install pulls in the last 30 days of orders, so the Orders page is
+ * not empty until the next webhook and the merchant can start with the orders
+ * they already have — which is what DSers does and what a reviewer expects to
+ * see. Only runs while the store has no orders at all: a re-auth or a
+ * reinstall of a store with history must not queue a second sync.
+ *
+ * The job module is loaded lazily: it imports every service, and a static
+ * import here would create a cycle back through the Shopify client.
+ */
+async function backfillOrdersOnInstall(shopId: string) {
+  try {
+    const existing = await prisma.order.count({ where: { shopId } });
+    if (existing > 0) return;
+    const [{ findOrCreateJobRun }, { enqueue }] = await Promise.all([import("./jobs.server"), import("./jobs/index.server")]);
+    const { job, reused } = await findOrCreateJobRun({ shopId, type: "sync-orders", payload: { days: 30, reason: "install" } });
+    if (!reused) {
+      await enqueue("sync-orders", { shopId, days: 30, jobRunId: job.id }, { dedupeKey: `sync-orders-${shopId}` });
+    }
+  } catch (error) {
+    logger.warn("Could not queue the install order backfill", { shopId, error });
+  }
 }
 
 export async function markShopUninstalled(domain: string) {
