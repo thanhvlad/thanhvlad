@@ -827,6 +827,10 @@ export async function syncPendingTracking(shop: ShopWithSettings, purchaseOrderI
       if (outstanding.length > 0) {
         const result = await createFulfillmentWithTracking(graphql, {
           orderId: po.order.shopifyOrderId,
+          // Derived from the purchase order and the exact set of tracking
+          // numbers, so a retry of this same shipment is recognised by Shopify
+          // rather than fulfilled a second time.
+          idempotencyKey: createHash("sha256").update(`${poId}|${[...numbers].sort().join(",")}`).digest("hex").slice(0, 40),
           // Only what is genuinely still outstanding: falling back to the full
           // quantity re-fulfilled the whole order for the second parcel.
           items: outstanding.map((l) => ({ lineItemId: l.shopifyLineItemId, quantity: l.fulfillableQuantity })),

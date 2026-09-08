@@ -8,7 +8,7 @@ const SHOP_QUERY = `#graphql
       myshopifyDomain
       currencyCode
       ianaTimezone
-      billingAddress { countryCodeV2 }
+      shopAddress { countryCodeV2 }
       currencyFormats { moneyFormat }
       plan { partnerDevelopment shopifyPlus }
     }
@@ -36,7 +36,7 @@ export async function fetchShopInfo(client: GraphqlClient): Promise<ShopInfo> {
       email: string | null;
       currencyCode: string;
       ianaTimezone: string;
-      billingAddress: { countryCodeV2: string | null } | null;
+      shopAddress: { countryCodeV2: string | null } | null;
       currencyFormats: { moneyFormat: string } | null;
       plan: { partnerDevelopment: boolean } | null;
     };
@@ -48,7 +48,7 @@ export async function fetchShopInfo(client: GraphqlClient): Promise<ShopInfo> {
     email: data.shop.email,
     currencyCode: data.shop.currencyCode,
     ianaTimezone: data.shop.ianaTimezone,
-    countryCode: data.shop.billingAddress?.countryCodeV2 ?? null,
+    countryCode: data.shop.shopAddress?.countryCodeV2 ?? null,
     moneyFormat: data.shop.currencyFormats?.moneyFormat ?? null,
     primaryLocationId: data.locations.nodes[0]?.id ?? null,
     isDevelopmentStore: data.shop.plan?.partnerDevelopment ?? false,

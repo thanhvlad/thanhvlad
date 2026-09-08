@@ -329,10 +329,15 @@ export async function setInventoryQuantities(
   const data = await gql<{
     inventorySetQuantities: { userErrors: UserError[] };
   }>(client, INVENTORY_SET_QUANTITIES, {
+    // No `ignoreCompareQuantity`: it is not a field on InventorySetQuantitiesInput
+    // (verified against the 2026-07 Admin schema), and an unknown key in the
+    // variables is rejected by the server as a top-level error — every inventory
+    // sync failed on it. The optimistic-concurrency check is opt-in through each
+    // quantity's `changeFromQuantity`; leaving it out means "set it regardless",
+    // which is what a supplier-driven sync wants.
     input: {
       name: "available",
       reason: "correction",
-      ignoreCompareQuantity: true,
       quantities: quantities.map((q) => ({
         inventoryItemId: q.inventoryItemId,
         locationId,
@@ -344,8 +349,8 @@ export async function setInventoryQuantities(
 }
 
 const PRODUCT_UPDATE_STATUS = `#graphql
-  mutation DropshipProductStatus($input: ProductInput!) {
-    productUpdate(input: $input) {
+  mutation DropshipProductStatus($product: ProductUpdateInput!) {
+    productUpdate(product: $product) {
       product { id status }
       userErrors { field message }
     }
@@ -357,8 +362,9 @@ export async function setProductStatus(
   productId: string,
   status: "ACTIVE" | "DRAFT" | "ARCHIVED",
 ) {
+  // `input` on productUpdate is deprecated in favour of `product`.
   const data = await gql<{ productUpdate: { userErrors: UserError[] } }>(client, PRODUCT_UPDATE_STATUS, {
-    input: { id: productId, status },
+    product: { id: productId, status },
   });
   assertNoUserErrors(data.productUpdate.userErrors, "productUpdate");
 }
@@ -384,7 +390,7 @@ export async function deleteProduct(client: GraphqlClient, productId: string) {
 
 const PUBLICATIONS_QUERY = `#graphql
   query DropshipPublications {
-    publications(first: 20) { nodes { id name } }
+    publications(first: 20) { nodes { id catalog { title } } }
   }
 `;
 
@@ -398,11 +404,12 @@ const PUBLISH_MUTATION = `#graphql
 
 /** Publish to every sales channel that looks like an online storefront. */
 export async function publishProduct(client: GraphqlClient, productId: string) {
-  const data = await gql<{ publications: { nodes: Array<{ id: string; name: string }> } }>(
+  // Publication.name is deprecated in favour of the catalog's title.
+  const data = await gql<{ publications: { nodes: Array<{ id: string; catalog: { title: string } | null }> } }>(
     client,
     PUBLICATIONS_QUERY,
   );
-  const targets = data.publications.nodes.filter((p) => /online store|headless|shop/i.test(p.name));
+  const targets = data.publications.nodes.filter((p) => /online store|headless|shop/i.test(p.catalog?.title ?? ""));
   if (targets.length === 0) return;
   const result = await gql<{ publishablePublish: { userErrors: UserError[] } }>(client, PUBLISH_MUTATION, {
     id: productId,

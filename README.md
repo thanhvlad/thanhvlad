@@ -15,13 +15,16 @@ cost and profit — across several stores under one account.
 
 | Area | What you get |
 | --- | --- |
-| **Find products** | Keyword + image search across supplier catalogs (AliExpress DS API, CJ), sort by orders/rating/price, paste URLs or IDs, bulk link import, CSV import, browser-extension capture. |
+| **Find products** | Keyword + image search across supplier catalogs (AliExpress DS API, CJ), sort by orders/rating/price, shipping cost per result, **Add to shop** in one click (import + price + push), paste URLs or IDs, bulk link import, CSV import, browser-extension capture. |
 | **Import list** | Staging area: edit title, description (HTML with preview), vendor/type/tags/handle/collections, images (reorder/remove/add), variants (price, compare-at, SKU, inventory, enable/disable), exclude option values, split by option, apply pricing rules, bulk push to Shopify. |
 | **My products** | Managed products mirrored from Shopify, link existing Shopify products for mapping, reprice from supplier cost, auto-update toggles, refresh/unlink/delete, resource-picker linking. |
-| **Mapping** | Basic (1:1), Advanced (ranked suppliers per destination country with in-stock fall-through), BOGO (quantity tiers), Bundle (multi-SKU components). Auto-map by option values. Live "test the mapping" resolver. Supplier cost history. |
+| **Mapping** | Basic (1:1), Advanced (ranked suppliers per destination country with in-stock fall-through), BOGO (quantity tiers), Bundle (multi-SKU components). Auto-map by option values, with an AI pass for the variants the deterministic matcher cannot place. Live "test the mapping" resolver. Supplier cost history. |
+| **Supplier comparison** | Side-by-side landed cost, shipping, delivery days, rating, order count and variant coverage for every supplier of a product, scored and ranked, with one-click switch and the saving it earns. |
 | **Orders** | Webhook ingest + backfill sync, pipeline stages (Pending → Awaiting order → Awaiting payment → Awaiting shipment → Awaiting delivery → Fulfilled / Canceled / Failed), address validation with country rules (phone, ZIP, province, CPF/RUT/PCCC/TC Kimlik…), auto-fix over-long addresses, per-line mapping resolution with clear failure reasons, bulk place, force place, ignore lines, address editor that can write back to Shopify, CSV export. |
 | **Fulfilment** | One purchase order per supplier, shipping method chosen from your carrier preferences with cost/day/tracking guard rails and cheapest/fastest fallback, idempotent placement, retry/cancel/manual link, supplier status polling that never regresses, tracking capture, Shopify fulfilment creation with customer notification, carrier-name override, custom tracking URL, order tagging, auto-cancel upstream on Shopify cancel, auto-place with delay. |
-| **Tracking** | All tracking numbers with sync state, failed-sync retry, delivered filter. |
+| **Tracking** | All tracking numbers with sync state, failed-sync retry, delivered filter. A supplier order that ships as several parcels puts every number on the one Shopify fulfilment. |
+| **Payments** | AliExpress will not let an app charge your account, so the app never tries: it places orders unpaid and gives you the links. Every unpaid order with its total, a running total per currency, a 24-hour countdown before AliExpress cancels it, a **Pay** button per order, bulk open, automatic status polling and a manual "I paid this". |
+| **Request fulfillment from Shopify** | Register the app as a Shopify fulfilment service and the native **Request fulfillment** button on a Shopify order routes it here, which places the supplier order. Unmapped lines are rejected back to Shopify with the reason. |
 | **Auto updates** | Policy per shop: on price change (update via rule / notify / nothing) with threshold; on stock change (set 0 when out + restock, mirror capped quantity, unpublish, notify); on product removed. Dry-run preview, manual run, schedule interval, run history. |
 | **Pricing rules** | Multiply / add / target margin / fixed; compare-at derived from price; cents ending; round-up-to-multiple; min/max clamps; include shipping; cost-range tiers; default rule; live preview table. |
 | **Shipping** | Ranked carriers per country (or `*`), max cost, max days, tracking required, fallback cheapest/fastest/none, global cost cap. |
@@ -29,7 +32,7 @@ cost and profit — across several stores under one account.
 | **Reports** | Revenue / cost / profit / margin KPIs, daily chart, top products, destinations, recalculation. |
 | **Multi-store & staff** | Several Shopify stores under one account (shared supplier connections), staff roles (Owner/Admin/Staff/Read-only). |
 | **Notifications & activity** | In-app notification feed with dedupe, full activity log, background job list with progress, queue/webhook status. |
-| **Settings** | Orders, fulfilment, products defaults, currency (live FX with buffer/manual rate), notifications, UI language (EN/VI scaffold), extension API token, system status. |
+| **Settings** | Orders, fulfilment, products defaults, currency (live FX with buffer/manual rate), notifications, UI language (English / Tiếng Việt), extension API token, system status. |
 | **Extension** | Minimal MV3 Chrome extension (`extension/`) that sends the current AliExpress/CJ product page to the import list. |
 
 A detailed DSers feature-by-feature comparison is in [`docs/FEATURES.md`](docs/FEATURES.md).
@@ -81,6 +84,8 @@ Leave `SUPPLIER_DRIVER=mock` to exercise the complete flow with the built-in sam
 catalog: products import, orders route to the mock supplier, orders move to
 paid → shipped → delivered over a few minutes and tracking numbers appear. Switch to
 `SUPPLIER_DRIVER=live` and set the AliExpress / CJ keys to go live.
+Going live with a real AliExpress account is covered step by step, in English and
+Vietnamese, in [`docs/ALIEXPRESS.md`](docs/ALIEXPRESS.md).
 
 ### Background worker
 
@@ -123,7 +128,8 @@ All settings are environment variables; see [`.env.example`](.env.example).
 | `SUPPLIER_DRIVER` | `mock` (sample catalog) or `live`. |
 | `ALIEXPRESS_APP_KEY`, `ALIEXPRESS_APP_SECRET`, `ALIEXPRESS_REDIRECT_URI`, `ALIEXPRESS_TRACKING_ID` | AliExpress Open Platform (Dropshipping solution). Redirect URI must be `https://<app>/app/suppliers/callback/aliexpress`. |
 | `CJ_EMAIL`, `CJ_API_KEY` | Optional server-wide CJ credentials (merchants can also enter their own in the UI). |
-| `ENCRYPTION_KEY` | 32-byte base64 key; supplier tokens are AES-256-GCM encrypted at rest when set. |
+| `ENCRYPTION_KEY` | 32-byte base64 key (`openssl rand -base64 32`); supplier tokens are AES-256-GCM encrypted at rest. **Required in production** — without it the app refuses to store a supplier token rather than writing it in plaintext. |
+| `ANTHROPIC_API_KEY`, `AI_MAPPING_MODEL` | Optional. Enables the AI pass on variant matching for the variants the deterministic matcher cannot place. Without a key the deterministic matcher is used alone. |
 | `EXCHANGE_RATE_API_URL` | FX provider (default open.er-api.com). |
 
 Per-shop behaviour (order gating, auto-place, supplier note, tags, phone fallback,
@@ -169,6 +175,27 @@ npm run worker         # (tuỳ chọn) worker xử lý hàng đợi khi có Red
 ```
 
 Giữ `SUPPLIER_DRIVER=mock` để chạy thử toàn bộ luồng với catalog mẫu; đổi sang `live` và
-điền khoá API AliExpress/CJ khi dùng thật. Chi tiết tính năng so với DSers xem
-`docs/FEATURES.md`; kiến trúc xem `docs/ARCHITECTURE.md`; triển khai xem
-`docs/DEPLOYMENT.md`.
+điền khoá API AliExpress/CJ khi dùng thật. Hướng dẫn kết nối tài khoản AliExpress thật,
+từng bước bằng tiếng Việt, nằm ở `docs/ALIEXPRESS.md`.
+
+**Giao diện tiếng Việt.** Vào **Settings → General → Language** chọn *Tiếng Việt*. Tiếng
+Anh là bản gốc, nên nếu thiếu chuỗi nào thì hiện tiếng Anh chứ không để trống.
+
+**Thanh toán.** AliExpress không cho phép ứng dụng trừ tiền tài khoản của bạn, nên app
+không bao giờ tự thanh toán: app tạo đơn ở trạng thái chưa trả rồi đưa link trực tiếp.
+Trang **Payments** liệt kê mọi đơn chưa trả, tổng tiền theo từng loại tiền tệ, đồng hồ
+đếm ngược 24 giờ trước khi AliExpress huỷ đơn, nút **Pay** mở đúng đơn đó, và nút mở
+hàng loạt để trả nhiều đơn một lần.
+
+**Nút Request fulfillment ngay trong Shopify.** Đăng ký app làm fulfillment service
+(Settings → Fulfilment) là mỗi đơn Shopify sẽ có nút **Request fulfillment** gửi thẳng
+sang app và app tự đặt hàng nhà cung cấp. Dòng nào chưa map thì app từ chối kèm lý do.
+
+**So sánh nhà cung cấp & map bằng AI.** Trang sản phẩm hiển thị mọi nhà cung cấp của
+sản phẩm đó cạnh nhau: giá vốn đã gồm ship, số ngày giao, đánh giá, số đơn, và tỷ lệ
+biến thể khớp được — có điểm số và nút chuyển sang nhà cung cấp rẻ hơn. Việc ghép biến
+thể chạy bằng bộ so khớp tất định trước (hiểu màu/size/quốc gia ở 10 ngôn ngữ), phần
+còn lại mới nhờ AI.
+
+Chi tiết tính năng so với DSers xem `docs/FEATURES.md`; kiến trúc xem
+`docs/ARCHITECTURE.md`; triển khai xem `docs/DEPLOYMENT.md`.

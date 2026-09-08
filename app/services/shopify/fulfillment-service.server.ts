@@ -20,14 +20,12 @@ const FULFILLMENT_SERVICE_CREATE = `#graphql
     $callbackUrl: URL!
     $trackingSupport: Boolean!
     $inventoryManagement: Boolean!
-    $permitsSkuSharing: Boolean!
   ) {
     fulfillmentServiceCreate(
       name: $name
       callbackUrl: $callbackUrl
       trackingSupport: $trackingSupport
       inventoryManagement: $inventoryManagement
-      permitsSkuSharing: $permitsSkuSharing
     ) {
       fulfillmentService {
         id
@@ -131,7 +129,6 @@ export async function createFulfillmentService(
     // The app already mirrors supplier stock onto the merchant's own location,
     // so it does not also want Shopify asking it for inventory levels.
     inventoryManagement: false,
-    permitsSkuSharing: true,
   });
   assertNoUserErrors(data.fulfillmentServiceCreate.userErrors, "fulfillmentServiceCreate");
   const service = data.fulfillmentServiceCreate.fulfillmentService;

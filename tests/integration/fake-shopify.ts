@@ -32,7 +32,7 @@ function respond(operation: string, variables: Record<string, unknown>, fake: Fa
   switch (operation) {
     case "DropshipShopInfo":
       return {
-        shop: { name: "Test Store", email: "owner@test.dev", currencyCode: "USD", ianaTimezone: "UTC", billingAddress: { countryCodeV2: "US" }, currencyFormats: { moneyFormat: "{{amount}} USD" }, plan: { partnerDevelopment: true } },
+        shop: { name: "Test Store", email: "owner@test.dev", currencyCode: "USD", ianaTimezone: "UTC", shopAddress: { countryCodeV2: "US" }, currencyFormats: { moneyFormat: "{{amount}} USD" }, plan: { partnerDevelopment: true } },
         locations: { nodes: [{ id: "gid://shopify/Location/1", name: "Main" }] },
       };
     case "DropshipProductSet": {
@@ -64,7 +64,7 @@ function respond(operation: string, variables: Record<string, unknown>, fake: Fa
       };
     }
     case "DropshipPublications":
-      return { publications: { nodes: [{ id: "gid://shopify/Publication/1", name: "Online Store" }] } };
+      return { publications: { nodes: [{ id: "gid://shopify/Publication/1", catalog: { title: "Online Store" } }] } };
     case "DropshipPublish":
       return { publishablePublish: { userErrors: [] } };
     case "DropshipVariantsUpdate": {
@@ -74,7 +74,7 @@ function respond(operation: string, variables: Record<string, unknown>, fake: Fa
     case "DropshipInventorySet":
       return { inventorySetQuantities: { inventoryAdjustmentGroup: { reason: "correction" }, userErrors: [] } };
     case "DropshipProductStatus":
-      return { productUpdate: { product: { id: (variables.input as { id: string }).id, status: (variables.input as { status: string }).status }, userErrors: [] } };
+      return { productUpdate: { product: { id: (variables.product as { id: string }).id, status: (variables.product as { status: string }).status }, userErrors: [] } };
     case "DropshipProductDelete":
       return { productDelete: { deletedProductId: (variables.input as { id: string }).id, userErrors: [] } };
     case "DropshipTagsAdd":

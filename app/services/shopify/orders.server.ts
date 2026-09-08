@@ -71,7 +71,7 @@ const ORDER_FIELDS = `#graphql
     totalShippingPriceSet { shopMoney { amount } }
     totalTaxSet { shopMoney { amount } }
     totalDiscountsSet { shopMoney { amount } }
-    customer { firstName lastName email phone }
+    customer { firstName lastName defaultEmailAddress { emailAddress } defaultPhoneNumber { phoneNumber } }
     customAttributes { key value }
     shippingAddress {
       firstName lastName name company address1 address2 city province provinceCode zip country countryCodeV2 phone
@@ -136,7 +136,16 @@ function normalizeOrder(raw: any): ShopifyOrderSnapshot {
     totalShipping: raw.totalShippingPriceSet?.shopMoney?.amount ?? "0",
     totalTax: raw.totalTaxSet?.shopMoney?.amount ?? "0",
     totalDiscounts: raw.totalDiscountsSet?.shopMoney?.amount ?? "0",
-    customer: raw.customer ?? null,
+    customer: raw.customer
+      ? {
+          firstName: raw.customer.firstName,
+          lastName: raw.customer.lastName,
+          // Customer.email and Customer.phone are deprecated; the address
+          // objects are where they live now.
+          email: raw.customer.defaultEmailAddress?.emailAddress ?? null,
+          phone: raw.customer.defaultPhoneNumber?.phoneNumber ?? null,
+        }
+      : null,
     shippingAddress: raw.shippingAddress ?? null,
     customAttributes: raw.customAttributes ?? [],
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -276,8 +285,8 @@ export async function fetchFulfillmentOrders(client: GraphqlClient, orderId: str
 }
 
 const FULFILLMENT_CREATE = `#graphql
-  mutation DropshipFulfillmentCreate($fulfillment: FulfillmentInput!) {
-    fulfillmentCreate(fulfillment: $fulfillment) {
+  mutation DropshipFulfillmentCreate($fulfillment: FulfillmentInput!, $idempotencyKey: String!) {
+    fulfillmentCreate(fulfillment: $fulfillment) @idempotent(key: $idempotencyKey) {
       fulfillment { id status trackingInfo { number company url } }
       userErrors { field message }
     }
@@ -295,6 +304,14 @@ export interface CreateFulfillmentInput {
    */
   tracking: { numbers: string[]; company?: string | null; urls?: string[] };
   notifyCustomer: boolean;
+  /**
+   * Stable across retries of the same shipment.
+   *
+   * Shopify de-duplicates on it, so a retry after a lost response cannot create
+   * a second fulfilment — which the customer would see as a second shipment
+   * notification for goods that were only sent once.
+   */
+  idempotencyKey: string;
 }
 
 export interface CreateFulfillmentResult {
@@ -345,6 +362,7 @@ export async function createFulfillmentWithTracking(
   const data = await gql<{
     fulfillmentCreate: { fulfillment: { id: string; status: string } | null; userErrors: UserError[] };
   }>(client, FULFILLMENT_CREATE, {
+    idempotencyKey: input.idempotencyKey,
     fulfillment: {
       lineItemsByFulfillmentOrder,
       notifyCustomer: input.notifyCustomer,
