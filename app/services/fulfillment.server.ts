@@ -940,7 +940,16 @@ async function attachOrRetire(
 }
 
 /** Manual tracking entry from the order page. */
-export async function addManualTracking(shop: ShopWithSettings, purchaseOrderId: string, input: { number: string; carrierName?: string | null; url?: string | null; notifyCustomer?: boolean }, actor?: string) {
+export async function addManualTracking(
+  shop: ShopWithSettings,
+  purchaseOrderId: string,
+  input: { number: string; carrierName?: string | null; url?: string | null; notifyCustomer?: boolean },
+  actor?: string,
+  // Optional for the same reason `syncPendingTracking` takes one: a caller that
+  // already holds an Admin client (a route, a script) should not make the code
+  // reach for the shop's offline session again.
+  client?: GraphqlClient,
+) {
   const po = await ownedPurchaseOrder(shop.id, purchaseOrderId);
   const tracking = await prisma.trackingNumber.upsert({
     where: { purchaseOrderId_number: { purchaseOrderId, number: input.number.trim() } },
@@ -951,7 +960,7 @@ export async function addManualTracking(shop: ShopWithSettings, purchaseOrderId:
     await prisma.purchaseOrder.update({ where: { id: purchaseOrderId }, data: { status: "SHIPPED", shippedAt: new Date() } });
   }
   await logActivity(shop.id, { actor, action: "tracking.added", entity: "Order", entityId: po.orderId, message: `Tracking ${tracking.number} added manually.` });
-  if (shop.parsedSettings.fulfillment.autoFulfill) await syncPendingTracking(shop, purchaseOrderId);
+  if (shop.parsedSettings.fulfillment.autoFulfill) await syncPendingTracking(shop, purchaseOrderId, client);
   await evaluateAndStoreOrder(shop, po.orderId);
   return tracking;
 }

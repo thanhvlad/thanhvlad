@@ -27,7 +27,8 @@
     "lint": "eslint --cache --cache-location ./node_modules/.cache/eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "demo": "node --import tsx/esm ./scripts/demo.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.124.0",

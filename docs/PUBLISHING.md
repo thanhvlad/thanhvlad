@@ -92,6 +92,16 @@ webhook and the plan page's reconciliation both bring the plan back.
 The App Store listing's pricing section must repeat the same plans and prices;
 reviewers compare them. Shopify's revenue share applies to every charge.
 
+## 3b. Prove the pipeline on your own deployment
+
+```bash
+SUPPLIER_DRIVER=mock npm run demo
+```
+
+Runs the full merchant flow against your database and prints every step. Use it after a
+deploy, before a submission, and any time you want to know whether a change broke the
+pipeline without installing on a store.
+
 ## 4. Prove the compliance webhooks
 
 ```bash

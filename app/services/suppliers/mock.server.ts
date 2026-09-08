@@ -293,6 +293,12 @@ export class MockSupplierAdapter implements SupplierAdapter {
       totalCost: money(itemsCost.plus(shippingCost)),
       currency: "USD",
       paymentUrl: `https://example.com/pay/${externalOrderId}`,
+      // AliExpress cancels an unpaid order after 24 hours and the Payments page
+      // counts down to it. Without a deadline here the countdown, the
+      // "expiring soon" tally and the reminder job all have nothing to show, so
+      // anyone trying the app on the Demo supplier — a new merchant, an App
+      // Store reviewer — sees an empty column and reads it as broken.
+      paymentDueAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
     };
     rememberOrder(input.reference, { placedAt: Date.now(), input, result });
     ORDERS.set(externalOrderId, { placedAt: Date.now(), input, result });

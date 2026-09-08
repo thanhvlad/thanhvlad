@@ -12,7 +12,10 @@ import { countUnpaid } from "~/services/payments.server";
 import { updateShopSettings } from "~/services/shop.server";
 import { makeT, type Locale } from "~/lib/i18n";
 
-export const links = () => [{ rel: "stylesheet", href: polarisStyles }];
+export const links = () => [
+  { rel: "stylesheet", href: polarisStyles },
+  { rel: "icon", href: "/favicon.svg", type: "image/svg+xml" },
+];
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);

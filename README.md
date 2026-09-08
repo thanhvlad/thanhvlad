@@ -104,6 +104,20 @@ It consumes the queue and owns the repeatable schedules (supplier order polling 
 process (fine for development). `RUN_WORKER_IN_WEB=true` runs the worker inside the web
 process for single-dyno hosting.
 
+### See the whole flow without a Shopify store
+
+```bash
+SUPPLIER_DRIVER=mock npm run demo
+```
+
+Drives the real services — the same code the admin UI calls — with the Demo supplier
+and a stand-in Admin API, and prints each step: connect a supplier, import, push, map,
+take an order, place it, watch it get paid and shipped, sync the tracking number into a
+Shopify fulfilment, run the auto-update policy, roll up the reports. It takes about
+three minutes because it waits for the Demo supplier to ship; `--quick` skips that wait
+and `--keep` leaves the demo store in the database so you can browse it in the UI. It
+refuses to run against a live supplier driver, where the orders would be real.
+
 ### Tests
 
 ```bash
