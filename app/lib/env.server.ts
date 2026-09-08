@@ -65,6 +65,23 @@ const schema = z.object({
   AI_MAPPING_MODEL: z.string().default("claude-opus-5"),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
   EXCHANGE_RATE_API_URL: z.string().default("https://open.er-api.com/v6/latest"),
+}).superRefine((values, ctx) => {
+  // Every default above exists so a bare checkout can run tests and generate
+  // the Prisma client. In production a missing value is a misconfiguration
+  // that must stop the boot with a clear message, not surface later as a
+  // failed OAuth, a plaintext supplier token or a job that never runs.
+  if (values.NODE_ENV !== "production") return;
+  const missing = (key: string) => ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: "required in production" });
+  if (!values.SHOPIFY_API_KEY) missing("SHOPIFY_API_KEY");
+  if (!values.SHOPIFY_API_SECRET) missing("SHOPIFY_API_SECRET");
+  if (!/^https:\/\//.test(values.SHOPIFY_APP_URL)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["SHOPIFY_APP_URL"], message: "must be the public https URL of this deployment" });
+  }
+  if (!values.DATABASE_URL) missing("DATABASE_URL");
+  if (!values.ENCRYPTION_KEY) missing("ENCRYPTION_KEY");
+  if (values.SUPPLIER_DRIVER === "live" && !(values.ALIEXPRESS_APP_KEY || values.CJ_API_KEY)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["SUPPLIER_DRIVER"], message: "live driver needs ALIEXPRESS_APP_KEY/SECRET or CJ_API_KEY" });
+  }
 });
 
 export type AppEnv = z.infer<typeof schema>;

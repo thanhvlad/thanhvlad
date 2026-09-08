@@ -1,0 +1,46 @@
+# Fly.io: one app, two process groups from the same image.
+#   fly launch --no-deploy   (or: fly apps create dropship-hub)
+#   fly postgres create && fly postgres attach   → DATABASE_URL
+#   fly redis create                             → REDIS_URL
+#   fly secrets set SHOPIFY_API_KEY=... SHOPIFY_API_SECRET=... ENCRYPTION_KEY=... \
+#                   SHOPIFY_APP_URL=https://dropship-hub.fly.dev SUPPLIER_DRIVER=live ...
+#   fly deploy
+app = "dropship-hub"
+primary_region = "sin"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  PORT = "3000"
+  LOG_LEVEL = "info"
+
+[processes]
+  web = "npm run docker-start"
+  worker = "npm run worker"
+
+[http_service]
+  processes = ["web"]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "40s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  processes = ["web"]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+
+[[vm]]
+  processes = ["worker"]
+  size = "shared-cpu-1x"
+  memory = "1gb"
