@@ -4,9 +4,10 @@ import { useFetcher, useLoaderData } from "@remix-run/react";
 import { Banner, BlockStack, Button, Card, Checkbox, FormLayout, InlineGrid, Layout, Select, Text, TextField } from "@shopify/polaris";
 import { mergeShopSettings, type ShopSettings } from "~/domain/settings/shop-settings";
 import { readForm, requireShop } from "~/lib/auth.server";
-import { errorMessage } from "~/lib/errors";
+import { actionFailure } from "~/lib/errors";
 import { SUPPORTED_LOCALES, localeCoverage } from "~/lib/i18n";
-import { useMessage, useT } from "~/lib/use-t";
+import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
+import { requireFeature } from "~/services/billing.server";
 import { updateShopSettings } from "~/services/shop.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -19,10 +20,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const { json } = await readForm(request);
   try {
     const patch = json<Partial<ShopSettings>>("settings", {});
+    if (patch.orders?.autoPlaceOrders && !shop.parsedSettings.orders.autoPlaceOrders) {
+      await requireFeature(shop, "autoPlaceOrders");
+    }
     await updateShopSettings(shop.id, mergeShopSettings(shop.settings, patch));
     return { ok: true, messageKey: "msg.settingsSaved" };
   } catch (e) {
-    return { ok: false, error: errorMessage(e) };
+    return actionFailure(e);
   }
 };
 
@@ -30,8 +34,9 @@ export default function GeneralSettings() {
   const { settings, currency } = useLoaderData<typeof loader>();
   const t = useT();
   const fetcher = useFetcher<typeof action>();
-  const result = fetcher.data as { message?: string; error?: string } | undefined;
+  const result = fetcher.data as { ok?: boolean; message?: string; error?: string } | undefined;
   const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
+  const failureMessage = useErrorMessage(result as Parameters<typeof useErrorMessage>[0]);
   const [s, setS] = useState<ShopSettings>(settings);
   const save = () => fetcher.submit({ settings: JSON.stringify(s) }, { method: "post" });
   const set = <K extends keyof ShopSettings>(section: K, patch: Partial<ShopSettings[K]>) => setS({ ...s, [section]: { ...s[section], ...patch } });
@@ -44,9 +49,9 @@ export default function GeneralSettings() {
             <p>{actionMessage}</p>
           </Banner>
         )}
-        {result?.error && (
+        {failureMessage && (
           <Banner tone="critical">
-            <p>{result.error}</p>
+            <p>{failureMessage}</p>
           </Banner>
         )}
       </Layout.Section>

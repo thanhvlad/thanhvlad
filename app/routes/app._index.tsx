@@ -26,22 +26,30 @@ import { listNotifications } from "~/services/notifications.server";
 import { getDashboardStats } from "~/services/reports.server";
 import { listSupplierAccounts } from "~/services/supplier-accounts.server";
 import { listPricingRules } from "~/services/pricing.server";
+import { PLANS } from "~/domain/billing/plans";
+import { getAccountBilling } from "~/services/billing.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
-  const [stats, notifications, suppliers, rules] = await Promise.all([
+  const [stats, notifications, suppliers, rules, billing] = await Promise.all([
     getDashboardStats(shop.id),
     listNotifications(shop.id, { limit: 6 }),
     listSupplierAccounts(shop.id),
     listPricingRules(shop.id),
+    getAccountBilling(shop),
   ]);
+  const plan = {
+    name: PLANS[billing.plan].displayName,
+    productsUsed: billing.usage.products,
+    productsLimit: PLANS[billing.plan].limits.products,
+  };
   const onboarding = {
     supplier: suppliers.length > 0,
     pricing: rules.length > 0,
     product: stats.products.total > 0,
     order: Object.values(stats.stages).some((n) => n > 0),
   };
-  return { shop: { name: shop.name ?? shop.domain, currency: shop.currency }, stats, notifications, onboarding };
+  return { shop: { name: shop.name ?? shop.domain, currency: shop.currency }, stats, notifications, onboarding, plan };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -65,7 +73,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function Dashboard() {
-  const { shop, stats, notifications, onboarding } = useLoaderData<typeof loader>();
+  const { shop, stats, notifications, onboarding, plan } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const t = useT();
   const steps = [
@@ -126,6 +134,25 @@ export default function Dashboard() {
               hint={`${stats.products.unmapped} ${t("dashboard.stat.unmapped")}`}
             />
           </InlineGrid>
+        </Layout.Section>
+
+        <Layout.Section>
+          <Card>
+            <InlineStack align="space-between" blockAlign="center" wrap>
+              <BlockStack gap="050">
+                <Text as="p" tone="subdued" variant="bodySm">
+                  {t("dashboard.stat.plan")}
+                </Text>
+                <Text as="p" variant="headingMd">
+                  {plan.name}
+                </Text>
+                <Text as="p" tone="subdued" variant="bodySm">
+                  {t("dashboard.stat.planUsage", { used: plan.productsUsed, limit: plan.productsLimit ?? t("plan.unlimited") })}
+                </Text>
+              </BlockStack>
+              <Button url="/app/settings/plan">{t("settings.tabs.plan")}</Button>
+            </InlineStack>
+          </Card>
         </Layout.Section>
 
         <Layout.Section>

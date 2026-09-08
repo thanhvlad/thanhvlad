@@ -25,11 +25,12 @@ import type { MappingType } from "@prisma/client";
 import type { ResolveResult } from "~/domain/mapping/types";
 import { FAILURE_LABELS } from "~/domain/mapping/resolve";
 import { readForm, requireShop } from "~/lib/auth.server";
-import { errorMessage } from "~/lib/errors";
+import { actionFailure } from "~/lib/errors";
 import { adminUrl, formatMoney, legacyId, relativeTime } from "~/lib/format";
-import { useMessage, useT } from "~/lib/use-t";
+import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
 import { addSupplierProductForMapping, getMapping, getSupplierProductWithVariants, resolveForVariant, saveMapping, suggestMappingForProduct, supplierProductsForProduct, type MappingRowInput, type MappingSuggestionRow } from "~/services/mapping.server";
 import { aiMappingAvailable } from "~/services/ai-mapping.server";
+import { requireFeature } from "~/services/billing.server";
 import { dismissCandidate, findAlternativeSuppliers, getComparison, switchSupplier } from "~/services/supplier-comparison.server";
 import { listPricingRules } from "~/services/pricing.server";
 import { deleteProducts, getProduct, repriceProduct, setAutoUpdate, syncProductFromShopify } from "~/services/products.server";
@@ -176,6 +177,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       }
       case "auto-map": {
         const useAi = get("useAi") === "true";
+        if (useAi) await requireFeature(shop, "aiMapping");
         const suggestion = await suggestMappingForProduct(id, get("supplierProductId"), { useAi, shopId: shop.id });
         // The pieces are translated on the page; the action only says which
         // ones apply and with what numbers.
@@ -239,7 +241,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     }
   } catch (e) {
     if (e instanceof Response) throw e;
-    return { ok: false, error: errorMessage(e) };
+    return actionFailure(e);
   }
 };
 
@@ -277,6 +279,7 @@ export default function ProductDetailPage() {
   const result = fetcher.data as { ok?: boolean; message?: string; error?: string; aiUsed?: boolean; aiError?: string | null; autoRows?: MappingSuggestionRow[] } | undefined;
 
   const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
+  const failureMessage = useErrorMessage(result as Parameters<typeof useErrorMessage>[0]);
 
   // Suggestions fill the gaps; they never replace rows the merchant built.
   // Applying them in the render body replaced the whole table (losing hand-made
@@ -380,9 +383,9 @@ export default function ProductDetailPage() {
               <p>{autoNote}</p>
             </Banner>
           )}
-          {result?.error && (
+          {failureMessage && (
             <Banner tone="critical">
-              <p>{result.error}</p>
+              <p>{failureMessage}</p>
             </Banner>
           )}
         </Layout.Section>

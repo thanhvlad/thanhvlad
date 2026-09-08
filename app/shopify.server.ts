@@ -2,15 +2,38 @@ import "@shopify/shopify-app-remix/adapters/node";
 import {
   ApiVersion,
   AppDistribution,
+  BillingInterval,
+  BillingReplacementBehavior,
   DeliveryMethod,
   shopifyApp,
 } from "@shopify/shopify-app-remix/server";
+import type { BillingConfig } from "@shopify/shopify-api";
 import { PrismaSessionStorage } from "@shopify/shopify-app-session-storage-prisma";
 import prisma from "./db.server";
+import { PAID_PLANS, PLANS } from "./domain/billing/plans";
 import { env } from "./lib/env.server";
 import { onShopInstalled } from "./services/shop.server";
 
 const config = env();
+
+/**
+ * Shopify Billing plans, keyed by the name Shopify shows on its approval page
+ * and echoes back as the subscription name. Derived from the plan catalogue so
+ * the price a merchant is quoted and the cap they get can never disagree.
+ */
+const billing: BillingConfig = Object.fromEntries(
+  PAID_PLANS.map((id) => [
+    PLANS[id].displayName,
+    {
+      trialDays: PLANS[id].trialDays,
+      // Moving between plans replaces the current subscription at once rather
+      // than waiting for the period to end, so an upgrade takes effect the
+      // moment the merchant approves it.
+      replacementBehavior: BillingReplacementBehavior.ApplyImmediately,
+      lineItems: [{ amount: PLANS[id].monthlyPrice, currencyCode: "USD", interval: BillingInterval.Every30Days as const }],
+    },
+  ]),
+);
 
 const shopify = shopifyApp({
   apiKey: config.SHOPIFY_API_KEY,
@@ -21,6 +44,7 @@ const shopify = shopifyApp({
   authPathPrefix: "/auth",
   sessionStorage: new PrismaSessionStorage(prisma),
   distribution: AppDistribution.AppStore,
+  billing,
   future: {
     unstable_newEmbeddedAuthStrategy: true,
     expiringOfflineAccessTokens: true,
@@ -30,6 +54,7 @@ const shopify = shopifyApp({
     // the CLI on deploy; this map only tells the framework how to route them.
     APP_UNINSTALLED: { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/app" },
     APP_SCOPES_UPDATE: { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/app" },
+    APP_SUBSCRIPTIONS_UPDATE: { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/app" },
     ORDERS_CREATE: { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/orders" },
     ORDERS_UPDATED: { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/orders" },
     ORDERS_CANCELLED: { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/orders" },

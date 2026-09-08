@@ -37,6 +37,16 @@ const schema = z.object({
 
   ENCRYPTION_KEY: z.string().optional(),
 
+  /**
+   * Force Shopify Billing into test mode (no real charges). Always on outside
+   * production and on development stores; set it on a staging deployment that
+   * talks to a live store.
+   */
+  BILLING_TEST: z
+    .string()
+    .default("false")
+    .transform((v) => v === "true" || v === "1"),
+
   /** Optional: enables AI-assisted variant mapping and supplier picking. */
   ANTHROPIC_API_KEY: z.string().optional(),
   AI_MAPPING_MODEL: z.string().default("claude-opus-5"),

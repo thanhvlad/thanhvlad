@@ -26,7 +26,7 @@ import { PlatformBadge, StatusBadge } from "~/components/StatusBadge";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatMoney } from "~/lib/format";
-import { useMessage, useT } from "~/lib/use-t";
+import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
 import {
   applyPricingRuleToImport,
   getImportedProduct,
@@ -134,7 +134,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       case "push": {
         const result = await pushImportedProduct(shop, graphql, id, actor);
         if (result.ok) throw redirect(`/app/products/${result.productId}`);
-        return { ok: false, error: result.error };
+        return { ok: false, error: result.error, errorKey: result.errorKey, errorVars: result.errorVars };
       }
       case "split": {
         const created = await splitImportedProduct(shop.id, id, get("option"));
@@ -157,6 +157,7 @@ export default function ImportEditPage() {
   const { product, rules, collections, shipping, currency, country } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const actionMessage = useMessage(fetcher.data as Parameters<typeof useMessage>[0]);
+  const failureMessage = useErrorMessage(fetcher.data as Parameters<typeof useErrorMessage>[0]);
   const navigate = useNavigate();
   const [tab, setTab] = useState(0);
   const [form, setForm] = useState({ title: product.title, description: product.description, vendor: product.vendor, productType: product.productType, tags: product.tags, handle: product.handle });
@@ -220,9 +221,9 @@ export default function ImportEditPage() {
               <p>{actionMessage}</p>
             </Banner>
           )}
-          {fetcher.data && "error" in fetcher.data && fetcher.data.error && (
+          {failureMessage && (
             <Banner tone="critical">
-              <p>{fetcher.data.error}</p>
+              <p>{failureMessage}</p>
             </Banner>
           )}
           {product.pushError && product.status === "FAILED" && (

@@ -69,6 +69,7 @@ export async function onShopInstalled({
       timezone: info.ianaTimezone,
       moneyFormat: info.moneyFormat,
       primaryLocationId: info.primaryLocationId,
+      isDevelopmentStore: info.isDevelopmentStore,
     };
   } catch (error) {
     logger.warn("Could not fetch shop profile after auth", { shop: session.shop, error });

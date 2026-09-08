@@ -6,6 +6,7 @@ import { placeSupplierOrders, syncOpenPurchaseOrders, syncPendingTracking } from
 import { addToImportList, pushImportedProduct } from "../import.server";
 import { runInventorySync } from "../inventory-sync.server";
 import { runJob } from "../jobs.server";
+import { hasFeature } from "../billing.server";
 import { notify } from "../notifications.server";
 import { checkPayments, sendPaymentReminders } from "../payments.server";
 import { syncOrdersFromShopify } from "../orders.server";
@@ -148,6 +149,11 @@ export function registerAllHandlers() {
     if (!shop || !shop.isActive) return;
     const settings = shop.parsedSettings.orders;
     if (!settings.autoPlaceOrders) return;
+    // A downgrade after the setting was switched on must not keep placing.
+    if (!(await hasFeature(shop, "autoPlaceOrders"))) {
+      logger.info("Auto-place skipped: not included in the plan", { shopId });
+      return;
+    }
     const cutoff = new Date(Date.now() - settings.autoPlaceDelayMinutes * 60_000);
     const ready = await prisma.order.findMany({
       where: { shopId, stage: "AWAITING_ORDER", shopifyCreatedAt: { lte: cutoff }, isTest: false },

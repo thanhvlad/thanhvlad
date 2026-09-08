@@ -22,7 +22,7 @@ import { PlatformBadge } from "~/components/StatusBadge";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatMoney, pageParam } from "~/lib/format";
-import { useT } from "~/lib/use-t";
+import { useErrorMessage, useT } from "~/lib/use-t";
 import { addToImportList, pushImportedProduct } from "~/services/import.server";
 import { adapterForShop, listPlatforms } from "~/services/suppliers/index.server";
 import type { SupplierPlatform, SupplierSearchResult } from "~/services/suppliers/types";
@@ -56,6 +56,8 @@ interface SearchActionData {
   title?: string;
   reference?: string;
   error?: string;
+  errorKey?: string;
+  errorVars?: Record<string, string | number>;
   /** Set when the product went straight to Shopify. */
   productId?: string;
   bulk?: Array<{ reference: string; ok: boolean; title?: string; error?: string }>;
@@ -71,7 +73,7 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<SearchAct
     try {
       const product = await addToImportList(shop, get("reference"), { platform, actor });
       const pushed = await pushImportedProduct(shop, graphql, product.id, actor);
-      if (!pushed.ok) return { ok: false, error: pushed.error, reference: get("reference") };
+      if (!pushed.ok) return { ok: false, error: pushed.error, errorKey: pushed.errorKey, errorVars: pushed.errorVars, reference: get("reference") };
       return { ok: true, id: product.id, productId: pushed.productId, title: product.title, reference: get("reference") };
     } catch (e) {
       return { ok: false, error: errorMessage(e), reference: get("reference") };
@@ -258,6 +260,7 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
   const [pushing, setPushing] = useState(false);
   const t = useT();
   const result = fetcher.data as SearchActionData | undefined;
+  const failureMessage = useErrorMessage(result);
   const added = result?.ok && result.reference === item.url;
   const failed = result && !result.ok && result.reference === item.url;
   return (
@@ -338,7 +341,7 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
           )}
           {failed && (
             <Text as="p" tone="critical" variant="bodySm">
-              {result?.error}
+              {failureMessage}
             </Text>
           )}
         </BlockStack>

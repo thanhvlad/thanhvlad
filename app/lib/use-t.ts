@@ -40,3 +40,24 @@ export function useMessage(
   }
   return result.message ?? undefined;
 }
+
+/**
+ * Text for an action's failure banner.
+ *
+ * Most failures carry supplier or Shopify text and are shown as they are. A
+ * failure the app itself raised — a plan limit, for instance — carries a key
+ * instead, so a Vietnamese merchant is not told in English what to do next.
+ */
+export function useErrorMessage(
+  result:
+    | { ok?: boolean; error?: string | null; errorKey?: string | null; errorVars?: I18nVars | null }
+    | undefined
+    | null,
+): string | undefined {
+  const t = useT();
+  if (!result || result.ok) return undefined;
+  if (result.errorKey) {
+    return t(result.errorKey as I18nKey, result.errorVars ?? undefined) ?? result.error ?? undefined;
+  }
+  return result.error ?? undefined;
+}

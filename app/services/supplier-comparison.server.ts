@@ -6,6 +6,7 @@ import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
 import { d, money } from "~/lib/money";
 import { logActivity } from "./activity.server";
+import { hasFeature } from "./billing.server";
 import { convertToShopCurrency } from "./currency.server";
 import { saveMapping, suggestMappingForProduct } from "./mapping.server";
 import { notify } from "./notifications.server";
@@ -316,7 +317,7 @@ async function evaluateCandidate(
 
 /** Re-map the product onto a different supplier product and mark it current. */
 export async function switchSupplier(shop: ShopWithSettings, productId: string, supplierProductId: string, actor?: string) {
-  const suggestion = await suggestMappingForProduct(productId, supplierProductId, { useAi: true });
+  const suggestion = await suggestMappingForProduct(productId, supplierProductId, { useAi: await hasFeature(shop, "aiMapping") });
   if (suggestion.rows.length === 0) {
     throw new Error("None of that supplier's SKUs could be matched to this product's variants. Map it by hand instead.");
   }

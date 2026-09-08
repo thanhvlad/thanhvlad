@@ -61,6 +61,17 @@ model Account {
   ownerEmail String?
   plan      Plan     @default(FREE)
   planRenewsAt DateTime?
+  /// Shopify AppSubscription gid behind `plan`; null on the free tier.
+  subscriptionId     String?
+  /// Last status Shopify reported (ACTIVE, CANCELLED, EXPIRED, FROZEN, ...).
+  subscriptionStatus String?
+  /// The plan name Shopify echoes back, kept for reconciliation.
+  subscriptionName   String?
+  /// Subscriptions are per store on Shopify's side: this is the store that
+  /// approved the charge, and the only one whose `billing.check()` is authoritative.
+  billingShopId      String?
+  trialEndsAt        DateTime?
+  planChangedAt      DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -93,6 +104,8 @@ model Shop {
   installedAt   DateTime  @default(now())
   uninstalledAt DateTime?
   isActive      Boolean   @default(true)
+  /// Partner development stores cannot be charged; billing runs in test mode there.
+  isDevelopmentStore Boolean @default(false)
   onboardingStep String   @default("connect_supplier")
   /// Bearer token for the browser extension / public import API.
   apiToken      String?   @unique
@@ -1008,11 +1021,14 @@ model Notification {
 
   readAt     DateTime?
   archivedAt DateTime?
+  /// When the notification went out by email (instantly or in a digest).
+  emailedAt  DateTime?
   createdAt  DateTime  @default(now())
 
   shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
 
   @@index([shopId, readAt])
+  @@index([shopId, emailedAt])
 }
 
 /// Webhook de-duplication. Shopify retries, and at-least-once delivery would

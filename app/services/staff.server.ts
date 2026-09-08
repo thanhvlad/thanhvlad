@@ -1,6 +1,7 @@
 import type { StaffRole } from "@prisma/client";
 import prisma from "~/db.server";
 import { logActivity } from "./activity.server";
+import { assertWithinPlan } from "./billing.server";
 
 /**
  * Staff accounts live on the parent Account so one team can manage every
@@ -18,6 +19,9 @@ export async function inviteStaff(
   input: { email: string; name?: string | null; role: StaffRole; shopScopes?: string[] },
 ) {
   const email = input.email.trim().toLowerCase();
+  // Re-inviting someone already on the team changes nothing about the count.
+  const existing = await prisma.staffAccount.findUnique({ where: { accountId_email: { accountId, email } }, select: { id: true } });
+  if (!existing) await assertWithinPlan({ accountId }, "staff", 1);
   const row = await prisma.staffAccount.upsert({
     where: { accountId_email: { accountId, email } },
     create: { accountId, email, name: input.name ?? null, role: input.role, shopScopes: input.shopScopes ?? [] },

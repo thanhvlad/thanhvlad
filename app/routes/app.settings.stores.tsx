@@ -4,10 +4,11 @@ import { useFetcher, useLoaderData } from "@remix-run/react";
 import { Badge, Banner, BlockStack, Box, Button, Card, FormLayout, InlineStack, Layout, Text, TextField } from "@shopify/polaris";
 import prisma from "~/db.server";
 import { readForm, requireShop } from "~/lib/auth.server";
-import { errorMessage } from "~/lib/errors";
+import { actionFailure } from "~/lib/errors";
 import { formatDate } from "~/lib/format";
-import { useMessage, useT } from "~/lib/use-t";
+import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
 import { logActivity } from "~/services/activity.server";
+import { assertWithinPlan } from "~/services/billing.server";
 import { listAccountShops } from "~/services/shop.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -36,6 +37,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         // Move this store under another store's account (share suppliers, pricing rules are per-store).
         const target = await prisma.account.findUnique({ where: { id: get("code").trim() } });
         if (!target) return { ok: false, error: "No account found for that code." };
+        if (target.id !== shop.accountId) await assertWithinPlan({ accountId: target.id }, "stores", 1);
         const previous = shop.accountId;
         await prisma.shop.update({ where: { id: shop.id }, data: { accountId: target.id } });
         if (previous && previous !== target.id) {
@@ -55,15 +57,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         return { ok: false, error: "Unknown action" };
     }
   } catch (e) {
-    return { ok: false, error: errorMessage(e) };
+    return actionFailure(e);
   }
 };
 
 export default function StoresSettings() {
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
-  const result = fetcher.data as { message?: string; error?: string } | undefined;
+  const result = fetcher.data as { ok?: boolean; message?: string; error?: string } | undefined;
   const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
+  const failureMessage = useErrorMessage(result as Parameters<typeof useErrorMessage>[0]);
   const [name, setName] = useState(data.account?.name ?? "");
   const [code, setCode] = useState("");
   const t = useT();
@@ -76,9 +79,9 @@ export default function StoresSettings() {
             <p>{actionMessage}</p>
           </Banner>
         )}
-        {result?.error && (
+        {failureMessage && (
           <Banner tone="critical">
-            <p>{result.error}</p>
+            <p>{failureMessage}</p>
           </Banner>
         )}
       </Layout.Section>

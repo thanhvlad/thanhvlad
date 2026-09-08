@@ -3,6 +3,7 @@ import prisma from "~/db.server";
 import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
 import { logActivity } from "./activity.server";
+import { applySubscriptionWebhook } from "./billing.server";
 import { cancelPurchaseOrder } from "./fulfillment.server";
 import { handleFulfillmentRequest } from "./fulfillment-service.server";
 import { refreshOrderFromShopify } from "./orders.server";
@@ -115,6 +116,10 @@ export async function processWebhookEvent(webhookEventId: string) {
       }
       case "APP_UNINSTALLED": {
         await markShopUninstalled(shop.domain);
+        break;
+      }
+      case "APP_SUBSCRIPTIONS_UPDATE": {
+        await applySubscriptionWebhook(shop, payload);
         break;
       }
       case "APP_SCOPES_UPDATE": {

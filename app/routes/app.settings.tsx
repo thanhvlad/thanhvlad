@@ -14,6 +14,7 @@ const TABS = [
   { id: "fulfillment", path: "/app/settings/fulfillment", labelKey: "settings.tabs.fulfillmentService" },
   { id: "staff", path: "/app/settings/staff", labelKey: "settings.tabs.staff" },
   { id: "stores", path: "/app/settings/stores", labelKey: "settings.tabs.stores" },
+  { id: "plan", path: "/app/settings/plan", labelKey: "settings.tabs.plan" },
   { id: "advanced", path: "/app/settings/advanced", labelKey: "settings.tabs.advanced" },
 ] as const;
 

@@ -6,6 +6,7 @@ import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
 import { d, money } from "~/lib/money";
 import { logActivity } from "./activity.server";
+import { PlanLimitError, assertWithinPlan } from "./billing.server";
 import { convertToShopCurrency } from "./currency.server";
 import { resolvePricingRule } from "./pricing.server";
 import type { ShopWithSettings } from "./shop.server";
@@ -365,6 +366,9 @@ export interface PushResult {
   productId?: string;
   shopifyProductId?: string;
   error?: string;
+  /** Set when the failure is one the app raised and can translate (a plan limit). */
+  errorKey?: string;
+  errorVars?: Record<string, string | number>;
 }
 
 /**
@@ -381,6 +385,20 @@ export async function pushImportedProduct(shop: ShopWithSettings, client: Graphq
   if (enabledVariants.length === 0) {
     await prisma.importedProduct.update({ where: { id: product.id }, data: { status: "FAILED", pushError: "No enabled variants" } });
     return { importedProductId, ok: false, error: "No enabled variants" };
+  }
+
+  // A product adopted from a previous attempt already counts against the cap;
+  // only a brand-new listing can cross it.
+  if (!product.shopifyProductId) {
+    try {
+      await assertWithinPlan(shop, "products", 1);
+    } catch (error) {
+      if (error instanceof PlanLimitError) {
+        await prisma.importedProduct.update({ where: { id: product.id }, data: { status: "FAILED", pushError: error.message } });
+        return { importedProductId, ok: false, error: error.message, errorKey: error.messageKey, errorVars: error.messageVars };
+      }
+      throw error;
+    }
   }
 
   await prisma.importedProduct.update({ where: { id: product.id }, data: { status: "PUSHING", pushError: null } });

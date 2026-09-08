@@ -4,9 +4,9 @@ import { useFetcher, useLoaderData } from "@remix-run/react";
 import type { StaffRole } from "@prisma/client";
 import { Badge, Banner, BlockStack, Box, Button, Card, FormLayout, InlineStack, Layout, Select, Text, TextField } from "@shopify/polaris";
 import { readForm, requireShop } from "~/lib/auth.server";
-import { errorMessage } from "~/lib/errors";
+import { actionFailure } from "~/lib/errors";
 import { formatDate } from "~/lib/format";
-import { useMessage, useT } from "~/lib/use-t";
+import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
 import { ROLE_PERMISSIONS, inviteStaff, listStaff, removeStaff, updateStaffRole } from "~/services/staff.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -34,7 +34,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         return { ok: false, error: "Unknown action" };
     }
   } catch (e) {
-    return { ok: false, error: errorMessage(e) };
+    return actionFailure(e);
   }
 };
 
@@ -43,6 +43,7 @@ export default function StaffSettings() {
   const fetcher = useFetcher<typeof action>();
   const result = fetcher.data as { message?: string; error?: string } | undefined;
   const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
+  const failureMessage = useErrorMessage(result as Parameters<typeof useErrorMessage>[0]);
   const [form, setForm] = useState({ email: "", name: "", role: "STAFF" as StaffRole });
   const t = useT();
 
@@ -60,9 +61,9 @@ export default function StaffSettings() {
             <p>{actionMessage}</p>
           </Banner>
         )}
-        {result?.error && (
+        {failureMessage && (
           <Banner tone="critical">
-            <p>{result.error}</p>
+            <p>{failureMessage}</p>
           </Banner>
         )}
         <Banner tone="info">
