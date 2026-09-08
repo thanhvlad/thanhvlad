@@ -179,6 +179,7 @@ export async function ensureSchedules() {
     { kind: "auto-place", every: 10 * 60_000 },
     { kind: "metrics", every: 60 * 60_000 },
     { kind: "payments", every: 20 * 60_000 },
+    { kind: "email-digest", every: 60 * 60_000 },
   ];
   for (const tick of ticks) {
     await q.upsertJobScheduler(`tick-${tick.kind}`, { every: tick.every }, { name: "scheduler-tick", data: { kind: tick.kind } });

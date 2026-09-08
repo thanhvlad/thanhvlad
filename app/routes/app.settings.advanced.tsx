@@ -10,6 +10,7 @@ import { errorMessage } from "~/lib/errors";
 import { formatDate } from "~/lib/format";
 import { useMessage, useT } from "~/lib/use-t";
 import { listRates, refreshRates } from "~/services/currency.server";
+import { emailProvider } from "~/services/email.server";
 import { queueStats } from "~/services/jobs/index.server";
 import { logActivity } from "~/services/activity.server";
 
@@ -25,6 +26,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     appUrl: env().SHOPIFY_APP_URL,
     supplierDriver: env().SUPPLIER_DRIVER,
     encryption: encryptionConfigured(),
+    emailProvider: emailProvider(),
     queue,
     rates: rates.filter((r) => ["USD", "EUR", "GBP", "VND", "CNY", "AUD", "CAD", shop.currency].includes(r.quote)).map((r) => ({ quote: r.quote, rate: r.rate.toString(), fetchedAt: r.fetchedAt })),
     webhooks: webhooks.map((w) => ({ id: w.id, topic: w.topic, createdAt: w.createdAt, processedAt: w.processedAt, error: w.error })),
@@ -111,6 +113,10 @@ export default function AdvancedSettings() {
             <InlineStack gap="200">
               <Text as="span">{t("settings.advanced.tokenEncryption")}</Text>
               <Badge tone={data.encryption ? "success" : "warning"}>{data.encryption ? t("common.enabled") : t("common.disabled")}</Badge>
+            </InlineStack>
+            <InlineStack gap="200">
+              <Text as="span">{t("settings.advanced.email")}</Text>
+              <Badge tone={data.emailProvider === "none" ? "attention" : "success"}>{data.emailProvider === "none" ? t("common.disabled") : data.emailProvider}</Badge>
             </InlineStack>
             <InlineStack gap="200">
               <Text as="span">{t("settings.advanced.jobQueue")}</Text>

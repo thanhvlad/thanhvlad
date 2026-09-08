@@ -7,7 +7,7 @@ import { addToImportList, pushImportedProduct } from "../import.server";
 import { runInventorySync } from "../inventory-sync.server";
 import { runJob } from "../jobs.server";
 import { hasFeature } from "../billing.server";
-import { notify } from "../notifications.server";
+import { notify, sendDigest } from "../notifications.server";
 import { checkPayments, sendPaymentReminders } from "../payments.server";
 import { syncOrdersFromShopify } from "../orders.server";
 import { rollupRange } from "../reports.server";
@@ -179,6 +179,12 @@ export function registerAllHandlers() {
     return { ...checked, ...reminded };
   });
 
+  registerHandler("email-digest", async ({ shopId }) => {
+    const shop = await prisma.shop.findUnique({ where: { id: shopId }, select: { id: true, name: true, domain: true, settings: true, timezone: true, isActive: true } });
+    if (!shop || !shop.isActive) return;
+    return sendDigest(shop);
+  });
+
   registerHandler("refresh-rates", async ({ base }) => {
     const count = await refreshRates(base);
     return { count };
@@ -221,6 +227,9 @@ export function registerAllHandlers() {
           break;
         case "metrics":
           await enqueue("rollup-metrics", { shopId: shop.id, days: 2 }, { dedupeKey: `metrics-${shop.id}` });
+          break;
+        case "email-digest":
+          await enqueue("email-digest", { shopId: shop.id }, { dedupeKey: `digest-${shop.id}` });
           break;
       }
     }

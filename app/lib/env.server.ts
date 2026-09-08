@@ -47,6 +47,19 @@ const schema = z.object({
     .default("false")
     .transform((v) => v === "true" || v === "1"),
 
+  /**
+   * Outbound email. Pick a provider explicitly, or leave it unset and the app
+   * uses Resend when RESEND_API_KEY is present, else SMTP when SMTP_URL is,
+   * else keeps notifications in the in-app feed only.
+   */
+  EMAIL_PROVIDER: z.enum(["smtp", "resend", "none"]).optional(),
+  EMAIL_FROM: z.string().default("DropshipHub <no-reply@example.com>"),
+  /** smtp://user:pass@host:587 or smtps://user:pass@host:465 */
+  SMTP_URL: z.string().optional(),
+  RESEND_API_KEY: z.string().optional(),
+  /** Shown on the public support page and used as the reply-to address. */
+  SUPPORT_EMAIL: z.string().optional(),
+
   /** Optional: enables AI-assisted variant mapping and supplier picking. */
   ANTHROPIC_API_KEY: z.string().optional(),
   AI_MAPPING_MODEL: z.string().default("claude-opus-5"),

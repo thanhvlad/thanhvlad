@@ -31,8 +31,10 @@ export interface JobPayloads {
   "refresh-rates": { base: string };
   /** Roll up DailyMetric for a shop. */
   "rollup-metrics": { shopId: string; days: number };
+  /** Send the daily notification digest for a shop, if it is due. */
+  "email-digest": { shopId: string };
   /** Fan-out tick: enqueue the per-shop periodic jobs for every active shop. */
-  "scheduler-tick": { kind: "purchase-orders" | "inventory" | "metrics" | "auto-place" | "tracking" | "payments" };
+  "scheduler-tick": { kind: "purchase-orders" | "inventory" | "metrics" | "auto-place" | "tracking" | "payments" | "email-digest" };
 }
 
 export type JobName = keyof JobPayloads;
