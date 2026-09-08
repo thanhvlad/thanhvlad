@@ -25,6 +25,7 @@ function toLine(
     supplierVariantId: variant.id,
     externalProductId: variant.externalProductId,
     externalSkuId: variant.externalSkuId,
+    skuAttr: variant.skuAttr ?? null,
     platform: variant.platform,
     title: variant.title,
     quantity,

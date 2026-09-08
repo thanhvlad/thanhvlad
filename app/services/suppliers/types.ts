@@ -54,6 +54,10 @@ export interface SupplierSearchItem {
   shipsFrom?: string[];
   /** Cheapest shipping seen in search, when the platform returns it. */
   shippingFrom?: string | null;
+  /** Delivery estimate the search surface returned, e.g. "10". */
+  shipToDays?: string | null;
+  /** Affiliate/promotion link, when the platform returns one. */
+  promotionLink?: string | null;
 }
 
 export interface SupplierSearchResult {
@@ -62,6 +66,8 @@ export interface SupplierSearchResult {
   pageSize: number;
   total: number | null;
   hasMore: boolean;
+  /** Surfaced to the merchant when the result set is degraded or filtered locally. */
+  notice?: string;
 }
 
 export interface SupplierAttribute {
@@ -150,6 +156,12 @@ export interface SupplierOrderAddress {
 export interface PlaceOrderItem {
   externalProductId: string;
   externalSkuId: string;
+  /**
+   * Attribute-encoded SKU ("14:350853#Black;5:361386"). AliExpress order
+   * creation takes `sku_attr`, not the numeric sku id; freight quotes take the
+   * numeric id. Adapters that only need one of the two ignore the other.
+   */
+  externalSkuAttr?: string | null;
   quantity: number;
   /** Carrier chosen by the shipping selector. */
   carrierCode?: string | null;
@@ -176,6 +188,8 @@ export interface PlaceOrderResult {
   currency: string;
   /** URL where the merchant pays, when payment is manual. */
   paymentUrl?: string | null;
+  /** When the supplier will auto-cancel the order if it stays unpaid. */
+  paymentDueAt?: Date | null;
   raw?: unknown;
 }
 
@@ -197,6 +211,8 @@ export interface SupplierOrderStatus {
   currency?: string | null;
   paidAt?: Date | null;
   shippedAt?: Date | null;
+  /** Refreshed deep link to pay this order on the supplier's site. */
+  paymentUrl?: string | null;
   raw?: unknown;
 }
 
@@ -229,11 +245,15 @@ export interface SupplierAdapter {
 
   /** True when the adapter has what it needs (app keys, tokens) to make calls. */
   isConfigured(): boolean;
+  /** True when a merchant account is connected (as opposed to only server keys). */
+  hasSession?(): boolean;
 
   // Auth
   getAuthorizationUrl?(state: string): string;
   exchangeCode?(code: string): Promise<SupplierTokens>;
   refreshTokens?(refreshToken: string): Promise<SupplierTokens>;
+  /** Register the merchant's store with the platform's dropshipping programme. */
+  registerStore?(storeUrl: string): Promise<boolean>;
 
   // Catalog
   /** Extract the upstream product id from a URL or raw id; null when not recognised. */

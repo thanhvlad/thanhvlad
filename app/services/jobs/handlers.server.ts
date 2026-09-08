@@ -7,6 +7,7 @@ import { pushImportedProduct } from "../import.server";
 import { runInventorySync } from "../inventory-sync.server";
 import { runJob } from "../jobs.server";
 import { notify } from "../notifications.server";
+import { checkPayments, sendPaymentReminders } from "../payments.server";
 import { syncOrdersFromShopify } from "../orders.server";
 import { rollupRange } from "../reports.server";
 import { getShopById } from "../shop.server";
@@ -137,6 +138,15 @@ export function registerAllHandlers() {
     return { placed: ready.length };
   });
 
+  registerHandler("payment-reminders", async ({ shopId }) => {
+    const shop = await getShopById(shopId);
+    if (!shop || !shop.isActive) return;
+    // Pick up payments made on the supplier site, then warn about what is left.
+    const checked = await checkPayments(shop);
+    const reminded = await sendPaymentReminders(shop);
+    return { ...checked, ...reminded };
+  });
+
   registerHandler("refresh-rates", async ({ base }) => {
     const count = await refreshRates(base);
     return { count };
@@ -173,6 +183,9 @@ export function registerAllHandlers() {
         }
         case "auto-place":
           await enqueue("auto-place-orders", { shopId: shop.id }, { dedupeKey: `auto-place-${shop.id}` });
+          break;
+        case "payments":
+          await enqueue("payment-reminders", { shopId: shop.id }, { dedupeKey: `payments-${shop.id}` });
           break;
         case "metrics":
           await enqueue("rollup-metrics", { shopId: shop.id, days: 2 }, { dedupeKey: `metrics-${shop.id}` });

@@ -39,6 +39,9 @@ const shopify = shopifyApp({
     PRODUCTS_DELETE: { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/products" },
     FULFILLMENTS_CREATE: { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/fulfillments" },
     FULFILLMENTS_UPDATE: { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/fulfillments" },
+    FULFILLMENT_ORDERS_FULFILLMENT_REQUEST_SUBMITTED: { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/fulfillment-orders" },
+    FULFILLMENT_ORDERS_CANCELLATION_REQUEST_SUBMITTED: { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/fulfillment-orders" },
+    FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE: { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/fulfillment-orders" },
   },
   hooks: {
     afterAuth: async ({ session, admin }) => {

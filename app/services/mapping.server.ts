@@ -162,6 +162,7 @@ export async function buildResolveContext(productVariantId: string, shipToCountr
       id: sv.id,
       supplierProductId: sv.supplierProductId,
       externalSkuId: sv.externalSkuId,
+      skuAttr: sv.skuAttr,
       externalProductId: sv.supplierProduct.externalId,
       platform: sv.supplierProduct.platform,
       title: `${sv.supplierProduct.title} — ${((sv.attributes as unknown as Array<{ value: string }>) ?? []).map((a) => a.value).join(" / ")}`,

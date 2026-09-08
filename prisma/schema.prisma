@@ -97,6 +97,13 @@ model Shop {
   /// Bearer token for the browser extension / public import API.
   apiToken      String?   @unique
 
+  /// Shopify FulfillmentService id + its location, once the app is registered
+  /// as a fulfilment service. Products assigned to that location get a native
+  /// "Request fulfillment" button in the Shopify order page.
+  fulfillmentServiceId  String?
+  fulfillmentLocationId String?
+  fulfillmentServiceRegisteredAt DateTime?
+
   /// Free-form UI/behaviour preferences (see app/domain/settings/shop-settings.ts).
   settings Json @default("{}")
 
@@ -224,6 +231,7 @@ model SupplierProduct {
   shippingOptions  SupplierShippingOption[]
   importedProducts ImportedProduct[]
   priceSnapshots   SupplierPriceSnapshot[]
+  candidates       SupplierCandidate[]
 
   @@unique([platform, externalId])
   @@index([platform, isAvailable])
@@ -385,9 +393,10 @@ model Product {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  shop     Shop             @relation(fields: [shopId], references: [id], onDelete: Cascade)
-  variants ProductVariant[]
-  mapping  ProductMapping?
+  shop       Shop             @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  variants   ProductVariant[]
+  mapping    ProductMapping?
+  candidates SupplierCandidate[]
 
   @@unique([shopId, shopifyProductId])
   @@index([shopId])
@@ -408,6 +417,9 @@ model ProductVariant {
   cost              Decimal? @db.Decimal(18, 4)
   inventoryQuantity Int     @default(0)
   position          Int     @default(1)
+  /// True once this variant's inventory is stocked at the app's fulfilment
+  /// location, which is what makes Shopify route its fulfilment orders here.
+  fulfillmentAssigned Boolean @default(false)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -423,6 +435,12 @@ model ProductVariant {
 // -----------------------------------------------------------------------------
 // 6. Mapping
 // -----------------------------------------------------------------------------
+
+enum MappingSource {
+  MANUAL
+  AUTO
+  AI
+}
 
 enum MappingType {
   /// One Shopify variant -> one supplier SKU.
@@ -471,6 +489,11 @@ model VariantMapping {
 
   isDefault Boolean @default(false)
   isEnabled Boolean @default(true)
+
+  /// How this row was created: manual, auto (exact option match) or ai.
+  source     MappingSource @default(MANUAL)
+  /// 0-1 match confidence for auto/ai rows; null for manual ones.
+  confidence Float?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -695,6 +718,7 @@ model Order {
   shop           Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
   lineItems      OrderLineItem[]
   purchaseOrders PurchaseOrder[]
+  fulfillmentRequests FulfillmentRequest[]
 
   @@unique([shopId, shopifyOrderId])
   @@index([shopId, stage])
@@ -774,6 +798,15 @@ model PurchaseOrder {
   /// Free-text note pushed to the supplier ("no invoice, no promotion"...).
   supplierNote String?
 
+  /// Deep link where the merchant pays this order on the supplier's site.
+  paymentUrl        String?
+  /// When the supplier auto-cancels the order if it is still unpaid.
+  paymentDueAt      DateTime?
+  /// Last time we warned the merchant that payment is outstanding.
+  paymentReminderAt DateTime?
+  /// Set when the merchant ticks "I paid this" before the supplier reports it.
+  paymentMarkedAt   DateTime?
+
   errorCode    String?
   errorMessage String?
   attempts     Int      @default(0)
@@ -807,6 +840,8 @@ model PurchaseOrderItem {
 
   externalProductId String?
   externalSkuId     String?
+  /// Attribute-encoded SKU; AliExpress order creation needs this, not the id.
+  externalSkuAttr   String?
   title             String
   quantity          Int     @default(1)
   unitCost          Decimal @default(0) @db.Decimal(18, 4)
@@ -998,4 +1033,81 @@ model DailyMetric {
 
   @@unique([shopId, day])
   @@index([shopId, day])
+}
+
+
+// -----------------------------------------------------------------------------
+// 10. Fulfilment service (native "Request fulfillment" button)
+// -----------------------------------------------------------------------------
+
+enum FulfillmentRequestStatus {
+  SUBMITTED
+  ACCEPTED
+  REJECTED
+  CANCELLATION_REQUESTED
+  CANCELLED
+  CLOSED
+}
+
+/// A Shopify fulfilment request routed to this app because the merchant clicked
+/// "Request fulfillment" on an order whose items sit at the app's location.
+model FulfillmentRequest {
+  id      String @id @default(cuid())
+  orderId String
+
+  shopifyFulfillmentOrderId String
+  status                    FulfillmentRequestStatus @default(SUBMITTED)
+  /// Note the merchant typed in the request dialog.
+  requestMessage            String?
+  /// Reason we sent back when rejecting.
+  responseMessage           String?
+  /// [{ fulfillmentOrderLineItemId, shopifyLineItemId, quantity }]
+  lineItems                 Json  @default("[]")
+
+  requestedAt DateTime  @default(now())
+  respondedAt DateTime?
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId, shopifyFulfillmentOrderId])
+  @@index([status])
+}
+
+// -----------------------------------------------------------------------------
+// 11. Supplier comparison
+// -----------------------------------------------------------------------------
+
+/// A candidate supplier product for an existing managed product, with the
+/// landed cost and score used by the supplier optimizer.
+model SupplierCandidate {
+  id                String @id @default(cuid())
+  productId         String
+  supplierProductId String
+
+  itemCost      Decimal  @db.Decimal(18, 4)
+  shippingCost  Decimal  @default(0) @db.Decimal(18, 4)
+  landedCost    Decimal  @db.Decimal(18, 4)
+  currency      String   @default("USD")
+  deliveryDays  Int?
+  carrierName   String?
+  rating        Float?
+  orderCount    Int?
+  /// 0-100; higher is better. See app/domain/suppliers/score.ts.
+  score         Float    @default(0)
+  /// Why it scored that way, for the comparison table.
+  scoreBreakdown Json    @default("{}")
+
+  /// True for the supplier the product is mapped to right now.
+  isCurrent   Boolean @default(false)
+  /// Set when the merchant dismisses this candidate.
+  dismissedAt DateTime?
+
+  evaluatedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  product         Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  supplierProduct SupplierProduct @relation(fields: [supplierProductId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, supplierProductId])
+  @@index([productId, score])
 }

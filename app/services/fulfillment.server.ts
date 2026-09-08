@@ -149,6 +149,7 @@ export async function placeSupplierOrders(shop: ShopWithSettings, orderId: strin
             supplierVariantId: l.resolved.supplierVariantId,
             externalProductId: l.resolved.externalProductId,
             externalSkuId: l.resolved.externalSkuId,
+            externalSkuAttr: l.resolved.skuAttr ?? null,
             title: l.resolved.title,
             quantity: l.resolved.quantity,
             unitCost: l.resolved.unitCost,
@@ -164,6 +165,7 @@ export async function placeSupplierOrders(shop: ShopWithSettings, orderId: strin
       items: group.lines.map((l) => ({
         externalProductId: l.resolved.externalProductId,
         externalSkuId: l.resolved.externalSkuId,
+        externalSkuAttr: l.resolved.skuAttr ?? null,
         quantity: l.resolved.quantity,
         carrierCode,
         shipFromCountry: shipFrom,
@@ -196,9 +198,11 @@ export async function placeSupplierOrders(shop: ShopWithSettings, orderId: strin
           totalCost: result.totalCost,
           currency: result.currency,
           placedAt: new Date(),
+          paymentUrl: result.paymentUrl ?? null,
+          paymentDueAt: result.paymentDueAt ?? null,
           errorCode: null,
           errorMessage: null,
-          raw: { ...(po.raw as object), paymentUrl: result.paymentUrl ?? null, externalOrderIds: result.externalOrderIds ?? [result.externalOrderId], response: sanitize(result.raw) } as Prisma.InputJsonValue,
+          raw: { ...(po.raw as object), externalOrderIds: result.externalOrderIds ?? [result.externalOrderId], response: sanitize(result.raw) } as Prisma.InputJsonValue,
         },
       });
       if (account) await touchSupplierAccount(account.id);
@@ -257,6 +261,7 @@ async function recordFailedPurchaseOrder(shop: ShopWithSettings, orderId: string
           supplierVariantId: l.resolved.supplierVariantId,
           externalProductId: l.resolved.externalProductId,
           externalSkuId: l.resolved.externalSkuId,
+          externalSkuAttr: l.resolved.skuAttr ?? null,
           title: l.resolved.title,
           quantity: l.resolved.quantity,
           unitCost: l.resolved.unitCost,
@@ -370,8 +375,11 @@ export async function syncPurchaseOrder(shop: ShopWithSettings, purchaseOrderId:
       shippingCost: upstream.shippingCost ?? undefined,
       totalCost: upstream.totalCost ?? undefined,
       currency: upstream.currency ?? undefined,
-      paidAt: upstream.paidAt ?? (status === "PAID" && !po.paidAt ? new Date() : undefined),
-      shippedAt: upstream.shippedAt ?? (status === "SHIPPED" && !po.shippedAt ? new Date() : undefined),
+      paidAt: upstream.paidAt ?? (ORDER_RANK[status] >= ORDER_RANK.PAID && !po.paidAt ? new Date() : undefined),
+      shippedAt: upstream.shippedAt ?? (ORDER_RANK[status] >= ORDER_RANK.SHIPPED && !po.shippedAt ? new Date() : undefined),
+      paymentUrl: upstream.paymentUrl ?? po.paymentUrl ?? undefined,
+      // Once the supplier confirms payment the deadline no longer applies.
+      paymentDueAt: ORDER_RANK[status] >= ORDER_RANK.PAID ? null : undefined,
       raw: { ...(po.raw as object), lastStatus: sanitize(upstream.raw) } as Prisma.InputJsonValue,
     },
   });

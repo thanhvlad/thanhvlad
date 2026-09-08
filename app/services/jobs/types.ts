@@ -18,12 +18,14 @@ export interface JobPayloads {
   "process-webhook": { webhookEventId: string };
   /** Auto-place AWAITING_ORDER orders older than the configured delay. */
   "auto-place-orders": { shopId: string };
+  /** Warn about supplier orders approaching their payment deadline. */
+  "payment-reminders": { shopId: string };
   /** Refresh FX rates for a base currency. */
   "refresh-rates": { base: string };
   /** Roll up DailyMetric for a shop. */
   "rollup-metrics": { shopId: string; days: number };
   /** Fan-out tick: enqueue the per-shop periodic jobs for every active shop. */
-  "scheduler-tick": { kind: "purchase-orders" | "inventory" | "metrics" | "auto-place" | "tracking" };
+  "scheduler-tick": { kind: "purchase-orders" | "inventory" | "metrics" | "auto-place" | "tracking" | "payments" };
 }
 
 export type JobName = keyof JobPayloads;

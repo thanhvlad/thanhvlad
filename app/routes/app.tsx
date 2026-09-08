@@ -7,22 +7,24 @@ import polarisStyles from "@shopify/polaris/build/esm/styles.css?url";
 import { requireShop } from "~/lib/auth.server";
 import { env } from "~/lib/env.server";
 import { countUnread } from "~/services/notifications.server";
+import { countUnpaid } from "~/services/payments.server";
 
 export const links = () => [{ rel: "stylesheet", href: polarisStyles }];
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
-  const unread = await countUnread(shop.id);
+  const [unread, unpaid] = await Promise.all([countUnread(shop.id), countUnpaid(shop.id)]);
 
   return {
     apiKey: env().SHOPIFY_API_KEY,
     shopDomain: shop.domain,
     unread,
+    unpaid,
   };
 };
 
 export default function App() {
-  const { apiKey, unread } = useLoaderData<typeof loader>();
+  const { apiKey, unread, unpaid } = useLoaderData<typeof loader>();
 
   return (
     <AppProvider isEmbeddedApp apiKey={apiKey}>
@@ -34,6 +36,7 @@ export default function App() {
         <Link to="/app/import">Import list</Link>
         <Link to="/app/products">My products</Link>
         <Link to="/app/orders">Orders</Link>
+        <Link to="/app/payments">{unpaid > 0 ? `Payments (${unpaid})` : "Payments"}</Link>
         <Link to="/app/tracking">Tracking</Link>
         <Link to="/app/suppliers">Suppliers</Link>
         <Link to="/app/pricing">Pricing rules</Link>

@@ -4,6 +4,7 @@ import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
 import { logActivity } from "./activity.server";
 import { cancelPurchaseOrder } from "./fulfillment.server";
+import { handleFulfillmentRequest } from "./fulfillment-service.server";
 import { refreshOrderFromShopify } from "./orders.server";
 import { handleProductDeleted, syncProductFromShopify } from "./products.server";
 import { getShopByDomain, markShopUninstalled } from "./shop.server";
@@ -81,6 +82,15 @@ export async function processWebhookEvent(webhookEventId: string) {
         const client = await offlineClient(shop.domain);
         const orderId = payload.order_id ? gid("Order", String(payload.order_id)) : null;
         if (orderId) await refreshOrderFromShopify(shop, client, orderId);
+        break;
+      }
+      case "FULFILLMENT_ORDERS_FULFILLMENT_REQUEST_SUBMITTED":
+      case "FULFILLMENT_ORDERS_CANCELLATION_REQUEST_SUBMITTED": {
+        await handleFulfillmentRequest(shop, event.topic, payload);
+        break;
+      }
+      case "FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE": {
+        // Routing finished; nothing to do until the merchant requests fulfilment.
         break;
       }
       case "APP_UNINSTALLED": {

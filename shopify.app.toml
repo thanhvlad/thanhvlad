@@ -31,6 +31,16 @@ api_version = "2026-07"
   topics = [ "fulfillments/create", "fulfillments/update" ]
   uri = "/webhooks/fulfillments"
 
+  # Fires when a merchant clicks "Request fulfillment" on an order whose items
+  # are stocked at the app's fulfilment location.
+  [[webhooks.subscriptions]]
+  topics = [
+    "fulfillment_orders/fulfillment_request_submitted",
+    "fulfillment_orders/cancellation_request_submitted",
+    "fulfillment_orders/order_routing_complete",
+  ]
+  uri = "/webhooks/fulfillment-orders"
+
   [[webhooks.subscriptions]]
   compliance_topics = [ "customers/data_request", "customers/redact", "shop/redact" ]
   uri = "/webhooks/compliance"

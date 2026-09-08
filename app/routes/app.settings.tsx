@@ -10,6 +10,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
 const TABS = [
   { id: "general", path: "/app/settings", content: "General" },
+  { id: "fulfillment", path: "/app/settings/fulfillment", content: "Fulfilment service" },
   { id: "staff", path: "/app/settings/staff", content: "Staff" },
   { id: "stores", path: "/app/settings/stores", content: "Stores" },
   { id: "advanced", path: "/app/settings/advanced", content: "Advanced" },
