@@ -6,6 +6,13 @@ export interface JobPayloads {
   "push-products": { shopId: string; importedProductIds: string[]; jobRunId: string; actor?: string };
   /** Place supplier orders for a batch of Shopify orders. */
   "place-orders": { shopId: string; orderIds: string[]; jobRunId: string; actor?: string };
+  /**
+   * Add a batch of supplier links/ids to the import list.
+   *
+   * Each reference is a supplier round trip, so a paste of a few hundred URLs
+   * would blow past any platform request timeout if it ran in the action.
+   */
+  "import-references": { shopId: string; references: string[]; jobRunId: string; actor?: string };
   /** Pull orders from Shopify (initial sync / manual). */
   "sync-orders": { shopId: string; days: number; jobRunId: string };
   /** Poll open purchase orders upstream and pull tracking. */

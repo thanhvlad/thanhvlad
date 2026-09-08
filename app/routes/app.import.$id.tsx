@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
 import { useFetcher, useLoaderData, useNavigate } from "@remix-run/react";
@@ -165,9 +165,13 @@ export default function ImportEditPage() {
   const [ruleId, setRuleId] = useState(product.pricingRuleId);
   const [bulkPrice, setBulkPrice] = useState("");
 
-  if (fetcher.data && "redirectTo" in fetcher.data && fetcher.data.redirectTo) {
-    navigate(fetcher.data.redirectTo);
-  }
+  // In an effect: calling navigate() from the render body updates the router
+  // while another component is rendering, and runs twice under StrictMode, so
+  // a split pushed two history entries.
+  const redirectTo = fetcher.data && "redirectTo" in fetcher.data ? fetcher.data.redirectTo : null;
+  useEffect(() => {
+    if (redirectTo) navigate(redirectTo);
+  }, [redirectTo, navigate]);
 
   const save = () => {
     fetcher.submit(

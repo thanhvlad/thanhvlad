@@ -33,6 +33,11 @@ export async function upsertShippingPreference(shopId: string, input: ShippingPr
     requireTracking: input.requireTracking ?? false,
     isEnabled: input.isEnabled ?? true,
   };
+  if (id) {
+    // Scoped, so a preference id from another store cannot be overwritten.
+    const owned = await prisma.shippingPreference.findFirst({ where: { id, shopId }, select: { id: true } });
+    if (!owned) throw new Error("Shipping preference not found.");
+  }
   const row = id
     ? await prisma.shippingPreference.update({ where: { id }, data })
     : await prisma.shippingPreference.upsert({
@@ -51,6 +56,28 @@ export async function upsertShippingPreference(shopId: string, input: ShippingPr
 
 export async function deleteShippingPreference(shopId: string, id: string) {
   await prisma.shippingPreference.deleteMany({ where: { id, shopId } });
+}
+
+/**
+ * Enable or disable one preference without touching anything else.
+ *
+ * Going through `upsertShippingPreference` for this would null out every field
+ * the caller did not resend — the cost cap, the delivery-day cap and the
+ * carrier's display name — so disabling a row to try another carrier silently
+ * discarded the limits the merchant set.
+ */
+export async function setShippingPreferenceEnabled(shopId: string, id: string, isEnabled: boolean) {
+  const updated = await prisma.shippingPreference.updateMany({
+    where: { id, shopId },
+    data: { isEnabled },
+  });
+  if (updated.count === 0) throw new Error("Shipping preference not found.");
+  await logActivity(shopId, {
+    action: "shipping.preference.toggled",
+    entity: "ShippingPreference",
+    entityId: id,
+    message: `Shipping preference ${isEnabled ? "enabled" : "disabled"}.`,
+  });
 }
 
 export async function reorderShippingPreferences(shopId: string, countryCode: string, orderedIds: string[]) {

@@ -3,7 +3,7 @@ import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
 import { refreshRates } from "../currency.server";
 import { placeSupplierOrders, syncOpenPurchaseOrders, syncPendingTracking } from "../fulfillment.server";
-import { pushImportedProduct } from "../import.server";
+import { addToImportList, pushImportedProduct } from "../import.server";
 import { runInventorySync } from "../inventory-sync.server";
 import { runJob } from "../jobs.server";
 import { notify } from "../notifications.server";
@@ -43,6 +43,32 @@ export function registerAllHandlers() {
         link: failed ? "/app/import?status=FAILED" : "/app/products",
       });
       return { ok, failed, results };
+    });
+  });
+
+  registerHandler("import-references", async ({ shopId, references, jobRunId, actor }) => {
+    const shop = await getShopById(shopId);
+    if (!shop) return;
+    return runJob(jobRunId, async ({ progress }) => {
+      let ok = 0;
+      const errors: string[] = [];
+      for (const reference of references) {
+        try {
+          await addToImportList(shop, reference, { actor });
+          ok += 1;
+          await progress({ processed: 1, succeeded: 1 });
+        } catch (error) {
+          errors.push(`${reference}: ${errorMessage(error)}`);
+          await progress({ processed: 1, failed: 1 });
+        }
+      }
+      await notify(shopId, {
+        type: "job.finished",
+        severity: errors.length ? "warning" : "info",
+        title: `Imported ${ok} product(s)${errors.length ? `, ${errors.length} failed` : ""}`,
+        link: "/app/import",
+      });
+      return { ok, failed: errors.length, errors: errors.slice(0, 50) };
     });
   });
 

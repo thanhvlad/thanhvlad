@@ -12,7 +12,7 @@ export async function listProducts(
   shopId: string,
   options: { search?: string; mapped?: "all" | "mapped" | "unmapped"; page?: number; pageSize?: number; autoUpdate?: boolean } = {},
 ) {
-  const page = Math.max(1, options.page ?? 1);
+  const page = Number.isFinite(options.page) ? Math.max(1, Math.floor(options.page as number)) : 1;
   const pageSize = Math.min(100, options.pageSize ?? 25);
   const where: Prisma.ProductWhereInput = {
     shopId,

@@ -6,7 +6,7 @@ import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatMoney } from "~/lib/format";
 import { mergeShopSettings } from "~/domain/settings/shop-settings";
-import { KNOWN_CARRIERS, deleteShippingPreference, listShippingPreferences, upsertShippingPreference } from "~/services/shipping.server";
+import { KNOWN_CARRIERS, deleteShippingPreference, listShippingPreferences, setShippingPreferenceEnabled, upsertShippingPreference } from "~/services/shipping.server";
 import { updateShopSettings } from "~/services/shop.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -37,7 +37,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         });
         return { ok: true, message: "Preference saved." };
       case "toggle":
-        await upsertShippingPreference(shop.id, { countryCode: get("countryCode"), carrierCode: get("carrierCode"), isEnabled: get("enabled") === "true", priority: Number(get("priority") || 0), requireTracking: get("requireTracking") === "true" }, get("id"));
+        await setShippingPreferenceEnabled(shop.id, get("id"), get("enabled") === "true");
         return { ok: true, message: "Preference updated." };
       case "delete":
         await deleteShippingPreference(shop.id, get("id"));

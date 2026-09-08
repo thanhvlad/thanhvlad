@@ -134,7 +134,7 @@ export async function listImportList(
   shopId: string,
   options: { status?: ImportStatus | "ALL"; search?: string; page?: number; pageSize?: number } = {},
 ) {
-  const page = Math.max(1, options.page ?? 1);
+  const page = Number.isFinite(options.page) ? Math.max(1, Math.floor(options.page as number)) : 1;
   const pageSize = Math.min(100, options.pageSize ?? 25);
   const where: Prisma.ImportedProductWhereInput = {
     shopId,

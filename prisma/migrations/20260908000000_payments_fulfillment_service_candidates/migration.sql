@@ -84,3 +84,9 @@ ALTER TABLE "SupplierCandidate" ADD CONSTRAINT "SupplierCandidate_supplierProduc
 -- AlterTable
 ALTER TABLE "ProductVariant" ADD COLUMN     "fulfillmentAssigned" BOOLEAN NOT NULL DEFAULT false;
 
+-- AlterTable
+ALTER TABLE "SupplierAccount" ADD COLUMN     "lastErrorAt" TIMESTAMP(3),
+ADD COLUMN     "lastErrorCode" TEXT,
+ADD COLUMN     "needsReauth" BOOLEAN NOT NULL DEFAULT false,
+ADD COLUMN     "storeRegisteredAt" TIMESTAMP(3);
+

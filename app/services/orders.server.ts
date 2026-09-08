@@ -250,7 +250,7 @@ export async function listOrders(
   shopId: string,
   options: { stage?: OrderStage | "ALL"; search?: string; page?: number; pageSize?: number; country?: string; from?: Date; to?: Date } = {},
 ) {
-  const page = Math.max(1, options.page ?? 1);
+  const page = Number.isFinite(options.page) ? Math.max(1, Math.floor(options.page as number)) : 1;
   const pageSize = Math.min(250, options.pageSize ?? 50);
   const where: Prisma.OrderWhereInput = {
     shopId,

@@ -9,7 +9,7 @@ import { Thumb } from "~/components/Thumb";
 import prisma from "~/db.server";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
-import { formatMoney, relativeTime } from "~/lib/format";
+import { formatMoney, pageParam, relativeTime } from "~/lib/format";
 import { createJobRun } from "~/services/jobs.server";
 import { enqueue } from "~/services/jobs/index.server";
 import { listPricingRules } from "~/services/pricing.server";
@@ -20,7 +20,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const url = new URL(request.url);
   const search = url.searchParams.get("q") ?? "";
   const mapped = (url.searchParams.get("mapped") ?? "all") as "all" | "mapped" | "unmapped";
-  const page = Number(url.searchParams.get("page") ?? 1);
+  const page = pageParam(url.searchParams.get("page"));
   const [list, counts, rules] = await Promise.all([listProducts(shop.id, { search, mapped, page }), countProducts(shop.id), listPricingRules(shop.id)]);
   return {
     currency: shop.currency,

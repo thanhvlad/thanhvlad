@@ -2,6 +2,7 @@ import prisma from "~/db.server";
 import { decryptSecret, encryptSecret } from "~/lib/crypto.server";
 import { env } from "~/lib/env.server";
 import { SupplierError } from "~/lib/errors";
+import { notify } from "../notifications.server";
 import { logger } from "~/lib/logger.server";
 import { AliExpressAdapter } from "./aliexpress.server";
 import { CjDropshippingAdapter } from "./cj.server";
@@ -102,7 +103,83 @@ export async function adapterForAccount(accountId: string): Promise<{ adapter: S
     }
   }
 
-  return { adapter: getAdapter(account.platform, { accessToken, refreshToken, meta }), account };
+  const adapter = getAdapter(account.platform, { accessToken, refreshToken, meta });
+  return { adapter: watchAuth(adapter, account.id), account };
+}
+
+/**
+ * Wrap an adapter so an authorisation failure marks the account as needing a
+ * reconnect. Without this a merchant's expired AliExpress token would fail
+ * every order individually with no obvious cause and no way back.
+ */
+function watchAuth(adapter: SupplierAdapter, accountId: string): SupplierAdapter {
+  return new Proxy(adapter, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        let result: unknown;
+        try {
+          result = (value as (...a: unknown[]) => unknown).apply(target, args);
+        } catch (error) {
+          void noteAuthFailure(accountId, error);
+          throw error;
+        }
+        if (result instanceof Promise) {
+          return result.then(
+            (ok) => {
+              void clearAuthFailure(accountId);
+              return ok;
+            },
+            (error) => {
+              void noteAuthFailure(accountId, error);
+              throw error;
+            },
+          );
+        }
+        return result;
+      };
+    },
+  });
+}
+
+async function noteAuthFailure(accountId: string, error: unknown) {
+  const code = error instanceof SupplierError ? error.code : null;
+  if (code !== "SUPPLIER_NOT_AUTHORIZED") return;
+  try {
+    const account = await prisma.supplierAccount.update({
+      where: { id: accountId },
+      data: { needsReauth: true, lastErrorCode: code, lastErrorAt: new Date() },
+      select: { id: true, label: true, platform: true, shopId: true, accountId: true },
+    });
+    const shop = account.shopId
+      ? { id: account.shopId }
+      : await prisma.shop.findFirst({ where: { accountId: account.accountId, isActive: true }, select: { id: true } });
+    if (shop) {
+      await notify(shop.id, {
+        type: "supplier.auth",
+        severity: "critical",
+        title: `${account.platform} needs reconnecting`,
+        body: `"${account.label}" was rejected by the platform. Orders will not be placed until you reconnect it.`,
+        link: "/app/suppliers",
+        dedupeKey: `reauth:${account.id}`,
+        dedupeMinutes: 60 * 12,
+      });
+    }
+  } catch (updateError) {
+    logger.warn("Could not flag a supplier account for reauth", { accountId, error: updateError });
+  }
+}
+
+async function clearAuthFailure(accountId: string) {
+  try {
+    await prisma.supplierAccount.updateMany({
+      where: { id: accountId, needsReauth: true },
+      data: { needsReauth: false, lastErrorCode: null },
+    });
+  } catch {
+    // Best effort: a successful call should never fail because of bookkeeping.
+  }
 }
 
 /**

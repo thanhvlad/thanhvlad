@@ -66,3 +66,18 @@ export function adminUrl(shopDomain: string, path: string): string {
   const store = shopDomain.replace(".myshopify.com", "");
   return `https://admin.shopify.com/store/${store}${path}`;
 }
+
+/**
+ * Read a `?page=` value safely.
+ *
+ * `Number(searchParams.get("page") ?? 1)` only covers a *missing* param:
+ * `?page=` gives 0 and `?page=abc` gives NaN, both of which reach Prisma's
+ * `skip` and throw ("must be greater than or equal to 0"), dropping the merchant
+ * on the error boundary instead of page 1. `Math.max(1, NaN)` is NaN, so the
+ * service-side clamps did not save it either.
+ */
+export function pageParam(value: string | null | undefined, max = 100_000): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(Math.floor(n), max);
+}

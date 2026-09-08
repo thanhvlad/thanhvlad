@@ -4,6 +4,7 @@ import { useFetcher, useLoaderData } from "@remix-run/react";
 import type { PriceChangeAction, StockChangeAction } from "@prisma/client";
 import { Badge, Banner, BlockStack, Box, Button, Card, Checkbox, DataTable, FormLayout, InlineStack, Layout, Page, Select, Text, TextField } from "@shopify/polaris";
 import { JobProgress } from "~/components/JobProgress";
+import { useJobRun } from "~/lib/use-job-run";
 import { StatusBadge } from "~/components/StatusBadge";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
@@ -73,8 +74,7 @@ export default function InventoryPage() {
   const fetcher = useFetcher<typeof action>();
   const result = fetcher.data as { message?: string; error?: string; jobRunId?: string; dryRun?: { summary: Record<string, unknown>; actions: Array<{ type: string; variant: string; reason: string; price: string | null; quantity: number | null }> } } | undefined;
   const [form, setForm] = useState({ ...data.policy, priceThresholdPercent: data.policy.priceThresholdPercent, lowStockThreshold: String(data.policy.lowStockThreshold), maxInventoryPushed: String(data.policy.maxInventoryPushed), syncIntervalMinutes: String(data.policy.syncIntervalMinutes) });
-  const [jobRunId, setJobRunId] = useState<string | null>(null);
-  if (result?.jobRunId && result.jobRunId !== jobRunId) setJobRunId(result.jobRunId);
+  const { jobRunId, clearJobRun } = useJobRun(result);
 
   return (
     <Page
@@ -85,7 +85,7 @@ export default function InventoryPage() {
     >
       <Layout>
         <Layout.Section>
-          <JobProgress jobRunId={jobRunId} onDone={() => setJobRunId(null)} />
+          <JobProgress jobRunId={jobRunId} onDone={clearJobRun} />
           {result?.message && (
             <Banner tone="success">
               <p>{result.message}</p>

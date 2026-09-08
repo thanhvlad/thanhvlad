@@ -6,14 +6,14 @@ import { Paginator } from "~/components/Paginator";
 import { PlatformBadge, StatusBadge } from "~/components/StatusBadge";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
-import { formatDate, relativeTime } from "~/lib/format";
+import { formatDate, pageParam, relativeTime } from "~/lib/format";
 import { syncOpenPurchaseOrders, syncPendingTracking } from "~/services/fulfillment.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
   const url = new URL(request.url);
   const filter = url.searchParams.get("filter") ?? "all";
-  const page = Number(url.searchParams.get("page") ?? 1);
+  const page = pageParam(url.searchParams.get("page"));
   const pageSize = 50;
   const where = {
     purchaseOrder: { order: { shopId: shop.id } },

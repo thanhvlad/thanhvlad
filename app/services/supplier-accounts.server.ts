@@ -23,6 +23,9 @@ export async function listSupplierAccounts(shopId: string) {
     isActive: r.isActive,
     expiresAt: r.expiresAt,
     lastUsedAt: r.lastUsedAt,
+    needsReauth: r.needsReauth,
+    lastErrorAt: r.lastErrorAt,
+    storeRegisteredAt: r.storeRegisteredAt,
     scope: r.shopId ? (r.shop?.domain ?? "this store") : "all stores",
     hasToken: Boolean(r.accessToken),
     createdAt: r.createdAt,
@@ -90,6 +93,23 @@ export async function connectSupplierAccount(input: {
     },
   });
 
+  // AliExpress requires the store to be registered with the dropshipping
+  // programme before its order APIs work; best effort, reported if it fails.
+  if (adapter.registerStore) {
+    try {
+      await adapter.registerStore(`https://${shop.domain}`);
+      await prisma.supplierAccount.update({ where: { id: account.id }, data: { storeRegisteredAt: new Date() } });
+    } catch (error) {
+      await logActivity(input.shopId, {
+        action: "supplier.register_store_failed",
+        level: "warn",
+        entity: "SupplierAccount",
+        entityId: account.id,
+        message: `Could not register the store with ${input.platform}: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  }
+
   await logActivity(input.shopId, {
     action: "supplier.connected",
     entity: "SupplierAccount",
@@ -146,8 +166,11 @@ export async function testSupplierAccount(id: string): Promise<{ ok: boolean; me
   });
   if (!adapter.isConfigured()) return { ok: false, message: "Platform API keys are not configured on the server." };
   try {
-    const result = await adapter.searchProducts({ query: "phone case", pageSize: 1 });
-    return { ok: true, message: `Connected. Search returned ${result.items.length} result(s).` };
+    // An empty query uses the platform's own feed, which every connected
+    // account can read — keyword search additionally needs an affiliate id.
+    const result = await adapter.searchProducts({ query: "", pageSize: 1 });
+    await prisma.supplierAccount.update({ where: { id }, data: { needsReauth: false, lastErrorCode: null } });
+    return { ok: true, message: `Connected. The catalog returned ${result.items.length} result(s).` };
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) };
   }

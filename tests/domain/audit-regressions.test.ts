@@ -342,7 +342,7 @@ describe("shipping: a per-carrier cap is not undone by the fallback", () => {
   it("does not re-select the option the preference just rejected on cost", () => {
     const result = selectShipping({
       options: [
-        { carrierCode: "EPACKET", cost: "18.00", shipToCountry: "US", hasTracking: true, maxDeliveryDays: 10 },
+        { carrierCode: "EPACKET", carrierName: "Epacket", currency: "USD", cost: "18.00", shipToCountry: "US", hasTracking: true, maxDeliveryDays: 10 },
       ],
       preferences: [
         { countryCode: "US", carrierCode: "EPACKET", priority: 0, maxCost: 5, requireTracking: true, isEnabled: true },
@@ -357,10 +357,10 @@ describe("shipping: a per-carrier cap is not undone by the fallback", () => {
   it("does not re-select an option the preference rejected on delivery time", () => {
     const result = selectShipping({
       options: [
-        { carrierCode: "SLOW", cost: "1.00", shipToCountry: "US", hasTracking: true, maxDeliveryDays: 90 },
+        { carrierCode: "SLOW", carrierName: "Slow", currency: "USD", cost: "1.00", shipToCountry: "US", hasTracking: true, maxDeliveryDays: 90 },
       ],
       preferences: [
-        { countryCode: "US", carrierCode: "SLOW", priority: 0, maxDeliveryDays: 15, isEnabled: true },
+        { countryCode: "US", carrierCode: "SLOW", priority: 0, maxDeliveryDays: 15, requireTracking: false, isEnabled: true },
       ],
       shipToCountry: "US",
       fallback: "FASTEST",
@@ -371,11 +371,11 @@ describe("shipping: a per-carrier cap is not undone by the fallback", () => {
   it("still falls back to a carrier no preference rejected", () => {
     const result = selectShipping({
       options: [
-        { carrierCode: "EPACKET", cost: "18.00", shipToCountry: "US", hasTracking: true, maxDeliveryDays: 10 },
-        { carrierCode: "STANDARD", cost: "3.00", shipToCountry: "US", hasTracking: true, maxDeliveryDays: 25 },
+        { carrierCode: "EPACKET", carrierName: "Epacket", currency: "USD", cost: "18.00", shipToCountry: "US", hasTracking: true, maxDeliveryDays: 10 },
+        { carrierCode: "STANDARD", carrierName: "Standard", currency: "USD", cost: "3.00", shipToCountry: "US", hasTracking: true, maxDeliveryDays: 25 },
       ],
       preferences: [
-        { countryCode: "US", carrierCode: "EPACKET", priority: 0, maxCost: 5, isEnabled: true },
+        { countryCode: "US", carrierCode: "EPACKET", priority: 0, maxCost: 5, requireTracking: false, isEnabled: true },
       ],
       shipToCountry: "US",
       fallback: "CHEAPEST",
@@ -387,11 +387,11 @@ describe("shipping: a per-carrier cap is not undone by the fallback", () => {
   it("reports each rejection once", () => {
     const result = selectShipping({
       options: [
-        { carrierCode: "EPACKET", cost: "18.00", shipToCountry: "US", hasTracking: true, maxDeliveryDays: 10 },
+        { carrierCode: "EPACKET", carrierName: "Epacket", currency: "USD", cost: "18.00", shipToCountry: "US", hasTracking: true, maxDeliveryDays: 10 },
       ],
       preferences: [
-        { countryCode: "US", carrierCode: "EPACKET", priority: 0, maxCost: 5, isEnabled: true },
-        { countryCode: "*", carrierCode: "EPACKET", priority: 1, maxCost: 5, isEnabled: true },
+        { countryCode: "US", carrierCode: "EPACKET", priority: 0, maxCost: 5, requireTracking: false, isEnabled: true },
+        { countryCode: "*", carrierCode: "EPACKET", priority: 1, maxCost: 5, requireTracking: false, isEnabled: true },
       ],
       shipToCountry: "US",
       fallback: "CHEAPEST",
@@ -453,11 +453,11 @@ describe("pricing: the cents ending does not eat the compare-at price", () => {
 
 describe("mapping: BASIC ties are resolved the same way every time", () => {
   const supplierVariants = {
-    svA: { id: "svA", stock: 10, isAvailable: true, price: "5.00", currency: "USD" },
-    svB: { id: "svB", stock: 10, isAvailable: true, price: "9.00", currency: "USD" },
+    svA: { id: "svA", supplierProductId: "sp1", externalSkuId: "svA-sku", externalProductId: "sp1", platform: "MOCK", title: "svA", stock: 10, isAvailable: true, price: "5.00", currency: "USD" },
+    svB: { id: "svB", supplierProductId: "sp1", externalSkuId: "svB-sku", externalProductId: "sp1", platform: "MOCK", title: "svB", stock: 10, isAvailable: true, price: "9.00", currency: "USD" },
   };
-  const rowA = { id: "rowA", supplierVariantId: "svA", quantity: 1, priority: 0, isEnabled: true, isDefault: false };
-  const rowB = { id: "rowB", supplierVariantId: "svB", quantity: 1, priority: 0, isEnabled: true, isDefault: false };
+  const rowA = { id: "rowA", productVariantId: "pv1", shipToCountry: "*", supplierVariantId: "svA", quantity: 1, priority: 0, isEnabled: true, isDefault: false };
+  const rowB = { id: "rowB", productVariantId: "pv1", shipToCountry: "*", supplierVariantId: "svB", quantity: 1, priority: 0, isEnabled: true, isDefault: false };
 
   it("does not depend on the order the rows came back from the database", () => {
     const forwards = resolveMapping({ type: "BASIC", rows: [rowA, rowB], supplierVariants, orderedQuantity: 1, shipToCountry: "US" });
@@ -472,10 +472,10 @@ describe("mapping: a bundle cannot claim the same SKU twice", () => {
     const result = resolveMapping({
       type: "BUNDLE",
       rows: [
-        { id: "r1", supplierVariantId: "svX", quantity: 1, priority: 0, isEnabled: true, isDefault: false, bundleGroup: "g1" },
-        { id: "r2", supplierVariantId: "svX", quantity: 1, priority: 0, isEnabled: true, isDefault: false, bundleGroup: "g1" },
+        { id: "r1", productVariantId: "pv1", shipToCountry: "*", supplierVariantId: "svX", quantity: 1, priority: 0, isEnabled: true, isDefault: false, bundleGroup: "g1" },
+        { id: "r2", productVariantId: "pv1", shipToCountry: "*", supplierVariantId: "svX", quantity: 1, priority: 0, isEnabled: true, isDefault: false, bundleGroup: "g1" },
       ],
-      supplierVariants: { svX: { id: "svX", stock: 1, isAvailable: true, price: "5.00", currency: "USD" } },
+      supplierVariants: { svX: { id: "svX", supplierProductId: "sp1", externalSkuId: "svX-sku", externalProductId: "sp1", platform: "MOCK", title: "svX", stock: 1, isAvailable: true, price: "5.00", currency: "USD" } },
       orderedQuantity: 1,
       shipToCountry: "US",
     });
@@ -487,10 +487,10 @@ describe("mapping: a bundle cannot claim the same SKU twice", () => {
     const result = resolveMapping({
       type: "BUNDLE",
       rows: [
-        { id: "r1", supplierVariantId: "svX", quantity: 1, priority: 0, isEnabled: true, isDefault: false, bundleGroup: "g1" },
-        { id: "r2", supplierVariantId: "svX", quantity: 1, priority: 0, isEnabled: true, isDefault: false, bundleGroup: "g1" },
+        { id: "r1", productVariantId: "pv1", shipToCountry: "*", supplierVariantId: "svX", quantity: 1, priority: 0, isEnabled: true, isDefault: false, bundleGroup: "g1" },
+        { id: "r2", productVariantId: "pv1", shipToCountry: "*", supplierVariantId: "svX", quantity: 1, priority: 0, isEnabled: true, isDefault: false, bundleGroup: "g1" },
       ],
-      supplierVariants: { svX: { id: "svX", stock: 5, isAvailable: true, price: "5.00", currency: "USD" } },
+      supplierVariants: { svX: { id: "svX", supplierProductId: "sp1", externalSkuId: "svX-sku", externalProductId: "sp1", platform: "MOCK", title: "svX", stock: 5, isAvailable: true, price: "5.00", currency: "USD" } },
       orderedQuantity: 1,
       shipToCountry: "US",
     });

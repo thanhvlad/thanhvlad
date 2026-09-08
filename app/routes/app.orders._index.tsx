@@ -4,13 +4,14 @@ import { Link, useFetcher, useLoaderData, useNavigate, useSearchParams } from "@
 import { Badge, Banner, BlockStack, Button, Card, EmptyState, IndexTable, InlineStack, Layout, Page, Tabs, Text, TextField, Tooltip, useIndexResourceState } from "@shopify/polaris";
 import type { OrderStage } from "@prisma/client";
 import { JobProgress } from "~/components/JobProgress";
+import { useJobRun } from "~/lib/use-job-run";
 import { Paginator } from "~/components/Paginator";
 import { StatusBadge } from "~/components/StatusBadge";
 import { STAGE_ORDER } from "~/domain/orders/pipeline";
 import type { OrderIssue } from "~/domain/orders/pipeline";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
-import { formatDate, formatMoney } from "~/lib/format";
+import { formatDate, formatMoney, pageParam } from "~/lib/format";
 import { createJobRun } from "~/services/jobs.server";
 import { enqueue } from "~/services/jobs/index.server";
 import { countOrdersByStage, listOrders } from "~/services/orders.server";
@@ -20,7 +21,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const url = new URL(request.url);
   const stage = (url.searchParams.get("stage") ?? "ALL") as OrderStage | "ALL";
   const search = url.searchParams.get("q") ?? "";
-  const page = Number(url.searchParams.get("page") ?? 1);
+  const page = pageParam(url.searchParams.get("page"));
   const [list, counts] = await Promise.all([listOrders(shop.id, { stage, search, page, pageSize: shop.parsedSettings.ui.ordersPageSize }), countOrdersByStage(shop.id)]);
   return {
     currency: shop.currency,
@@ -85,15 +86,11 @@ export default function OrdersPage() {
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const [search, setSearch] = useState(data.search);
-  const [jobRunId, setJobRunId] = useState<string | null>(null);
   const items = data.list.items;
   const { selectedResources, allResourcesSelected, handleSelectionChange, clearSelection } = useIndexResourceState(items);
 
   const result = fetcher.data as { ok?: boolean; error?: string; jobRunId?: string } | undefined;
-  if (result?.jobRunId && result.jobRunId !== jobRunId) {
-    setJobRunId(result.jobRunId);
-    clearSelection();
-  }
+  const { jobRunId, clearJobRun } = useJobRun(result, clearSelection);
 
   const tabs = [{ id: "ALL", content: `All (${Object.values(data.counts).reduce((a, b) => a + b, 0)})` }, ...STAGE_ORDER.map((s) => ({ id: s, content: `${label(s)} (${data.counts[s]})` }))];
   const selectedTab = Math.max(0, tabs.findIndex((t) => t.id === data.stage));
@@ -116,7 +113,7 @@ export default function OrdersPage() {
     >
       <Layout>
         <Layout.Section>
-          <JobProgress jobRunId={jobRunId} onDone={() => setJobRunId(null)} />
+          <JobProgress jobRunId={jobRunId} onDone={clearJobRun} />
           {result?.error && (
             <Banner tone="critical">
               <p>{result.error}</p>

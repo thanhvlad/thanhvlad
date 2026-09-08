@@ -21,7 +21,7 @@ import {
 import { PlatformBadge } from "~/components/StatusBadge";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
-import { formatMoney } from "~/lib/format";
+import { formatMoney, pageParam } from "~/lib/format";
 import { addToImportList, pushImportedProduct } from "~/services/import.server";
 import { adapterForShop, listPlatforms } from "~/services/suppliers/index.server";
 import type { SupplierPlatform, SupplierSearchResult } from "~/services/suppliers/types";
@@ -32,7 +32,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const q = url.searchParams.get("q") ?? "";
   const platform = (url.searchParams.get("platform") ?? "ALIEXPRESS") as SupplierPlatform;
   const sort = (url.searchParams.get("sort") ?? "default") as "default" | "orders" | "price_asc" | "price_desc" | "newest" | "rating";
-  const page = Number(url.searchParams.get("page") ?? 1);
+  const page = pageParam(url.searchParams.get("page"));
   const imageUrl = url.searchParams.get("image") ?? "";
   const platforms = listPlatforms();
 

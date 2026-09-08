@@ -24,12 +24,16 @@ import { PlatformBadge, StatusBadge } from "~/components/StatusBadge";
 import { Thumb } from "~/components/Thumb";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
-import { formatMoney } from "~/lib/format";
+import { formatMoney, pageParam } from "~/lib/format";
+import { useJobRun } from "~/lib/use-job-run";
 import { applyPricingRuleToImport, listImportList, removeFromImportList, summarizeMargins, addToImportList } from "~/services/import.server";
 import { createJobRun } from "~/services/jobs.server";
 import { enqueue } from "~/services/jobs/index.server";
 import { listPricingRules } from "~/services/pricing.server";
 import type { ImportStatus } from "@prisma/client";
+
+/** Rows accepted per CSV paste. Anything past this is reported, not dropped. */
+const MAX_CSV_ROWS = 500;
 
 const TABS: Array<{ id: ImportStatus | "ALL"; label: string }> = [
   { id: "ALL", label: "All" },
@@ -43,7 +47,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const url = new URL(request.url);
   const status = (url.searchParams.get("status") ?? "ALL") as ImportStatus | "ALL";
   const search = url.searchParams.get("q") ?? "";
-  const page = Number(url.searchParams.get("page") ?? 1);
+  const page = pageParam(url.searchParams.get("page"));
   const [list, rules] = await Promise.all([listImportList(shop.id, { status, search, page, pageSize: 25 }), listPricingRules(shop.id)]);
   return {
     currency: shop.currency,
@@ -103,17 +107,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           .split(/\r?\n/)
           .map((line) => line.split(",")[0]?.trim())
           .filter((v): v is string => Boolean(v) && !/^(url|link|product)/i.test(v));
-        let ok = 0;
-        const errors: string[] = [];
-        for (const ref of refs.slice(0, 200)) {
-          try {
-            await addToImportList(shop, ref, { actor });
-            ok += 1;
-          } catch (e) {
-            errors.push(`${ref}: ${errorMessage(e)}`);
-          }
-        }
-        return { ok: true, message: `${ok} product(s) imported from CSV${errors.length ? `, ${errors.length} failed` : ""}.`, errors };
+        if (refs.length === 0) return { ok: false, error: "No product links or ids found in that CSV." };
+        // Every reference is a supplier round trip, so this goes through the
+        // queue like every other bulk action rather than holding the request
+        // open for minutes and dying at the platform timeout.
+        const batch = refs.slice(0, MAX_CSV_ROWS);
+        const job = await createJobRun({ shopId: shop.id, type: "import-references", total: batch.length, payload: { references: batch } });
+        await enqueue("import-references", { shopId: shop.id, references: batch, jobRunId: job.id, actor });
+        return {
+          ok: true,
+          jobRunId: job.id,
+          message:
+            refs.length > batch.length
+              ? `Importing the first ${batch.length} of ${refs.length} rows; re-paste the rest afterwards.`
+              : `Importing ${batch.length} product(s) in the background.`,
+        };
       }
       default:
         return { ok: false, error: "Unknown action" };
@@ -132,20 +140,14 @@ export default function ImportListPage() {
   const [ruleId, setRuleId] = useState(data.rules.find((r) => r.isDefault)?.id ?? "");
   const [reference, setReference] = useState("");
   const [csv, setCsv] = useState("");
-  const [jobRunId, setJobRunId] = useState<string | null>(null);
-
   const items = data.list.items;
   const { selectedResources, allResourcesSelected, handleSelectionChange, clearSelection } = useIndexResourceState(items);
   const selectedIndex = TABS.findIndex((t) => t.id === data.status);
+  const { jobRunId, clearJobRun } = useJobRun(fetcher.data, clearSelection);
 
   const submit = (intent: string, extra: Record<string, string> = {}) => {
     fetcher.submit({ intent, ids: selectedResources.join(","), ...extra }, { method: "post" });
   };
-
-  if (fetcher.data && "jobRunId" in fetcher.data && fetcher.data.jobRunId && fetcher.data.jobRunId !== jobRunId) {
-    setJobRunId(fetcher.data.jobRunId);
-    clearSelection();
-  }
 
   return (
     <Page
@@ -156,19 +158,10 @@ export default function ImportListPage() {
     >
       <Layout>
         <Layout.Section>
-          <JobProgress jobRunId={jobRunId} onDone={() => setJobRunId(null)} />
+          <JobProgress jobRunId={jobRunId} onDone={clearJobRun} />
           {fetcher.data && "message" in fetcher.data && fetcher.data.message && (
-            <Banner tone="success" onDismiss={() => undefined}>
+            <Banner tone="success">
               <p>{fetcher.data.message}</p>
-              {"errors" in fetcher.data && fetcher.data.errors?.length ? (
-                <BlockStack gap="100">
-                  {fetcher.data.errors.slice(0, 10).map((e) => (
-                    <Text as="p" key={e} tone="critical">
-                      {e}
-                    </Text>
-                  ))}
-                </BlockStack>
-              ) : null}
             </Banner>
           )}
           {fetcher.data && "error" in fetcher.data && fetcher.data.error && (

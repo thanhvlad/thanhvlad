@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { Form, useFetcher, useLoaderData } from "@remix-run/react";
 import { Banner, BlockStack, Button, Card, DataTable, InlineGrid, InlineStack, Layout, Page, Select, Text } from "@shopify/polaris";
@@ -30,6 +31,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
 export default function ReportsPage() {
   const { currency, range, report } = useLoaderData<typeof loader>();
+  // A controlled Select with a no-op onChange snaps back to the URL value on
+  // every change, so the range could never actually be changed.
+  const [selectedRange, setSelectedRange] = useState(range);
+  useEffect(() => setSelectedRange(range), [range]);
   const fetcher = useFetcher<typeof action>();
   const result = fetcher.data as { message?: string } | undefined;
   const totals = report.totals;
@@ -51,7 +56,7 @@ export default function ReportsPage() {
           <Card>
             <Form method="get">
               <InlineStack gap="200" blockAlign="end">
-                <Select label="Range" name="range" value={range} onChange={() => undefined} options={[{ label: "Last 7 days", value: "7d" }, { label: "Last 30 days", value: "30d" }, { label: "Last 90 days", value: "90d" }, { label: "Last 12 months", value: "365d" }]} />
+                <Select label="Range" name="range" value={selectedRange} onChange={setSelectedRange} options={[{ label: "Last 7 days", value: "7d" }, { label: "Last 30 days", value: "30d" }, { label: "Last 90 days", value: "90d" }, { label: "Last 12 months", value: "365d" }]} />
                 <Button submit>Apply</Button>
               </InlineStack>
             </Form>

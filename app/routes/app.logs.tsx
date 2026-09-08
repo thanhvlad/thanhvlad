@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import type { LoaderFunctionArgs } from "@remix-run/node";
 import { Form, Link, useLoaderData } from "@remix-run/react";
 import { Badge, BlockStack, Box, Button, Card, EmptyState, InlineStack, Layout, Page, Select, Text, TextField } from "@shopify/polaris";
@@ -30,6 +31,19 @@ const LEVEL_TONE: Record<string, "critical" | "warning" | "info" | undefined> = 
 
 export default function LogsPage() {
   const { logs, jobs, queue, filters } = useLoaderData<typeof loader>();
+  // Polaris passes value/onChange straight to the DOM node, so a controlled
+  // input with a no-op onChange cannot be typed in at all. Local state holds
+  // what the merchant is editing until the GET form submits it.
+  const [q, setQ] = useState(filters.q);
+  const [level, setLevel] = useState(filters.level);
+  const [entity, setEntity] = useState(filters.entity);
+
+  useEffect(() => {
+    setQ(filters.q);
+    setLevel(filters.level);
+    setEntity(filters.entity);
+  }, [filters.q, filters.level, filters.entity]);
+
   const linkFor = (entity: string | null, id: string | null) => {
     if (!entity || !id) return null;
     if (entity === "Order") return `/app/orders/${id}`;
@@ -45,10 +59,10 @@ export default function LogsPage() {
             <Form method="get">
               <InlineStack gap="200" blockAlign="end" wrap>
                 <div style={{ flex: 1, minWidth: 200 }}>
-                  <TextField label="Search" name="q" value={filters.q} onChange={() => undefined} autoComplete="off" />
+                  <TextField label="Search" name="q" value={q} onChange={setQ} autoComplete="off" />
                 </div>
-                <Select label="Level" name="level" value={filters.level} onChange={() => undefined} options={[{ label: "All levels", value: "" }, { label: "Errors", value: "error" }, { label: "Warnings", value: "warn" }, { label: "Info", value: "info" }]} />
-                <Select label="Entity" name="entity" value={filters.entity} onChange={() => undefined} options={[{ label: "All", value: "" }, { label: "Orders", value: "Order" }, { label: "Products", value: "Product" }, { label: "Import list", value: "ImportedProduct" }, { label: "Pricing rules", value: "PricingRule" }, { label: "Supplier accounts", value: "SupplierAccount" }]} />
+                <Select label="Level" name="level" value={level} onChange={setLevel} options={[{ label: "All levels", value: "" }, { label: "Errors", value: "error" }, { label: "Warnings", value: "warn" }, { label: "Info", value: "info" }]} />
+                <Select label="Entity" name="entity" value={entity} onChange={setEntity} options={[{ label: "All", value: "" }, { label: "Orders", value: "Order" }, { label: "Products", value: "Product" }, { label: "Import list", value: "ImportedProduct" }, { label: "Pricing rules", value: "PricingRule" }, { label: "Supplier accounts", value: "SupplierAccount" }]} />
                 <Button submit>Filter</Button>
               </InlineStack>
             </Form>

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
 import { useFetcher, useLoaderData } from "@remix-run/react";
@@ -263,26 +263,48 @@ export default function ProductDetailPage() {
   const [ruleId, setRuleId] = useState("");
 
   const result = fetcher.data as { ok?: boolean; message?: string; error?: string; autoRows?: MappingSuggestionRow[] } | undefined;
-  if (result?.autoRows && result.autoRows.length && !rows.some((r) => r.key.startsWith("auto"))) {
-    setRows(
-      result.autoRows.map((r, i) => ({
-        key: `auto${i}`,
-        productVariantId: r.productVariantId,
-        supplierProductId: data.supplierProducts.find((sp) => sp.variants.some((v) => v.id === r.supplierVariantId))?.id ?? "",
-        supplierVariantId: r.supplierVariantId,
-        quantity: 1,
-        priority: 0,
-        shipToCountry: "*",
-        minQuantity: null,
-        maxQuantity: null,
-        bundleGroup: null,
-        isDefault: true,
-        isEnabled: true,
-        source: r.source,
-        confidence: r.confidence,
-      })),
-    );
-  }
+
+  // Suggestions fill the gaps; they never replace rows the merchant built.
+  // Applying them in the render body replaced the whole table (losing hand-made
+  // mappings), then went silent for every later suggestion, and re-inserted the
+  // whole set as soon as the last auto row was deleted.
+  const [autoNote, setAutoNote] = useState<string | null>(null);
+  const appliedRef = useRef<unknown>(null);
+  useEffect(() => {
+    const auto = result?.autoRows;
+    if (!auto || auto.length === 0) return;
+    if (appliedRef.current === result) return;
+    appliedRef.current = result;
+
+    setRows((current) => {
+      const alreadyMapped = new Set(current.map((r) => r.productVariantId));
+      const additions = auto
+        .filter((r) => !alreadyMapped.has(r.productVariantId))
+        .map((r, i) => ({
+          key: `auto${Date.now()}-${i}`,
+          productVariantId: r.productVariantId,
+          supplierProductId: data.supplierProducts.find((sp) => sp.variants.some((v) => v.id === r.supplierVariantId))?.id ?? "",
+          supplierVariantId: r.supplierVariantId,
+          quantity: 1,
+          priority: 0,
+          shipToCountry: "*",
+          minQuantity: null,
+          maxQuantity: null,
+          bundleGroup: null,
+          isDefault: true,
+          isEnabled: true,
+          source: r.source,
+          confidence: r.confidence,
+        }));
+      const skipped = auto.length - additions.length;
+      setAutoNote(
+        additions.length === 0
+          ? `Every variant the matcher recognised already has a mapping; nothing was changed.`
+          : `Added ${additions.length} suggested mapping(s)${skipped ? `; ${skipped} skipped because the variant is already mapped` : ""}. Nothing is saved until you press Save mapping.`,
+      );
+      return additions.length ? [...current, ...additions] : current;
+    });
+  }, [result, data.supplierProducts]);
 
   const supplierById = useMemo(() => new Map(data.supplierProducts.map((sp) => [sp.id, sp])), [data.supplierProducts]);
   const rowsFor = (variantId: string) => rows.filter((r) => r.productVariantId === variantId);
@@ -331,6 +353,11 @@ export default function ProductDetailPage() {
           {result?.message && (
             <Banner tone="success">
               <p>{result.message}</p>
+            </Banner>
+          )}
+          {autoNote && (
+            <Banner tone="info" onDismiss={() => setAutoNote(null)}>
+              <p>{autoNote}</p>
             </Banner>
           )}
           {result?.error && (

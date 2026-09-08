@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
 import { useFetcher, useLoaderData } from "@remix-run/react";
@@ -71,10 +71,18 @@ export default function SuppliersPage() {
   const [cj, setCj] = useState({ email: "", apiKey: "", label: "", share: true });
   const [mockLabel, setMockLabel] = useState("Mock supplier");
 
-  if (result?.redirect && typeof window !== "undefined") {
-    // OAuth must leave the embedded iframe: open the supplier's consent page at top level.
-    window.open(result.redirect, "_top");
-  }
+  // OAuth must leave the embedded iframe: open the supplier's consent page at
+  // top level. In an effect keyed on the URL, not in the render body — a render
+  // is not a user gesture, so the browser blocks the popup, and it re-fires on
+  // every later re-render of the page.
+  const openedRef = useRef<string | null>(null);
+  useEffect(() => {
+    const target = result?.redirect;
+    if (!target || typeof window === "undefined") return;
+    if (openedRef.current === target) return;
+    openedRef.current = target;
+    window.open(target, "_top");
+  }, [result?.redirect]);
 
   return (
     <Page title="Suppliers" subtitle="Connect the accounts used to search catalogs and place orders.">
@@ -136,15 +144,27 @@ export default function SuppliersPage() {
                         </Text>
                         {a.isDefault && <Badge tone="success">Default</Badge>}
                         {!a.isActive && <Badge tone="critical">Inactive</Badge>}
+                        {a.needsReauth && <Badge tone="critical">Reconnect needed</Badge>}
                         <Badge>{a.scope}</Badge>
                       </InlineStack>
                       <Text as="p" tone="subdued" variant="bodySm">
                         {a.externalUserId ? `ID ${a.externalUserId} · ` : ""}
                         {a.expiresAt ? `token expires ${formatDate(a.expiresAt)} · ` : ""}
                         {a.lastUsedAt ? `last used ${relativeTime(a.lastUsedAt)}` : "never used"}
+                        {a.storeRegisteredAt ? " · store registered" : ""}
                       </Text>
+                      {a.needsReauth && (
+                        <Text as="p" tone="critical" variant="bodySm">
+                          The platform rejected this account{a.lastErrorAt ? ` ${relativeTime(a.lastErrorAt)}` : ""}. Orders will not be placed until you reconnect.
+                        </Text>
+                      )}
                     </BlockStack>
                     <InlineStack gap="100">
+                      {a.needsReauth && (
+                        <Button size="slim" variant="primary" onClick={() => fetcher.submit({ intent: "oauth", platform: a.platform }, { method: "post" })}>
+                          Reconnect
+                        </Button>
+                      )}
                       <Button size="slim" onClick={() => fetcher.submit({ intent: "test", id: a.id }, { method: "post" })} loading={fetcher.state !== "idle"}>
                         Test
                       </Button>

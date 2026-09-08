@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useFetcher, useRevalidator } from "@remix-run/react";
 import { Banner, BlockStack, ProgressBar, Text } from "@shopify/polaris";
 
@@ -20,25 +20,40 @@ interface JobSnapshot {
 export function JobProgress({ jobRunId, title, onDone }: { jobRunId: string | null | undefined; title?: string; onDone?: () => void }) {
   const fetcher = useFetcher<JobSnapshot>();
   const revalidator = useRevalidator();
-  const job = fetcher.data;
-  const finished = job && ["SUCCEEDED", "FAILED", "CANCELED"].includes(job.status);
+  // `fetcher.data` outlives the job it describes, so every read is scoped to the
+  // id currently being watched — otherwise a finished previous job makes the new
+  // one look finished before its first response arrives.
+  const job = fetcher.data && fetcher.data.id === jobRunId ? fetcher.data : undefined;
+  const finished = Boolean(job && ["SUCCEEDED", "FAILED", "CANCELED"].includes(job.status));
+
+  // `useFetcher` hands back a new object whenever its data changes, so the
+  // interval closure would read a frozen `fetcher.data` and poll forever. The
+  // stop condition lives in a ref that the render keeps current instead.
+  const doneRef = useRef(false);
+  doneRef.current = finished;
+
+  const loadRef = useRef(fetcher.load);
+  loadRef.current = fetcher.load;
 
   useEffect(() => {
     if (!jobRunId) return;
+    doneRef.current = false;
     let cancelled = false;
     const load = () => {
-      if (!cancelled) fetcher.load(`/api/jobs/${jobRunId}`);
+      if (!cancelled) loadRef.current(`/api/jobs/${jobRunId}`);
     };
     load();
     const timer = setInterval(() => {
-      if (fetcher.data && ["SUCCEEDED", "FAILED", "CANCELED"].includes(fetcher.data.status)) return;
+      if (doneRef.current) {
+        clearInterval(timer);
+        return;
+      }
       load();
     }, 2000);
     return () => {
       cancelled = true;
       clearInterval(timer);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobRunId]);
 
   useEffect(() => {

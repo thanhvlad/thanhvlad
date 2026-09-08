@@ -8,6 +8,7 @@ import { requireShop } from "~/lib/auth.server";
 import { env } from "~/lib/env.server";
 import { countUnread } from "~/services/notifications.server";
 import { countUnpaid } from "~/services/payments.server";
+import { makeT } from "~/lib/i18n";
 
 export const links = () => [{ rel: "stylesheet", href: polarisStyles }];
 
@@ -18,36 +19,38 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   return {
     apiKey: env().SHOPIFY_API_KEY,
     shopDomain: shop.domain,
+    locale: shop.parsedSettings.ui.locale,
     unread,
     unpaid,
   };
 };
 
 export default function App() {
-  const { apiKey, unread, unpaid } = useLoaderData<typeof loader>();
+  const { apiKey, unread, unpaid, locale } = useLoaderData<typeof loader>();
+  const t = makeT(locale);
 
   return (
     <AppProvider isEmbeddedApp apiKey={apiKey}>
       <NavMenu>
         <Link to="/app" rel="home">
-          Home
+          {t("nav.home")}
         </Link>
-        <Link to="/app/search">Find products</Link>
-        <Link to="/app/import">Import list</Link>
-        <Link to="/app/products">My products</Link>
-        <Link to="/app/orders">Orders</Link>
-        <Link to="/app/payments">{unpaid > 0 ? `Payments (${unpaid})` : "Payments"}</Link>
-        <Link to="/app/tracking">Tracking</Link>
-        <Link to="/app/suppliers">Suppliers</Link>
-        <Link to="/app/pricing">Pricing rules</Link>
-        <Link to="/app/shipping">Shipping</Link>
-        <Link to="/app/inventory">Auto updates</Link>
-        <Link to="/app/reports">Reports</Link>
+        <Link to="/app/search">{t("nav.search")}</Link>
+        <Link to="/app/import">{t("nav.import")}</Link>
+        <Link to="/app/products">{t("nav.products")}</Link>
+        <Link to="/app/orders">{t("nav.orders")}</Link>
+        <Link to="/app/payments">{unpaid > 0 ? `${t("nav.payments")} (${unpaid})` : t("nav.payments")}</Link>
+        <Link to="/app/tracking">{t("nav.tracking")}</Link>
+        <Link to="/app/suppliers">{t("nav.suppliers")}</Link>
+        <Link to="/app/pricing">{t("nav.pricing")}</Link>
+        <Link to="/app/shipping">{t("nav.shipping")}</Link>
+        <Link to="/app/inventory">{t("nav.inventory")}</Link>
+        <Link to="/app/reports">{t("nav.reports")}</Link>
         <Link to="/app/notifications">
-          {unread > 0 ? `Notifications (${unread})` : "Notifications"}
+          {unread > 0 ? `${t("nav.notifications")} (${unread})` : t("nav.notifications")}
         </Link>
-        <Link to="/app/logs">Activity</Link>
-        <Link to="/app/settings">Settings</Link>
+        <Link to="/app/logs">{t("nav.logs")}</Link>
+        <Link to="/app/settings">{t("nav.settings")}</Link>
       </NavMenu>
       <Outlet />
     </AppProvider>
