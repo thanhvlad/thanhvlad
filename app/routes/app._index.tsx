@@ -19,6 +19,7 @@ import { StatusBadge } from "~/components/StatusBadge";
 import { STAGE_ORDER } from "~/domain/orders/pipeline";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { formatMoney, relativeTime } from "~/lib/format";
+import { useT } from "~/lib/use-t";
 import { findOrCreateJobRun } from "~/services/jobs.server";
 import { enqueue } from "~/services/jobs/index.server";
 import { listNotifications } from "~/services/notifications.server";
@@ -66,22 +67,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 export default function Dashboard() {
   const { shop, stats, notifications, onboarding } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
+  const t = useT();
   const steps = [
-    { done: onboarding.supplier, label: "Connect a supplier account", to: "/app/suppliers" },
-    { done: onboarding.pricing, label: "Create a pricing rule", to: "/app/pricing" },
-    { done: onboarding.product, label: "Import your first product", to: "/app/search" },
-    { done: onboarding.order, label: "Sync orders from Shopify", to: "/app/orders" },
+    { done: onboarding.supplier, label: t("dashboard.onboarding.supplier"), to: "/app/suppliers" },
+    { done: onboarding.pricing, label: t("dashboard.onboarding.pricing"), to: "/app/pricing" },
+    { done: onboarding.product, label: t("dashboard.onboarding.product"), to: "/app/search" },
+    { done: onboarding.order, label: t("dashboard.onboarding.order"), to: "/app/orders" },
   ];
   const completed = steps.filter((s) => s.done).length;
 
   return (
     <Page
-      title={`Welcome, ${shop.name}`}
-      subtitle="Dropshipping automation for AliExpress, CJ and more."
-      primaryAction={{ content: "Find products", url: "/app/search" }}
+      title={`${t("page.dashboard.title")}, ${shop.name}`}
+      subtitle={t("page.dashboard.subtitle")}
+      primaryAction={{ content: t("nav.search"), url: "/app/search" }}
       secondaryActions={[
-        { content: "Sync orders", onAction: () => fetcher.submit({ intent: "sync-orders" }, { method: "post" }), loading: fetcher.state !== "idle" },
-        { content: "Check supplier orders", onAction: () => fetcher.submit({ intent: "sync-suppliers" }, { method: "post" }) },
+        { content: t("dashboard.action.syncOrders"), onAction: () => fetcher.submit({ intent: "sync-orders" }, { method: "post" }), loading: fetcher.state !== "idle" },
+        { content: t("dashboard.action.checkSupplierOrders"), onAction: () => fetcher.submit({ intent: "sync-suppliers" }, { method: "post" }) },
       ]}
     >
       <Layout>
@@ -91,10 +93,10 @@ export default function Dashboard() {
               <BlockStack gap="300">
                 <InlineStack align="space-between" blockAlign="center">
                   <Text as="h2" variant="headingMd">
-                    Get started
+                    {t("dashboard.getStarted")}
                   </Text>
                   <Text as="span" tone="subdued">
-                    {completed}/{steps.length} done
+                    {completed}/{steps.length} {t("dashboard.stepsDone")}
                   </Text>
                 </InlineStack>
                 <ProgressBar progress={(completed / steps.length) * 100} size="small" />
@@ -102,7 +104,7 @@ export default function Dashboard() {
                   {steps.map((step) => (
                     <List.Item key={step.label}>
                       <InlineStack gap="200" blockAlign="center">
-                        {step.done ? <Badge tone="success">Done</Badge> : <Badge>To do</Badge>}
+                        {step.done ? <Badge tone="success">{t("common.done")}</Badge> : <Badge>{t("common.toDo")}</Badge>}
                         <Link to={step.to}>{step.label}</Link>
                       </InlineStack>
                     </List.Item>
@@ -115,10 +117,14 @@ export default function Dashboard() {
 
         <Layout.Section>
           <InlineGrid columns={{ xs: 1, sm: 2, md: 4 }} gap="400">
-            <Stat label="Revenue (7 days)" value={formatMoney(stats.week.revenue, shop.currency)} />
-            <Stat label="Profit (7 days)" value={formatMoney(stats.week.profit, shop.currency)} />
-            <Stat label="Orders (7 days)" value={String(stats.week.orders)} />
-            <Stat label="Managed products" value={`${stats.products.total}`} hint={`${stats.products.unmapped} unmapped`} />
+            <Stat label={t("dashboard.stat.revenue7d")} value={formatMoney(stats.week.revenue, shop.currency)} />
+            <Stat label={t("dashboard.stat.profit7d")} value={formatMoney(stats.week.profit, shop.currency)} />
+            <Stat label={t("dashboard.stat.orders7d")} value={String(stats.week.orders)} />
+            <Stat
+              label={t("dashboard.stat.managedProducts")}
+              value={`${stats.products.total}`}
+              hint={`${stats.products.unmapped} ${t("dashboard.stat.unmapped")}`}
+            />
           </InlineGrid>
         </Layout.Section>
 
@@ -126,7 +132,7 @@ export default function Dashboard() {
           <Card>
             <BlockStack gap="300">
               <Text as="h2" variant="headingMd">
-                Orders pipeline
+                {t("dashboard.ordersPipeline")}
               </Text>
               <Grid>
                 {STAGE_ORDER.map((stage) => (
@@ -146,7 +152,8 @@ export default function Dashboard() {
               </Grid>
               {stats.recentFailures > 0 && (
                 <Text as="p" tone="critical">
-                  {stats.recentFailures} order(s) failed at the supplier. <Link to="/app/orders?stage=FAILED">Review them</Link>.
+                  {stats.recentFailures} {t("dashboard.ordersFailedAtSupplier")}{" "}
+                  <Link to="/app/orders?stage=FAILED">{t("dashboard.reviewThem")}</Link>.
                 </Text>
               )}
             </BlockStack>
@@ -158,13 +165,13 @@ export default function Dashboard() {
             <BlockStack gap="300">
               <InlineStack align="space-between">
                 <Text as="h2" variant="headingMd">
-                  Needs attention
+                  {t("common.needsAttention")}
                 </Text>
-                <Link to="/app/notifications">View all</Link>
+                <Link to="/app/notifications">{t("common.viewAll")}</Link>
               </InlineStack>
               {notifications.length === 0 ? (
                 <Text as="p" tone="subdued">
-                  Nothing right now.
+                  {t("dashboard.nothingRightNow")}
                 </Text>
               ) : (
                 <BlockStack gap="200">
@@ -197,22 +204,26 @@ export default function Dashboard() {
           <Card>
             <BlockStack gap="300">
               <Text as="h2" variant="headingMd">
-                Quick actions
+                {t("dashboard.quickActions")}
               </Text>
               <BlockStack gap="200">
-                <Button url="/app/search">Find & import products</Button>
+                <Button url="/app/search">{t("dashboard.quick.findImport")}</Button>
                 <Button url="/app/import" disabled={stats.importCount === 0}>
-                  {stats.importCount > 0 ? `Review import list (${stats.importCount})` : "Import list is empty"}
+                  {stats.importCount > 0
+                    ? `${t("dashboard.quick.reviewImportList")} (${stats.importCount})`
+                    : t("dashboard.quick.importListEmpty")}
                 </Button>
                 <Button url="/app/orders?stage=AWAITING_ORDER" disabled={stats.stages.AWAITING_ORDER === 0}>
-                  {stats.stages.AWAITING_ORDER > 0 ? `Place ${stats.stages.AWAITING_ORDER} ready order(s)` : "No orders ready"}
+                  {stats.stages.AWAITING_ORDER > 0
+                    ? `${t("dashboard.quick.place")} ${stats.stages.AWAITING_ORDER} ${t("dashboard.quick.readyOrders")}`
+                    : t("dashboard.quick.noOrdersReady")}
                 </Button>
-                <Button url="/app/inventory">Run auto-update</Button>
-                <Button url="/app/reports">Open reports</Button>
+                <Button url="/app/inventory">{t("dashboard.quick.runAutoUpdate")}</Button>
+                <Button url="/app/reports">{t("dashboard.quick.openReports")}</Button>
               </BlockStack>
               {stats.activeJobs > 0 && (
                 <Text as="p" tone="subdued">
-                  {stats.activeJobs} background job(s) running.
+                  {stats.activeJobs} {t("dashboard.backgroundJobsRunning")}
                 </Text>
               )}
             </BlockStack>

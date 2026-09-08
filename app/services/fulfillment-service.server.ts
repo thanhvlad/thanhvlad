@@ -2,6 +2,7 @@ import type { FulfillmentRequestStatus, Prisma } from "@prisma/client";
 import prisma from "~/db.server";
 import { errorMessage } from "~/lib/errors";
 import { env } from "~/lib/env.server";
+import { blocksPlacement } from "~/domain/orders/pipeline";
 import { logger } from "~/lib/logger.server";
 import { logActivity } from "./activity.server";
 import { notify } from "./notifications.server";
@@ -281,7 +282,10 @@ export async function handleFulfillmentRequest(shop: ShopWithSettings, topic: st
   // Decide before answering Shopify: rejecting with a reason is far more useful
   // to the merchant than accepting and then failing silently.
   const evaluated = await evaluateAndStoreOrder(shop, order.id);
-  const blocking = orderIssues(evaluated).filter((i) => i.severity === "error");
+  // `blocksPlacement` rather than a bare severity check: a purchase order that
+  // failed earlier is an error worth showing, but it is not a reason to refuse
+  // to place the lines that are still outstanding.
+  const blocking = orderIssues(evaluated).filter(blocksPlacement);
   const unresolvedMapping = blocking.filter((i) => i.code.startsWith("NO_MAPPING") || i.code === "MAPPING_NOT_RESOLVED");
 
   if (unresolvedMapping.length > 0) {

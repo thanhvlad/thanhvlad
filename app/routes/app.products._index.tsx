@@ -10,6 +10,7 @@ import prisma from "~/db.server";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatMoney, pageParam, relativeTime } from "~/lib/format";
+import { useMessage, useT } from "~/lib/use-t";
 import { createJobRun } from "~/services/jobs.server";
 import { enqueue } from "~/services/jobs/index.server";
 import { listPricingRules } from "~/services/pricing.server";
@@ -65,26 +66,28 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       case "reprice": {
         let n = 0;
         for (const id of ids) n += await repriceProduct(shop, graphql, id, get("ruleId") || null, actor);
-        return { ok: true, message: `${n} variant(s) repriced.` };
+        return { ok: true, messageKey: "msg.variantsRepriced", messageVars: { n } };
       }
       case "auto-on":
         await setAutoUpdate(shop.id, ids, true);
-        return { ok: true, message: `Auto-update enabled for ${ids.length} product(s).` };
+        return { ok: true, messageKey: "msg.autoUpdateEnabled", messageVars: { n: ids.length } };
       case "auto-off":
         await setAutoUpdate(shop.id, ids, false);
-        return { ok: true, message: `Auto-update disabled for ${ids.length} product(s).` };
+        return { ok: true, messageKey: "msg.autoUpdateDisabled", messageVars: { n: ids.length } };
       case "sync-now": {
         const job = await createJobRun({ shopId: shop.id, type: "inventory-sync", total: ids.length });
         await enqueue("inventory-sync", { shopId: shop.id, productIds: ids, jobRunId: job.id, actor });
-        return { ok: true, message: `Auto-update queued for ${ids.length} product(s).`, jobRunId: job.id };
+        return { ok: true, messageKey: "msg.autoUpdateQueued", messageVars: { n: ids.length }, jobRunId: job.id };
       }
       case "delete": {
         const result = await deleteProducts(shop, graphql, ids, { alsoInShopify: get("alsoInShopify") === "true" }, actor);
-        return { ok: true, message: `${result.removed} product(s) removed${result.deletedRemote ? `, ${result.deletedRemote} deleted in Shopify` : ""}.` };
+        return result.deletedRemote
+          ? { ok: true, messageKey: "msg.productsDeletedRemote", messageVars: { n: result.removed, remote: result.deletedRemote } }
+          : { ok: true, messageKey: "msg.productsDeleted", messageVars: { n: result.removed } };
       }
       case "refresh": {
         const rows = await Promise.all(ids.map((id) => syncByLocalId(shop, graphql, id)));
-        return { ok: true, message: `${rows.filter(Boolean).length}/${ids.length} product(s) refreshed from Shopify.` };
+        return { ok: true, messageKey: "msg.productsRefreshed", messageVars: { n: rows.filter(Boolean).length, total: ids.length } };
       }
       case "link": {
         const gids = getAll("shopifyProductIds").flatMap((v) => v.split(",")).filter(Boolean);
@@ -93,7 +96,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           await importExistingShopifyProduct(shop, graphql, gid, actor);
           n += 1;
         }
-        return { ok: true, message: `${n} Shopify product(s) linked. Open each product to map suppliers.` };
+        return { ok: true, messageKey: "msg.productsLinked", messageVars: { n } };
       }
       default:
         return { ok: false, error: "Unknown action" };
@@ -110,8 +113,10 @@ async function syncByLocalId(shop: Awaited<ReturnType<typeof requireShop>>["shop
 }
 
 export default function ProductsPage() {
+  const t = useT();
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
+  const actionMessage = useMessage(fetcher.data as Parameters<typeof useMessage>[0]);
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const shopify = useAppBridge();
@@ -141,16 +146,16 @@ export default function ProductsPage() {
 
   return (
     <Page
-      title="My products"
-      subtitle={`${data.counts.total} managed · ${data.counts.unmapped} unmapped · ${data.counts.autoUpdate} on auto-update`}
-      primaryAction={{ content: "Link existing Shopify product", onAction: linkExisting }}
-      secondaryActions={[{ content: "Import list", url: "/app/import" }]}
+      title={t("page.products.title")}
+      subtitle={`${data.counts.total} ${t("products.subtitle.managed")} · ${data.counts.unmapped} ${t("products.subtitle.unmapped")} · ${data.counts.autoUpdate} ${t("products.subtitle.onAutoUpdate")}`}
+      primaryAction={{ content: t("products.action.linkExisting"), onAction: linkExisting }}
+      secondaryActions={[{ content: t("nav.import"), url: "/app/import" }]}
     >
       <Layout>
         <Layout.Section>
-          {fetcher.data && "message" in fetcher.data && fetcher.data.message && (
+          {actionMessage && (
             <Banner tone="success">
-              <p>{fetcher.data.message}</p>
+              <p>{actionMessage}</p>
             </Banner>
           )}
           {fetcher.data && "error" in fetcher.data && fetcher.data.error && (
@@ -165,39 +170,39 @@ export default function ProductsPage() {
               <BlockStack gap="300">
                 <InlineStack gap="300" blockAlign="end" wrap>
                   <div style={{ flex: 1, minWidth: 240 }}>
-                    <TextField label="Search" labelHidden value={search} onChange={setSearch} autoComplete="off" placeholder="Search products" connectedRight={<Button onClick={() => setFilter("q", search)}>Search</Button>} />
+                    <TextField label={t("action.search")} labelHidden value={search} onChange={setSearch} autoComplete="off" placeholder={t("products.searchPlaceholder")} connectedRight={<Button onClick={() => setFilter("q", search)}>{t("action.search")}</Button>} />
                   </div>
-                  <Select label="Mapping" labelHidden options={[{ label: "All products", value: "all" }, { label: "Mapped", value: "mapped" }, { label: "Unmapped", value: "unmapped" }]} value={data.mapped} onChange={(v) => setFilter("mapped", v === "all" ? "" : v)} />
+                  <Select label={t("products.column.mapping")} labelHidden options={[{ label: t("products.filter.all"), value: "all" }, { label: t("products.filter.mapped"), value: "mapped" }, { label: t("products.filter.unmapped"), value: "unmapped" }]} value={data.mapped} onChange={(v) => setFilter("mapped", v === "all" ? "" : v)} />
                 </InlineStack>
                 {selectedResources.length > 0 && (
                   <InlineStack gap="200" wrap>
-                    <Select label="Rule" labelHidden options={[{ label: "Default pricing rule", value: "" }, ...data.rules.map((r) => ({ label: r.name, value: r.id }))]} value={ruleId} onChange={setRuleId} />
-                    <Button onClick={() => submit("reprice", { ruleId })}>Reprice</Button>
-                    <Button onClick={() => submit("sync-now")}>Run auto-update</Button>
-                    <Button onClick={() => submit("auto-on")}>Enable auto-update</Button>
-                    <Button onClick={() => submit("auto-off")}>Disable auto-update</Button>
-                    <Button onClick={() => submit("refresh")}>Refresh from Shopify</Button>
+                    <Select label={t("products.pricing.rule")} labelHidden options={[{ label: t("products.pricing.defaultRule"), value: "" }, ...data.rules.map((r) => ({ label: r.name, value: r.id }))]} value={ruleId} onChange={setRuleId} />
+                    <Button onClick={() => submit("reprice", { ruleId })}>{t("products.action.reprice")}</Button>
+                    <Button onClick={() => submit("sync-now")}>{t("products.action.runAutoUpdate")}</Button>
+                    <Button onClick={() => submit("auto-on")}>{t("products.action.enableAutoUpdate")}</Button>
+                    <Button onClick={() => submit("auto-off")}>{t("products.action.disableAutoUpdate")}</Button>
+                    <Button onClick={() => submit("refresh")}>{t("products.action.refreshFromShopify")}</Button>
                     <Button tone="critical" onClick={() => submit("delete", { alsoInShopify: "false" })}>
-                      Unlink
+                      {t("products.action.unlink")}
                     </Button>
                     <Button tone="critical" variant="primary" onClick={() => submit("delete", { alsoInShopify: "true" })}>
-                      Delete in Shopify
+                      {t("products.action.deleteInShopify")}
                     </Button>
                   </InlineStack>
                 )}
               </BlockStack>
             </div>
             {items.length === 0 ? (
-              <EmptyState heading="No managed products yet" image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png" action={{ content: "Find products", url: "/app/search" }} secondaryAction={{ content: "Link existing product", onAction: linkExisting }}>
-                <p>Products pushed from the import list, or linked from your store, show up here with their supplier mapping.</p>
+              <EmptyState heading={t("products.empty.heading")} image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png" action={{ content: t("nav.search"), url: "/app/search" }} secondaryAction={{ content: t("products.empty.linkExisting"), onAction: linkExisting }}>
+                <p>{t("products.empty.body")}</p>
               </EmptyState>
             ) : (
               <IndexTable
-                resourceName={{ singular: "product", plural: "products" }}
+                resourceName={{ singular: t("products.resource.singular"), plural: t("products.resource.plural") }}
                 itemCount={items.length}
                 selectedItemsCount={allResourcesSelected ? "All" : selectedResources.length}
                 onSelectionChange={handleSelectionChange}
-                headings={[{ title: "Product" }, { title: "Mapping" }, { title: "Cost" }, { title: "Price" }, { title: "Stock" }, { title: "Auto-update" }, { title: "Status" }]}
+                headings={[{ title: t("products.column.product") }, { title: t("products.column.mapping") }, { title: t("common.cost") }, { title: t("common.price") }, { title: t("common.stock") }, { title: t("products.column.autoUpdate") }, { title: t("common.status") }]}
               >
                 {items.map((item, index) => (
                   <IndexTable.Row id={item.id} key={item.id} position={index} selected={selectedResources.includes(item.id)}>
@@ -211,16 +216,16 @@ export default function ProductsPage() {
                             </Text>
                           </Link>
                           <Text as="span" tone="subdued" variant="bodySm">
-                            {item.variants} variant(s)
+                            {item.variants} {t("products.variantCount")}
                           </Text>
                         </BlockStack>
                       </InlineStack>
                     </IndexTable.Cell>
                     <IndexTable.Cell>
                       {item.mappedRows > 0 ? (
-                        <Badge tone={item.mappingEnabled ? "success" : "attention"}>{`${item.mappingType} · ${item.mappedRows} rows`}</Badge>
+                        <Badge tone={item.mappingEnabled ? "success" : "attention"}>{`${item.mappingType} · ${item.mappedRows} ${t("products.mappingRows")}`}</Badge>
                       ) : (
-                        <Badge tone="critical">Unmapped</Badge>
+                        <Badge tone="critical">{t("common.notMapped")}</Badge>
                       )}
                     </IndexTable.Cell>
                     <IndexTable.Cell>
@@ -234,7 +239,7 @@ export default function ProductsPage() {
                     <IndexTable.Cell>{item.stock}</IndexTable.Cell>
                     <IndexTable.Cell>
                       <BlockStack gap="050">
-                        <Badge tone={item.autoUpdate ? "success" : undefined}>{item.autoUpdate ? "On" : "Off"}</Badge>
+                        <Badge tone={item.autoUpdate ? "success" : undefined}>{item.autoUpdate ? t("common.on") : t("common.off")}</Badge>
                         {item.lastSyncedAt && (
                           <Text as="span" tone="subdued" variant="bodySm">
                             {relativeTime(item.lastSyncedAt)}

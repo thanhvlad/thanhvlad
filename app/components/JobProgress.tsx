@@ -1,6 +1,8 @@
 import { useEffect, useRef } from "react";
 import { useFetcher, useRevalidator } from "@remix-run/react";
 import { Banner, BlockStack, ProgressBar, Text } from "@shopify/polaris";
+import type { I18nKey, Translator } from "~/lib/i18n";
+import { useT } from "~/lib/use-t";
 
 interface JobSnapshot {
   id: string;
@@ -18,6 +20,7 @@ interface JobSnapshot {
  * when it finishes, so tables refresh without a manual reload.
  */
 export function JobProgress({ jobRunId, title, onDone }: { jobRunId: string | null | undefined; title?: string; onDone?: () => void }) {
+  const t = useT();
   const fetcher = useFetcher<JobSnapshot>();
   const revalidator = useRevalidator();
   // `fetcher.data` outlives the job it describes, so every read is scoped to the
@@ -68,11 +71,11 @@ export function JobProgress({ jobRunId, title, onDone }: { jobRunId: string | nu
   const percent = job.total > 0 ? Math.round((job.processed / job.total) * 100) : job.status === "SUCCEEDED" ? 100 : 0;
 
   return (
-    <Banner tone={job.status === "FAILED" || job.failed > 0 ? "warning" : finished ? "success" : "info"} title={title ?? jobTitle(job.type)}>
+    <Banner tone={job.status === "FAILED" || job.failed > 0 ? "warning" : finished ? "success" : "info"} title={title ?? jobTitle(job.type, t)}>
       <BlockStack gap="200">
         <ProgressBar progress={percent} size="small" />
         <Text as="p">
-          {job.processed}/{job.total} processed · {job.succeeded} succeeded · {job.failed} failed
+          {job.processed}/{job.total} {t("job.processed")} · {job.succeeded} {t("job.succeeded")} · {job.failed} {t("job.failed")}
           {job.error ? ` · ${job.error}` : ""}
         </Text>
       </BlockStack>
@@ -80,19 +83,7 @@ export function JobProgress({ jobRunId, title, onDone }: { jobRunId: string | nu
   );
 }
 
-function jobTitle(type: string) {
-  switch (type) {
-    case "push-products":
-      return "Pushing products to Shopify";
-    case "place-orders":
-      return "Placing supplier orders";
-    case "sync-orders":
-      return "Syncing orders from Shopify";
-    case "inventory-sync":
-      return "Running auto-update";
-    case "sync-purchase-orders":
-      return "Syncing supplier orders";
-    default:
-      return type;
-  }
+/** The job's own type is the fallback for a job with no translated name. */
+function jobTitle(type: string, t: Translator) {
+  return t(`job.${type}` as I18nKey) ?? type;
 }

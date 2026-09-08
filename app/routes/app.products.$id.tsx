@@ -27,6 +27,7 @@ import { FAILURE_LABELS } from "~/domain/mapping/resolve";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { adminUrl, formatMoney, legacyId, relativeTime } from "~/lib/format";
+import { useMessage, useT } from "~/lib/use-t";
 import { addSupplierProductForMapping, getMapping, getSupplierProductWithVariants, resolveForVariant, saveMapping, suggestMappingForProduct, supplierProductsForProduct, type MappingRowInput, type MappingSuggestionRow } from "~/services/mapping.server";
 import { aiMappingAvailable } from "~/services/ai-mapping.server";
 import { dismissCandidate, findAlternativeSuppliers, getComparison, switchSupplier } from "~/services/supplier-comparison.server";
@@ -34,12 +35,13 @@ import { listPricingRules } from "~/services/pricing.server";
 import { deleteProducts, getProduct, repriceProduct, setAutoUpdate, syncProductFromShopify } from "~/services/products.server";
 import { priceHistory } from "~/services/suppliers/catalog.server";
 
-const MAPPING_HELP: Record<MappingType, string> = {
-  BASIC: "One supplier SKU per variant. The simplest setup.",
-  ADVANCED: "Rank several supplier SKUs per variant, optionally per destination country. The first in-stock option wins.",
-  BOGO: "Choose the supplier SKU and quantity by how many units the customer ordered (e.g. buy 2 → ship a 3-pack).",
-  BUNDLE: "Fulfil one variant with several supplier SKUs at once (all components must be in stock).",
-};
+/** Translation keys for the help text under the mapping type selector. */
+const MAPPING_HELP = {
+  BASIC: "products.mapping.help.basic",
+  ADVANCED: "products.mapping.help.advanced",
+  BOGO: "products.mapping.help.bogo",
+  BUNDLE: "products.mapping.help.bundle",
+} as const satisfies Record<MappingType, string>;
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
@@ -163,7 +165,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     switch (intent) {
       case "save-mapping": {
         await saveMapping(shop.id, id, { type: get("type") as MappingType, isEnabled: get("isEnabled") !== "false", notes: get("notes") || null, rows: json<MappingRowInput[]>("rows", []) }, actor);
-        return { ok: true, message: "Mapping saved." };
+        return { ok: true, messageKey: "msg.mappingSaved" };
       }
       case "add-supplier": {
         const sp = await addSupplierProductForMapping(shop.id, get("reference"));
@@ -175,28 +177,37 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       case "auto-map": {
         const useAi = get("useAi") === "true";
         const suggestion = await suggestMappingForProduct(id, get("supplierProductId"), { useAi, shopId: shop.id });
-        const parts = [`${suggestion.rows.length} variant(s) matched`];
-        if (suggestion.aiUsed) parts.push("AI resolved the harder ones");
-        if (suggestion.unresolved) parts.push(`${suggestion.unresolved} still need you`);
-        if (suggestion.aiError) parts.push(`AI unavailable: ${suggestion.aiError}`);
-        return { ok: true, message: `${parts.join(" · ")}.`, autoRows: suggestion.rows };
+        // The pieces are translated on the page; the action only says which
+        // ones apply and with what numbers.
+        return {
+          ok: true,
+          messageKey: suggestion.unresolved ? "msg.autoMappedUnresolved" : "msg.autoMapped",
+          messageVars: { n: suggestion.rows.length, unresolved: suggestion.unresolved },
+          aiUsed: suggestion.aiUsed,
+          aiError: suggestion.aiError,
+          autoRows: suggestion.rows,
+        };
       }
       case "compare-suppliers": {
         const result = await findAlternativeSuppliers(shop, id, { actor });
-        return {
-          ok: true,
-          message: result.rows.length
-            ? `Compared ${result.rows.length} supplier(s).${result.betterOption ? ` A cheaper one saves ${result.betterOption.savingsVsCurrent} per unit.` : " The current supplier is still the best."}`
-            : "No comparable suppliers were found.",
-        };
+        if (result.rows.length === 0) return { ok: true, messageKey: "msg.noComparableSuppliers" };
+        return result.betterOption
+          ? {
+              ok: true,
+              messageKey: "msg.comparedWithBetter",
+              messageVars: { n: result.rows.length, saving: String(result.betterOption.savingsVsCurrent) },
+            }
+          : { ok: true, messageKey: "msg.comparedCurrentBest", messageVars: { n: result.rows.length } };
       }
       case "switch-supplier": {
         const suggestion = await switchSupplier(shop, id, get("supplierProductId"), actor);
-        return { ok: true, message: `Switched supplier; ${suggestion.rows.length} variant(s) mapped${suggestion.unresolved ? `, ${suggestion.unresolved} left for you` : ""}.` };
+        return suggestion.unresolved
+          ? { ok: true, messageKey: "msg.supplierSwitchedUnresolved", messageVars: { n: suggestion.rows.length, unresolved: suggestion.unresolved } }
+          : { ok: true, messageKey: "msg.supplierSwitched", messageVars: { n: suggestion.rows.length } };
       }
       case "dismiss-candidate": {
         await dismissCandidate(shop, id, get("supplierProductId"));
-        return { ok: true, message: "Hidden from the comparison." };
+        return { ok: true, messageKey: "msg.candidateHidden" };
       }
       case "preview": {
         const product = await getProduct(shop.id, id);
@@ -208,16 +219,16 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       }
       case "reprice": {
         const n = await repriceProduct(shop, graphql, id, get("ruleId") || null, actor);
-        return { ok: true, message: `${n} variant(s) repriced.` };
+        return { ok: true, messageKey: "msg.variantsRepriced", messageVars: { n } };
       }
       case "toggle-auto": {
         await setAutoUpdate(shop.id, [id], get("enabled") === "true");
-        return { ok: true, message: `Auto-update ${get("enabled") === "true" ? "enabled" : "disabled"}.` };
+        return { ok: true, messageKey: get("enabled") === "true" ? "msg.autoUpdateEnabledOne" : "msg.autoUpdateDisabledOne" };
       }
       case "refresh": {
         const product = await getProduct(shop.id, id);
         if (product) await syncProductFromShopify(shop, graphql, product.shopifyProductId);
-        return { ok: true, message: "Refreshed from Shopify." };
+        return { ok: true, messageKey: "msg.refreshedFromShopify" };
       }
       case "delete": {
         await deleteProducts(shop, graphql, [id], { alsoInShopify: get("alsoInShopify") === "true" }, actor);
@@ -250,6 +261,7 @@ type Row = {
 };
 
 export default function ProductDetailPage() {
+  const t = useT();
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const previewFetcher = useFetcher<typeof action>();
@@ -262,7 +274,9 @@ export default function ProductDetailPage() {
   const [previewQty, setPreviewQty] = useState("1");
   const [ruleId, setRuleId] = useState("");
 
-  const result = fetcher.data as { ok?: boolean; message?: string; error?: string; autoRows?: MappingSuggestionRow[] } | undefined;
+  const result = fetcher.data as { ok?: boolean; message?: string; error?: string; aiUsed?: boolean; aiError?: string | null; autoRows?: MappingSuggestionRow[] } | undefined;
+
+  const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
 
   // Suggestions fill the gaps; they never replace rows the merchant built.
   // Applying them in the render body replaced the whole table (losing hand-made
@@ -299,12 +313,12 @@ export default function ProductDetailPage() {
       const skipped = auto.length - additions.length;
       setAutoNote(
         additions.length === 0
-          ? `Every variant the matcher recognised already has a mapping; nothing was changed.`
-          : `Added ${additions.length} suggested mapping(s)${skipped ? `; ${skipped} skipped because the variant is already mapped` : ""}. Nothing is saved until you press Save mapping.`,
+          ? t("products.autoMap.nothingChanged")
+          : `${t("products.autoMap.added")} ${additions.length}${skipped ? ` · ${skipped} ${t("products.autoMap.skipped")}` : ""}. ${t("products.autoMap.saveReminder")}`,
       );
       return additions.length ? [...current, ...additions] : current;
     });
-  }, [result, data.supplierProducts]);
+  }, [result, data.supplierProducts, t]);
 
   const supplierById = useMemo(() => new Map(data.supplierProducts.map((sp) => [sp.id, sp])), [data.supplierProducts]);
   const rowsFor = (variantId: string) => rows.filter((r) => r.productVariantId === variantId);
@@ -335,24 +349,30 @@ export default function ProductDetailPage() {
       backAction={{ url: "/app/products" }}
       title={data.product.title}
       titleMetadata={<StatusBadge status={data.product.status} />}
-      primaryAction={{ content: "Save mapping", onAction: save, loading: fetcher.state !== "idle" }}
+      primaryAction={{ content: t("products.action.saveMapping"), onAction: save, loading: fetcher.state !== "idle" }}
       secondaryActions={[
-        { content: "Open in Shopify", url: adminUrl(data.shopDomain, `/products/${legacyId(data.product.shopifyProductId)}`), external: true },
-        { content: "Refresh from Shopify", onAction: () => fetcher.submit({ intent: "refresh" }, { method: "post" }) },
-        { content: data.product.autoUpdate ? "Disable auto-update" : "Enable auto-update", onAction: () => fetcher.submit({ intent: "toggle-auto", enabled: String(!data.product.autoUpdate) }, { method: "post" }) },
-        { content: "Unlink from app", destructive: true, onAction: () => fetcher.submit({ intent: "delete", alsoInShopify: "false" }, { method: "post" }) },
+        { content: t("products.action.openInShopify"), url: adminUrl(data.shopDomain, `/products/${legacyId(data.product.shopifyProductId)}`), external: true },
+        { content: t("products.action.refreshFromShopify"), onAction: () => fetcher.submit({ intent: "refresh" }, { method: "post" }) },
+        { content: data.product.autoUpdate ? t("products.action.disableAutoUpdate") : t("products.action.enableAutoUpdate"), onAction: () => fetcher.submit({ intent: "toggle-auto", enabled: String(!data.product.autoUpdate) }, { method: "post" }) },
+        { content: t("products.action.unlinkFromApp"), destructive: true, onAction: () => fetcher.submit({ intent: "delete", alsoInShopify: "false" }, { method: "post" }) },
       ]}
     >
       <Layout>
         <Layout.Section>
           {data.loadedMessage && (
             <Banner tone="success">
-              <p>Supplier product “{data.loadedMessage}” loaded. Pick its SKUs below or use auto-map.</p>
+              <p>
+                “{data.loadedMessage}” — {t("products.supplierLoaded")}
+              </p>
             </Banner>
           )}
-          {result?.message && (
+          {actionMessage && (
             <Banner tone="success">
-              <p>{result.message}</p>
+              <p>
+                {actionMessage}
+                {result?.aiUsed ? ` ${t("msg.autoMapAiUsed")}` : ""}
+                {result?.aiError ? ` ${t("msg.autoMapAiUnavailable")}: ${result.aiError}` : ""}
+              </p>
             </Banner>
           )}
           {autoNote && (
@@ -372,25 +392,25 @@ export default function ProductDetailPage() {
             <BlockStack gap="400">
               <InlineStack align="space-between" blockAlign="center">
                 <Text as="h2" variant="headingMd">
-                  Supplier mapping
+                  {t("products.mapping.title")}
                 </Text>
-                <Checkbox label="Mapping enabled" checked={enabled} onChange={setEnabled} />
+                <Checkbox label={t("products.mapping.enabled")} checked={enabled} onChange={setEnabled} />
               </InlineStack>
               <InlineGrid columns={{ xs: 1, md: ["oneThird", "twoThirds"] }} gap="300">
                 <Select
-                  label="Mapping type"
+                  label={t("products.mapping.typeLabel")}
                   value={type}
                   onChange={(v) => setType(v as MappingType)}
                   options={[
-                    { label: "Basic", value: "BASIC" },
-                    { label: "Advanced (ranked / per country)", value: "ADVANCED" },
-                    { label: "BOGO / quantity tiers", value: "BOGO" },
-                    { label: "Bundle", value: "BUNDLE" },
+                    { label: t("products.mapping.type.basic"), value: "BASIC" },
+                    { label: t("products.mapping.type.advanced"), value: "ADVANCED" },
+                    { label: t("products.mapping.type.bogo"), value: "BOGO" },
+                    { label: t("products.mapping.type.bundle"), value: "BUNDLE" },
                   ]}
                 />
                 <Box paddingBlockStart="600">
                   <Text as="p" tone="subdued">
-                    {MAPPING_HELP[type]}
+                    {t(MAPPING_HELP[type])}
                   </Text>
                 </Box>
               </InlineGrid>
@@ -398,19 +418,19 @@ export default function ProductDetailPage() {
               <Divider />
               <BlockStack gap="200">
                 <Text as="h3" variant="headingSm">
-                  Supplier products
+                  {t("products.supplierProducts")}
                 </Text>
                 <InlineStack gap="200" blockAlign="end">
                   <div style={{ flex: 1 }}>
-                    <TextField label="Add supplier product by URL or ID" value={supplierRef} onChange={setSupplierRef} autoComplete="off" placeholder="https://www.aliexpress.com/item/1005006001.html" />
+                    <TextField label={t("products.addSupplier.label")} value={supplierRef} onChange={setSupplierRef} autoComplete="off" placeholder="https://www.aliexpress.com/item/1005006001.html" />
                   </div>
                   <Button onClick={() => fetcher.submit({ intent: "add-supplier", reference: supplierRef, suppliers: data.loadedSuppliers.join(",") }, { method: "post" })} disabled={!supplierRef.trim()} loading={fetcher.state !== "idle"}>
-                    Load
+                    {t("products.action.load")}
                   </Button>
                 </InlineStack>
                 {data.supplierProducts.length === 0 ? (
                   <Text as="p" tone="subdued">
-                    No supplier product loaded yet. Paste a link above.
+                    {t("products.noSupplierLoaded")}
                   </Text>
                 ) : (
                   <InlineGrid columns={{ xs: 1, md: 2 }} gap="200">
@@ -424,12 +444,12 @@ export default function ProductDetailPage() {
                             </Text>
                             <InlineStack gap="100">
                               <PlatformBadge platform={sp.platform} />
-                              {!sp.isAvailable && <Badge tone="critical">Unavailable</Badge>}
+                              {!sp.isAvailable && <Badge tone="critical">{t("common.unavailable")}</Badge>}
                               <Badge>{`${sp.variants.length} SKUs`}</Badge>
                             </InlineStack>
                             <InlineStack gap="200" wrap>
                               <Button size="slim" onClick={() => fetcher.submit({ intent: "auto-map", supplierProductId: sp.id, useAi: "false" }, { method: "post" })}>
-                                Auto-map
+                                {t("action.autoMap")}
                               </Button>
                               <Button
                                 size="slim"
@@ -438,11 +458,11 @@ export default function ProductDetailPage() {
                                 loading={fetcher.state !== "idle"}
                                 onClick={() => fetcher.submit({ intent: "auto-map", supplierProductId: sp.id, useAi: "true" }, { method: "post" })}
                               >
-                                {data.aiAvailable ? "Match with AI" : "AI (no API key)"}
+                                {data.aiAvailable ? t("action.matchWithAi") : t("products.aiNoKey")}
                               </Button>
                               {sp.url && (
                                 <Button size="slim" url={sp.url} external>
-                                  Open
+                                  {t("common.open")}
                                 </Button>
                               )}
                             </InlineStack>
@@ -465,16 +485,17 @@ export default function ProductDetailPage() {
                             {variant.title}
                           </Text>
                           <Text as="span" tone="subdued" variant="bodySm">
-                            {variant.sku ? `SKU ${variant.sku} · ` : ""}Price {formatMoney(variant.price, data.currency)} · Stock {variant.inventory}
+                            {variant.sku ? `SKU ${variant.sku} · ` : ""}
+                            {t("common.price")} {formatMoney(variant.price, data.currency)} · {t("common.stock")} {variant.inventory}
                           </Text>
                         </BlockStack>
                         <Button size="slim" onClick={() => addRow(variant.id)} disabled={data.supplierProducts.length === 0 || (type === "BASIC" && rowsFor(variant.id).length >= 1)}>
-                          Add supplier option
+                          {t("products.action.addSupplierOption")}
                         </Button>
                       </InlineStack>
                       {rowsFor(variant.id).length === 0 && (
                         <Text as="p" tone="critical" variant="bodySm">
-                          Not mapped — orders for this variant will be held.
+                          {t("products.variantNotMapped")}
                         </Text>
                       )}
                       {rowsFor(variant.id).map((row) => {
@@ -485,43 +506,43 @@ export default function ProductDetailPage() {
                             <BlockStack gap="200">
                               <InlineGrid columns={{ xs: 1, md: type === "BASIC" ? 3 : 4 }} gap="200">
                                 <Select
-                                  label="Supplier product"
+                                  label={t("products.row.supplierProduct")}
                                   value={sp?.id ?? ""}
                                   onChange={(v) => updateRow(row.key, { supplierProductId: v, supplierVariantId: supplierById.get(v)?.variants[0]?.id ?? "" })}
                                   options={data.supplierProducts.map((p) => ({ label: p.title.slice(0, 60), value: p.id }))}
                                 />
                                 <Select
-                                  label="Supplier SKU"
+                                  label={t("products.row.supplierSku")}
                                   value={row.supplierVariantId}
                                   onChange={(v) => updateRow(row.key, { supplierVariantId: v })}
-                                  options={(sp?.variants ?? []).map((v) => ({ label: `${v.label} — ${formatMoney(v.price, v.currency)} (stock ${v.stock})`, value: v.id }))}
+                                  options={(sp?.variants ?? []).map((v) => ({ label: `${v.label} — ${formatMoney(v.price, v.currency)} · ${t("common.stock")} ${v.stock}`, value: v.id }))}
                                 />
-                                <TextField label={type === "BOGO" ? "Units to buy" : "Qty per unit"} type="number" min={1} value={String(row.quantity)} onChange={(v) => updateRow(row.key, { quantity: Math.max(1, Number(v)) })} autoComplete="off" />
+                                <TextField label={type === "BOGO" ? t("products.row.unitsToBuy") : t("products.row.qtyPerUnit")} type="number" min={1} value={String(row.quantity)} onChange={(v) => updateRow(row.key, { quantity: Math.max(1, Number(v)) })} autoComplete="off" />
                                 {type === "ADVANCED" && (
-                                  <TextField label="Ship to (ISO code or *)" value={row.shipToCountry} onChange={(v) => updateRow(row.key, { shipToCountry: v.toUpperCase() })} autoComplete="off" />
+                                  <TextField label={t("products.row.shipTo")} value={row.shipToCountry} onChange={(v) => updateRow(row.key, { shipToCountry: v.toUpperCase() })} autoComplete="off" />
                                 )}
                                 {type === "BOGO" && (
                                   <InlineGrid columns={2} gap="100">
-                                    <TextField label="Min qty" type="number" value={String(row.minQuantity ?? 1)} onChange={(v) => updateRow(row.key, { minQuantity: Number(v) })} autoComplete="off" />
-                                    <TextField label="Max qty" type="number" value={row.maxQuantity === null ? "" : String(row.maxQuantity)} onChange={(v) => updateRow(row.key, { maxQuantity: v === "" ? null : Number(v) })} autoComplete="off" placeholder="∞" />
+                                    <TextField label={t("products.row.minQty")} type="number" value={String(row.minQuantity ?? 1)} onChange={(v) => updateRow(row.key, { minQuantity: Number(v) })} autoComplete="off" />
+                                    <TextField label={t("products.row.maxQty")} type="number" value={row.maxQuantity === null ? "" : String(row.maxQuantity)} onChange={(v) => updateRow(row.key, { maxQuantity: v === "" ? null : Number(v) })} autoComplete="off" placeholder="∞" />
                                   </InlineGrid>
                                 )}
-                                {type === "BUNDLE" && <TextField label="Bundle group" value={row.bundleGroup ?? "default"} onChange={(v) => updateRow(row.key, { bundleGroup: v })} autoComplete="off" />}
+                                {type === "BUNDLE" && <TextField label={t("products.row.bundleGroup")} value={row.bundleGroup ?? "default"} onChange={(v) => updateRow(row.key, { bundleGroup: v })} autoComplete="off" />}
                               </InlineGrid>
                               <InlineStack gap="300" blockAlign="center" align="space-between">
                                 <InlineStack gap="300">
-                                  {type !== "BASIC" && <TextField label="Priority" labelHidden type="number" value={String(row.priority)} onChange={(v) => updateRow(row.key, { priority: Number(v) })} autoComplete="off" prefix="Priority" />}
-                                  {type === "ADVANCED" && <Checkbox label="Default" checked={row.isDefault} onChange={(c) => updateRow(row.key, { isDefault: c })} />}
-                                  <Checkbox label="Enabled" checked={row.isEnabled} onChange={(c) => updateRow(row.key, { isEnabled: c })} />
-                                  {sv && <Badge tone={sv.isAvailable && sv.stock > 0 ? "success" : "critical"}>{sv.isAvailable && sv.stock > 0 ? `In stock (${sv.stock})` : "Out of stock"}</Badge>}
+                                  {type !== "BASIC" && <TextField label={t("products.row.priority")} labelHidden type="number" value={String(row.priority)} onChange={(v) => updateRow(row.key, { priority: Number(v) })} autoComplete="off" prefix={t("products.row.priority")} />}
+                                  {type === "ADVANCED" && <Checkbox label={t("products.row.default")} checked={row.isDefault} onChange={(c) => updateRow(row.key, { isDefault: c })} />}
+                                  <Checkbox label={t("common.enabled")} checked={row.isEnabled} onChange={(c) => updateRow(row.key, { isEnabled: c })} />
+                                  {sv && <Badge tone={sv.isAvailable && sv.stock > 0 ? "success" : "critical"}>{sv.isAvailable && sv.stock > 0 ? `${t("common.inStock")} (${sv.stock})` : t("common.outOfStock")}</Badge>}
                                   {row.source && row.source !== "MANUAL" && (
                                     <Badge tone={(row.confidence ?? 0) >= 0.9 ? "success" : "attention"}>
-                                      {`${row.source === "AI" ? "AI" : "Auto"} ${Math.round((row.confidence ?? 0) * 100)}%`}
+                                      {`${row.source === "AI" ? "AI" : t("products.row.autoSource")} ${Math.round((row.confidence ?? 0) * 100)}%`}
                                     </Badge>
                                   )}
                                 </InlineStack>
                                 <Button size="slim" tone="critical" onClick={() => removeRow(row.key)}>
-                                  Remove
+                                  {t("action.remove")}
                                 </Button>
                               </InlineStack>
                             </BlockStack>
@@ -532,7 +553,7 @@ export default function ProductDetailPage() {
                   </Box>
                 ))}
               </BlockStack>
-              <TextField label="Notes" value={notes} onChange={setNotes} autoComplete="off" multiline={2} placeholder="Internal notes about this supplier setup" />
+              <TextField label={t("products.notes.label")} value={notes} onChange={setNotes} autoComplete="off" multiline={2} placeholder={t("products.notes.placeholder")} />
             </BlockStack>
           </Card>
         </Layout.Section>
@@ -543,25 +564,25 @@ export default function ProductDetailPage() {
               <InlineStack align="space-between" blockAlign="center" wrap>
                 <BlockStack gap="050">
                   <Text as="h2" variant="headingMd">
-                    Compare suppliers
+                    {t("products.compare.title")}
                   </Text>
                   <Text as="p" tone="subdued" variant="bodySm">
-                    Landed cost = item + shipping to {data.comparison.shipToCountry}, in {data.currency}.
-                    {data.comparison.evaluatedAt ? ` Last checked ${relativeTime(data.comparison.evaluatedAt)}.` : ""}
+                    {t("products.compare.landedCostNote")} {data.comparison.shipToCountry} ({data.currency}).
+                    {data.comparison.evaluatedAt ? ` ${t("products.compare.lastChecked")} ${relativeTime(data.comparison.evaluatedAt)}.` : ""}
                   </Text>
                 </BlockStack>
                 <Button onClick={() => fetcher.submit({ intent: "compare-suppliers" }, { method: "post" })} loading={fetcher.state !== "idle"}>
-                  {data.comparison.rows.length ? "Re-check suppliers" : "Find cheaper suppliers"}
+                  {data.comparison.rows.length ? t("products.compare.recheck") : t("action.compareSuppliers")}
                 </Button>
               </InlineStack>
 
               {data.comparison.betterOptionId && (
-                <Banner tone="success" title="A better supplier is available">
+                <Banner tone="success" title={t("products.compare.betterAvailable")}>
                   <p>
                     {(() => {
                       const best = data.comparison.rows.find((r) => r.supplierProductId === data.comparison.betterOptionId);
                       return best
-                        ? `${best.title.slice(0, 70)} saves ${formatMoney(best.savingsVsCurrent ?? 0, data.currency)} per unit (${best.savingsPercent}%) and covers ${best.matchedVariants}/${best.totalVariants} variants.`
+                        ? `${best.title.slice(0, 70)} — ${t("products.compare.saves")} ${formatMoney(best.savingsVsCurrent ?? 0, data.currency)} ${t("products.compare.perUnit")} (${best.savingsPercent}%), ${t("products.compare.covers")} ${best.matchedVariants}/${best.totalVariants} ${t("products.variantCount")}.`
                         : "";
                     })()}
                   </p>
@@ -570,8 +591,7 @@ export default function ProductDetailPage() {
 
               {data.comparison.rows.length === 0 ? (
                 <Text as="p" tone="subdued">
-                  No comparison yet. Find cheaper suppliers searches the marketplace for the same item, prices each one
-                  delivered to your market, and checks how many of your variants it can actually cover.
+                  {t("products.compare.emptyBody")}
                 </Text>
               ) : (
                 <BlockStack gap="200">
@@ -590,10 +610,10 @@ export default function ProductDetailPage() {
                           <BlockStack gap="100">
                             <InlineStack gap="100" blockAlign="center" wrap>
                               <PlatformBadge platform={row.platform} />
-                              {row.isCurrent && <Badge tone="info">Current</Badge>}
-                              {row.isBest && !row.isCurrent && <Badge tone="success">Best score</Badge>}
-                              {!row.isAvailable && <Badge tone="critical">Out of stock</Badge>}
-                              <Badge>{`Score ${row.score}`}</Badge>
+                              {row.isCurrent && <Badge tone="info">{t("products.compare.current")}</Badge>}
+                              {row.isBest && !row.isCurrent && <Badge tone="success">{t("products.compare.bestScore")}</Badge>}
+                              {!row.isAvailable && <Badge tone="critical">{t("common.outOfStock")}</Badge>}
+                              <Badge>{`${t("products.compare.score")} ${row.score}`}</Badge>
                             </InlineStack>
                             <Text as="p" fontWeight="semibold">
                               {row.title.slice(0, 90)}
@@ -601,13 +621,13 @@ export default function ProductDetailPage() {
                             <Text as="p" tone="subdued" variant="bodySm">
                               {row.storeName ? `${row.storeName} · ` : ""}
                               {row.rating ? `★ ${row.rating.toFixed(1)} · ` : ""}
-                              {row.orderCount ? `${row.orderCount.toLocaleString()} orders · ` : ""}
-                              covers {row.matchedVariants}/{row.totalVariants} variants
+                              {row.orderCount ? `${row.orderCount.toLocaleString()} ${t("products.compare.orders")} · ` : ""}
+                              {t("products.compare.covers")} {row.matchedVariants}/{row.totalVariants} {t("products.variantCount")}
                             </Text>
                             <Text as="p" variant="bodySm">
-                              Item {formatMoney(row.itemCost, data.currency)} + shipping {formatMoney(row.shippingCost, data.currency)}
+                              {t("products.compare.item")} {formatMoney(row.itemCost, data.currency)} + {t("common.shipping")} {formatMoney(row.shippingCost, data.currency)}
                               {row.carrierName ? ` (${row.carrierName}` : ""}
-                              {row.deliveryDays ? `${row.carrierName ? ", " : " ("}${row.deliveryDays} days)` : row.carrierName ? ")" : ""}
+                              {row.deliveryDays ? `${row.carrierName ? ", " : " ("}${row.deliveryDays} ${t("products.compare.days")})` : row.carrierName ? ")" : ""}
                             </Text>
                           </BlockStack>
                         </InlineStack>
@@ -616,17 +636,17 @@ export default function ProductDetailPage() {
                             {formatMoney(row.landedCost, data.currency)}
                           </Text>
                           {row.savingsVsCurrent && Number(row.savingsVsCurrent) > 0 && (
-                            <Badge tone="success">{`Saves ${formatMoney(row.savingsVsCurrent, data.currency)} (${row.savingsPercent}%)`}</Badge>
+                            <Badge tone="success">{`${t("products.compare.saves")} ${formatMoney(row.savingsVsCurrent, data.currency)} (${row.savingsPercent}%)`}</Badge>
                           )}
                           {row.savingsVsCurrent && Number(row.savingsVsCurrent) < 0 && (
                             <Text as="span" tone="subdued" variant="bodySm">
-                              {formatMoney(Math.abs(Number(row.savingsVsCurrent)), data.currency)} dearer
+                              {formatMoney(Math.abs(Number(row.savingsVsCurrent)), data.currency)} {t("products.compare.dearer")}
                             </Text>
                           )}
                           <InlineStack gap="100">
                             {row.url && (
                               <Button size="slim" url={row.url} external>
-                                View
+                                {t("common.view")}
                               </Button>
                             )}
                             {!row.isCurrent && (
@@ -638,10 +658,10 @@ export default function ProductDetailPage() {
                                   loading={fetcher.state !== "idle"}
                                   onClick={() => fetcher.submit({ intent: "switch-supplier", supplierProductId: row.supplierProductId }, { method: "post" })}
                                 >
-                                  Switch
+                                  {t("action.switchSupplier")}
                                 </Button>
                                 <Button size="slim" onClick={() => fetcher.submit({ intent: "dismiss-candidate", supplierProductId: row.supplierProductId }, { method: "post" })}>
-                                  Hide
+                                  {t("products.compare.hide")}
                                 </Button>
                               </>
                             )}
@@ -661,17 +681,17 @@ export default function ProductDetailPage() {
             <Card>
               <BlockStack gap="300">
                 <Text as="h2" variant="headingMd">
-                  Test the mapping
+                  {t("products.test.title")}
                 </Text>
                 <Text as="p" tone="subdued" variant="bodySm">
-                  See which supplier SKU an order would use. Save the mapping first.
+                  {t("products.test.help")}
                 </Text>
                 <InlineGrid columns={2} gap="200">
-                  <TextField label="Ship to" value={previewCountry} onChange={(v) => setPreviewCountry(v.toUpperCase())} autoComplete="off" />
-                  <TextField label="Quantity" type="number" value={previewQty} onChange={setPreviewQty} autoComplete="off" />
+                  <TextField label={t("products.test.shipTo")} value={previewCountry} onChange={(v) => setPreviewCountry(v.toUpperCase())} autoComplete="off" />
+                  <TextField label={t("common.quantity")} type="number" value={previewQty} onChange={setPreviewQty} autoComplete="off" />
                 </InlineGrid>
                 <Button onClick={() => previewFetcher.submit({ intent: "preview", country: previewCountry, quantity: previewQty }, { method: "post" })} loading={previewFetcher.state !== "idle"}>
-                  Preview
+                  {t("action.preview")}
                 </Button>
                 {preview && (
                   <BlockStack gap="200">
@@ -689,7 +709,7 @@ export default function ProductDetailPage() {
                             ))
                           ) : (
                             <Text as="p" tone="critical" variant="bodySm">
-                              ✕ {p.result.failure ? FAILURE_LABELS[p.result.failure] : "Failed"}: {p.result.reason}
+                              ✕ {p.result.failure ? FAILURE_LABELS[p.result.failure] : t("stage.FAILED")}: {p.result.reason}
                             </Text>
                           )}
                         </BlockStack>
@@ -703,12 +723,12 @@ export default function ProductDetailPage() {
             <Card>
               <BlockStack gap="300">
                 <Text as="h2" variant="headingMd">
-                  Pricing
+                  {t("products.pricing.title")}
                 </Text>
-                <Select label="Rule" options={[{ label: "Default rule", value: "" }, ...data.rules.map((r) => ({ label: r.name, value: r.id }))]} value={ruleId} onChange={setRuleId} />
-                <Button onClick={() => fetcher.submit({ intent: "reprice", ruleId }, { method: "post" })}>Reprice from supplier cost</Button>
+                <Select label={t("products.pricing.rule")} options={[{ label: t("products.pricing.defaultRule"), value: "" }, ...data.rules.map((r) => ({ label: r.name, value: r.id }))]} value={ruleId} onChange={setRuleId} />
+                <Button onClick={() => fetcher.submit({ intent: "reprice", ruleId }, { method: "post" })}>{t("products.action.repriceFromCost")}</Button>
                 <Text as="p" tone="subdued" variant="bodySm">
-                  Auto-update: {data.product.autoUpdate ? "on" : "off"} · Last sync {relativeTime(data.product.lastSyncedAt)}
+                  {t("products.column.autoUpdate")}: {data.product.autoUpdate ? t("common.on") : t("common.off")} · {t("products.lastSync")} {relativeTime(data.product.lastSyncedAt)}
                 </Text>
               </BlockStack>
             </Card>
@@ -717,7 +737,7 @@ export default function ProductDetailPage() {
               <Card>
                 <BlockStack gap="200">
                   <Text as="h2" variant="headingMd">
-                    Supplier cost history
+                    {t("products.costHistory.title")}
                   </Text>
                   {data.history.map((h, i) => (
                     <InlineStack key={i} align="space-between">
@@ -725,7 +745,7 @@ export default function ProductDetailPage() {
                         {relativeTime(h.at)}
                       </Text>
                       <Text as="span" variant="bodySm">
-                        {formatMoney(h.price, data.currency)} · stock {h.stock}
+                        {formatMoney(h.price, data.currency)} · {t("common.stock")} {h.stock}
                       </Text>
                     </InlineStack>
                   ))}

@@ -8,6 +8,7 @@ import { encryptionConfigured } from "~/lib/crypto.server";
 import { env } from "~/lib/env.server";
 import { errorMessage } from "~/lib/errors";
 import { formatDate } from "~/lib/format";
+import { useMessage, useT } from "~/lib/use-t";
 import { listRates, refreshRates } from "~/services/currency.server";
 import { queueStats } from "~/services/jobs/index.server";
 import { logActivity } from "~/services/activity.server";
@@ -41,14 +42,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         const token = `dsh_${crypto.randomBytes(24).toString("base64url")}`;
         await prisma.shop.update({ where: { id: shop.id }, data: { apiToken: token } });
         await logActivity(shop.id, { action: "api.token_rotated", message: "Extension API token rotated." });
-        return { ok: true, message: "New token generated. Paste it into the browser extension." };
+        return { ok: true, messageKey: "msg.tokenGenerated" };
       }
       case "revoke-token":
         await prisma.shop.update({ where: { id: shop.id }, data: { apiToken: null } });
-        return { ok: true, message: "Token revoked." };
+        return { ok: true, messageKey: "msg.tokenRevoked" };
       case "refresh-rates": {
         const n = await refreshRates(shop.parsedSettings.currency.supplierCurrency);
-        return { ok: true, message: `${n} exchange rates refreshed.` };
+        return { ok: true, messageKey: "msg.ratesRefreshed", messageVars: { n } };
       }
       default:
         return { ok: false, error: "Unknown action" };
@@ -62,13 +63,15 @@ export default function AdvancedSettings() {
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const result = fetcher.data as { message?: string; error?: string } | undefined;
+  const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
+  const t = useT();
 
   return (
     <Layout>
       <Layout.Section>
-        {result?.message && (
+        {actionMessage && (
           <Banner tone="success">
-            <p>{result.message}</p>
+            <p>{actionMessage}</p>
           </Banner>
         )}
         {result?.error && (
@@ -78,43 +81,44 @@ export default function AdvancedSettings() {
         )}
       </Layout.Section>
 
-      <Layout.AnnotatedSection title="Browser extension / API" description="Capture products while browsing supplier sites. The token authenticates the extension against this store.">
+      <Layout.AnnotatedSection title={t("settings.advanced.extension.title")} description={t("settings.advanced.extension.description")}>
         <Card>
           <FormLayout>
-            <TextField label="API endpoint" value={`${data.appUrl}/api/extension/capture`} readOnly autoComplete="off" />
-            <TextField label="Token" value={data.apiToken ?? "— not generated —"} readOnly autoComplete="off" type={data.apiToken ? "text" : undefined} />
+            <TextField label={t("settings.advanced.apiEndpoint")} value={`${data.appUrl}/api/extension/capture`} readOnly autoComplete="off" />
+            <TextField label={t("settings.advanced.token")} value={data.apiToken ?? t("settings.advanced.tokenNotGenerated")} readOnly autoComplete="off" type={data.apiToken ? "text" : undefined} />
             <InlineStack gap="200">
-              <Button onClick={() => fetcher.submit({ intent: "rotate-token" }, { method: "post" })}>{data.apiToken ? "Rotate token" : "Generate token"}</Button>
+              <Button onClick={() => fetcher.submit({ intent: "rotate-token" }, { method: "post" })}>{data.apiToken ? t("settings.advanced.rotateToken") : t("settings.advanced.generateToken")}</Button>
               {data.apiToken && (
                 <Button tone="critical" onClick={() => fetcher.submit({ intent: "revoke-token" }, { method: "post" })}>
-                  Revoke
+                  {t("settings.advanced.revokeToken")}
                 </Button>
               )}
             </InlineStack>
             <Text as="p" tone="subdued" variant="bodySm">
-              POST JSON {"{ url }"} with header <code>Authorization: Bearer &lt;token&gt;</code> to add a product to the import list. See docs/EXTENSION_API.md.
+              {t("settings.advanced.extension.helpBefore")} <code>Authorization: Bearer &lt;token&gt;</code> {t("settings.advanced.extension.helpAfter")}
             </Text>
           </FormLayout>
         </Card>
       </Layout.AnnotatedSection>
 
-      <Layout.AnnotatedSection title="System" description="Runtime configuration of this deployment.">
+      <Layout.AnnotatedSection title={t("settings.advanced.system.title")} description={t("settings.advanced.system.description")}>
         <Card>
           <BlockStack gap="200">
             <InlineStack gap="200">
-              <Text as="span">Supplier driver</Text>
+              <Text as="span">{t("settings.advanced.supplierDriver")}</Text>
               <Badge tone={data.supplierDriver === "live" ? "success" : "attention"}>{data.supplierDriver}</Badge>
             </InlineStack>
             <InlineStack gap="200">
-              <Text as="span">Token encryption</Text>
-              <Badge tone={data.encryption ? "success" : "warning"}>{data.encryption ? "enabled" : "disabled"}</Badge>
+              <Text as="span">{t("settings.advanced.tokenEncryption")}</Text>
+              <Badge tone={data.encryption ? "success" : "warning"}>{data.encryption ? t("common.enabled") : t("common.disabled")}</Badge>
             </InlineStack>
             <InlineStack gap="200">
-              <Text as="span">Job queue</Text>
+              <Text as="span">{t("settings.advanced.jobQueue")}</Text>
               <Badge tone={data.queue.mode === "redis" ? "success" : "attention"}>{data.queue.mode}</Badge>
               {data.queue.mode === "redis" && (
                 <Text as="span" tone="subdued" variant="bodySm">
-                  {data.queue.waiting} waiting · {data.queue.active} active · {data.queue.delayed} delayed · {data.queue.failed} failed
+                  {data.queue.waiting} {t("settings.advanced.queue.waiting")} · {data.queue.active} {t("settings.advanced.queue.active")} · {data.queue.delayed} {t("settings.advanced.queue.delayed")} · {data.queue.failed}{" "}
+                  {t("settings.advanced.queue.failed")}
                 </Text>
               )}
             </InlineStack>
@@ -122,34 +126,42 @@ export default function AdvancedSettings() {
         </Card>
       </Layout.AnnotatedSection>
 
-      <Layout.AnnotatedSection title="Exchange rates" description={`${data.supplierCurrency} → ${data.shopCurrency} and other common currencies.`}>
+      <Layout.AnnotatedSection title={t("settings.advanced.rates.title")} description={`${data.supplierCurrency} → ${data.shopCurrency} ${t("settings.advanced.rates.description")}`}>
         <Card>
           <BlockStack gap="200">
             <Button onClick={() => fetcher.submit({ intent: "refresh-rates" }, { method: "post" })} loading={fetcher.state !== "idle"}>
-              Refresh now
+              {t("settings.advanced.rates.refresh")}
             </Button>
             {data.rates.length === 0 ? (
               <Text as="p" tone="subdued">
-                No rates cached yet.
+                {t("settings.advanced.rates.empty")}
               </Text>
             ) : (
-              <DataTable columnContentTypes={["text", "numeric", "text"]} headings={["Currency", "Rate", "Fetched"]} rows={data.rates.map((r) => [r.quote, r.rate, formatDate(r.fetchedAt)])} />
+              <DataTable
+                columnContentTypes={["text", "numeric", "text"]}
+                headings={[t("settings.advanced.rates.currency"), t("settings.advanced.rates.rate"), t("settings.advanced.rates.fetched")]}
+                rows={data.rates.map((r) => [r.quote, r.rate, formatDate(r.fetchedAt)])}
+              />
             )}
           </BlockStack>
         </Card>
       </Layout.AnnotatedSection>
 
-      <Layout.AnnotatedSection title="Recent webhooks" description="Shopify events received for this store.">
+      <Layout.AnnotatedSection title={t("settings.advanced.webhooks.title")} description={t("settings.advanced.webhooks.description")}>
         <Card>
           {data.webhooks.length === 0 ? (
             <Text as="p" tone="subdued">
-              No webhooks received yet.
+              {t("settings.advanced.webhooks.empty")}
             </Text>
           ) : (
             <DataTable
               columnContentTypes={["text", "text", "text"]}
-              headings={["Topic", "Received", "Status"]}
-              rows={data.webhooks.map((w) => [w.topic, formatDate(w.createdAt), w.error ? `Error: ${w.error}` : w.processedAt ? "Processed" : "Queued"])}
+              headings={[t("settings.advanced.webhooks.topic"), t("settings.advanced.webhooks.received"), t("common.status")]}
+              rows={data.webhooks.map((w) => [
+                w.topic,
+                formatDate(w.createdAt),
+                w.error ? `${t("common.error")}: ${w.error}` : w.processedAt ? t("settings.advanced.webhooks.processed") : t("settings.advanced.webhooks.queued"),
+              ])}
             />
           )}
         </Card>

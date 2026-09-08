@@ -9,6 +9,7 @@ import { StatusBadge } from "~/components/StatusBadge";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatDate, relativeTime } from "~/lib/format";
+import { useMessage, useT } from "~/lib/use-t";
 import { getInventoryPolicy, runInventorySync, updateInventoryPolicy } from "~/services/inventory-sync.server";
 import { createJobRun, listJobRuns } from "~/services/jobs.server";
 import { enqueue } from "~/services/jobs/index.server";
@@ -50,7 +51,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           onProductRemoved: get("onProductRemoved") as StockChangeAction,
           syncIntervalMinutes: Math.max(30, Number(get("syncIntervalMinutes") || 360)),
         });
-        return { ok: true, message: "Policy saved." };
+        return { ok: true, messageKey: "msg.policySaved" };
       case "run": {
         const total = (await countProducts(shop.id)).autoUpdate;
         const job = await createJobRun({ shopId: shop.id, type: "inventory-sync", total });
@@ -70,25 +71,27 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function InventoryPage() {
+  const t = useT();
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const result = fetcher.data as { message?: string; error?: string; jobRunId?: string; dryRun?: { summary: Record<string, unknown>; actions: Array<{ type: string; variant: string; reason: string; price: string | null; quantity: number | null }> } } | undefined;
+  const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
   const [form, setForm] = useState({ ...data.policy, priceThresholdPercent: data.policy.priceThresholdPercent, lowStockThreshold: String(data.policy.lowStockThreshold), maxInventoryPushed: String(data.policy.maxInventoryPushed), syncIntervalMinutes: String(data.policy.syncIntervalMinutes) });
   const { jobRunId, clearJobRun } = useJobRun(result);
 
   return (
     <Page
-      title="Auto updates"
-      subtitle={`${data.counts.autoUpdate} of ${data.counts.total} products on auto-update · last run ${relativeTime(data.policy.lastRunAt)}`}
-      primaryAction={{ content: "Run now", onAction: () => fetcher.submit({ intent: "run" }, { method: "post" }), loading: fetcher.state !== "idle" }}
-      secondaryActions={[{ content: "Preview changes (dry run)", onAction: () => fetcher.submit({ intent: "dry-run" }, { method: "post" }) }]}
+      title={t("page.inventory.title")}
+      subtitle={`${data.counts.autoUpdate}/${data.counts.total} ${t("inventory.subtitle.onAutoUpdate")} · ${t("inventory.subtitle.lastRun")} ${relativeTime(data.policy.lastRunAt)}`}
+      primaryAction={{ content: t("inventory.runNow"), onAction: () => fetcher.submit({ intent: "run" }, { method: "post" }), loading: fetcher.state !== "idle" }}
+      secondaryActions={[{ content: t("inventory.previewChanges"), onAction: () => fetcher.submit({ intent: "dry-run" }, { method: "post" }) }]}
     >
       <Layout>
         <Layout.Section>
           <JobProgress jobRunId={jobRunId} onDone={clearJobRun} />
-          {result?.message && (
+          {actionMessage && (
             <Banner tone="success">
-              <p>{result.message}</p>
+              <p>{actionMessage}</p>
             </Banner>
           )}
           {result?.error && (
@@ -100,13 +103,13 @@ export default function InventoryPage() {
             <Card>
               <BlockStack gap="200">
                 <Text as="h2" variant="headingMd">
-                  Dry run: {result.dryRun.actions.length} change(s) would be applied
+                  {`${t("inventory.dryRun.title")}: ${result.dryRun.actions.length} ${t("inventory.dryRun.changesApplied")}`}
                 </Text>
                 <Text as="p" tone="subdued" variant="bodySm">
-                  {String(result.dryRun.summary.productsChecked)} products checked · {String(result.dryRun.summary.suppliersRefreshed)} suppliers refreshed · {String(result.dryRun.summary.suppliersFailed)} failed
+                  {`${String(result.dryRun.summary.productsChecked)} ${t("inventory.dryRun.productsChecked")} · ${String(result.dryRun.summary.suppliersRefreshed)} ${t("inventory.dryRun.suppliersRefreshed")} · ${String(result.dryRun.summary.suppliersFailed)} ${t("inventory.dryRun.failed")}`}
                 </Text>
                 {result.dryRun.actions.length > 0 && (
-                  <DataTable columnContentTypes={["text", "text", "text"]} headings={["Action", "Variant", "Reason"]} rows={result.dryRun.actions.slice(0, 200).map((a) => [a.type, a.variant.split("/").pop() ?? a.variant, a.reason])} />
+                  <DataTable columnContentTypes={["text", "text", "text"]} headings={[t("inventory.table.action"), t("inventory.table.variant"), t("inventory.table.reason")]} rows={result.dryRun.actions.slice(0, 200).map((a) => [a.type, a.variant.split("/").pop() ?? a.variant, a.reason])} />
                 )}
               </BlockStack>
             </Card>
@@ -118,56 +121,56 @@ export default function InventoryPage() {
             <BlockStack gap="400">
               <InlineStack align="space-between" blockAlign="center">
                 <Text as="h2" variant="headingMd">
-                  Policy
+                  {t("inventory.policy")}
                 </Text>
-                <Checkbox label="Automatic sync enabled" checked={form.isEnabled} onChange={(v) => setForm({ ...form, isEnabled: v })} />
+                <Checkbox label={t("inventory.autoSyncEnabled")} checked={form.isEnabled} onChange={(v) => setForm({ ...form, isEnabled: v })} />
               </InlineStack>
               <FormLayout>
                 <FormLayout.Group>
                   <Select
-                    label="When the supplier price changes"
+                    label={t("inventory.priceAction.label")}
                     value={form.priceAction}
                     onChange={(v) => setForm({ ...form, priceAction: v as PriceChangeAction })}
                     options={[
-                      { label: "Update my price with the pricing rule", value: "UPDATE_PRICE" },
-                      { label: "Notify me only", value: "NOTIFY_ONLY" },
-                      { label: "Do nothing", value: "DO_NOTHING" },
+                      { label: t("inventory.priceAction.updatePrice"), value: "UPDATE_PRICE" },
+                      { label: t("inventory.action.notifyOnly"), value: "NOTIFY_ONLY" },
+                      { label: t("inventory.action.doNothing"), value: "DO_NOTHING" },
                     ]}
                   />
-                  <TextField label="Ignore price changes smaller than (%)" type="number" value={form.priceThresholdPercent} onChange={(v) => setForm({ ...form, priceThresholdPercent: v })} autoComplete="off" />
+                  <TextField label={t("inventory.priceThreshold")} type="number" value={form.priceThresholdPercent} onChange={(v) => setForm({ ...form, priceThresholdPercent: v })} autoComplete="off" />
                 </FormLayout.Group>
                 <FormLayout.Group>
                   <Select
-                    label="When the supplier stock changes"
+                    label={t("inventory.stockAction.label")}
                     value={form.stockAction}
                     onChange={(v) => setForm({ ...form, stockAction: v as StockChangeAction })}
                     options={[
-                      { label: "Set my inventory to 0 when out of stock (restock when back)", value: "SET_ZERO_WHEN_OUT" },
-                      { label: "Mirror the supplier quantity (capped)", value: "UPDATE_QUANTITY" },
-                      { label: "Unpublish the product when out of stock", value: "UNPUBLISH_WHEN_OUT" },
-                      { label: "Notify me only", value: "NOTIFY_ONLY" },
-                      { label: "Do nothing", value: "DO_NOTHING" },
+                      { label: t("inventory.stockAction.setZero"), value: "SET_ZERO_WHEN_OUT" },
+                      { label: t("inventory.stockAction.mirrorQuantity"), value: "UPDATE_QUANTITY" },
+                      { label: t("inventory.stockAction.unpublish"), value: "UNPUBLISH_WHEN_OUT" },
+                      { label: t("inventory.action.notifyOnly"), value: "NOTIFY_ONLY" },
+                      { label: t("inventory.action.doNothing"), value: "DO_NOTHING" },
                     ]}
                   />
-                  <TextField label="Treat stock at or below as out of stock" type="number" value={form.lowStockThreshold} onChange={(v) => setForm({ ...form, lowStockThreshold: v })} autoComplete="off" />
-                  <TextField label="Maximum quantity to push to Shopify" type="number" value={form.maxInventoryPushed} onChange={(v) => setForm({ ...form, maxInventoryPushed: v })} autoComplete="off" />
+                  <TextField label={t("inventory.lowStockThreshold")} type="number" value={form.lowStockThreshold} onChange={(v) => setForm({ ...form, lowStockThreshold: v })} autoComplete="off" />
+                  <TextField label={t("inventory.maxInventoryPushed")} type="number" value={form.maxInventoryPushed} onChange={(v) => setForm({ ...form, maxInventoryPushed: v })} autoComplete="off" />
                 </FormLayout.Group>
                 <FormLayout.Group>
                   <Select
-                    label="When the supplier removes the product"
+                    label={t("inventory.onRemoved.label")}
                     value={form.onProductRemoved}
                     onChange={(v) => setForm({ ...form, onProductRemoved: v as StockChangeAction })}
                     options={[
-                      { label: "Unpublish the product", value: "UNPUBLISH_WHEN_OUT" },
-                      { label: "Set inventory to 0", value: "SET_ZERO_WHEN_OUT" },
-                      { label: "Notify me only", value: "NOTIFY_ONLY" },
-                      { label: "Do nothing", value: "DO_NOTHING" },
+                      { label: t("inventory.onRemoved.unpublish"), value: "UNPUBLISH_WHEN_OUT" },
+                      { label: t("inventory.onRemoved.setZero"), value: "SET_ZERO_WHEN_OUT" },
+                      { label: t("inventory.action.notifyOnly"), value: "NOTIFY_ONLY" },
+                      { label: t("inventory.action.doNothing"), value: "DO_NOTHING" },
                     ]}
                   />
-                  <TextField label="Check every (minutes)" type="number" value={form.syncIntervalMinutes} onChange={(v) => setForm({ ...form, syncIntervalMinutes: v })} autoComplete="off" helpText="Minimum 30" />
+                  <TextField label={t("inventory.syncInterval")} type="number" value={form.syncIntervalMinutes} onChange={(v) => setForm({ ...form, syncIntervalMinutes: v })} autoComplete="off" helpText={t("inventory.syncIntervalHelp")} />
                 </FormLayout.Group>
                 <Button variant="primary" onClick={() => fetcher.submit({ intent: "save", ...form, isEnabled: String(form.isEnabled) }, { method: "post" })} loading={fetcher.state !== "idle"}>
-                  Save policy
+                  {t("inventory.savePolicy")}
                 </Button>
               </FormLayout>
             </BlockStack>
@@ -178,11 +181,11 @@ export default function InventoryPage() {
           <Card>
             <BlockStack gap="300">
               <Text as="h2" variant="headingMd">
-                Recent runs
+                {t("inventory.recentRuns")}
               </Text>
               {data.runs.length === 0 && (
                 <Text as="p" tone="subdued">
-                  No runs yet.
+                  {t("inventory.noRuns")}
                 </Text>
               )}
               {data.runs.map((run) => (
@@ -197,10 +200,10 @@ export default function InventoryPage() {
                     <InlineStack gap="100">
                       {run.result && typeof run.result.productsChecked === "number" && (
                         <>
-                          <Badge>{`${run.result.productsChecked} checked`}</Badge>
-                          <Badge tone="info">{`${run.result.priceUpdates} price`}</Badge>
-                          <Badge tone="warning">{`${run.result.inventoryUpdates} stock`}</Badge>
-                          <Badge tone="critical">{`${run.result.unpublished} unpublished`}</Badge>
+                          <Badge>{`${run.result.productsChecked} ${t("inventory.badge.checked")}`}</Badge>
+                          <Badge tone="info">{`${run.result.priceUpdates} ${t("inventory.badge.price")}`}</Badge>
+                          <Badge tone="warning">{`${run.result.inventoryUpdates} ${t("inventory.badge.stock")}`}</Badge>
+                          <Badge tone="critical">{`${run.result.unpublished} ${t("inventory.badge.unpublished")}`}</Badge>
                         </>
                       )}
                       {run.error && (

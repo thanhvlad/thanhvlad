@@ -12,6 +12,7 @@ import type { OrderIssue } from "~/domain/orders/pipeline";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatDate, formatMoney, pageParam } from "~/lib/format";
+import { useT } from "~/lib/use-t";
 import { createJobRun } from "~/services/jobs.server";
 import { enqueue } from "~/services/jobs/index.server";
 import { countOrdersByStage, listOrders } from "~/services/orders.server";
@@ -81,6 +82,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function OrdersPage() {
+  const t = useT();
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const navigate = useNavigate();
@@ -92,23 +94,23 @@ export default function OrdersPage() {
   const result = fetcher.data as { ok?: boolean; error?: string; jobRunId?: string } | undefined;
   const { jobRunId, clearJobRun } = useJobRun(result, clearSelection);
 
-  const tabs = [{ id: "ALL", content: `All (${Object.values(data.counts).reduce((a, b) => a + b, 0)})` }, ...STAGE_ORDER.map((s) => ({ id: s, content: `${label(s)} (${data.counts[s]})` }))];
+  const tabs = [{ id: "ALL", content: `${t("common.all")} (${Object.values(data.counts).reduce((a, b) => a + b, 0)})` }, ...STAGE_ORDER.map((s) => ({ id: s, content: `${t(`stage.${s}`)} (${data.counts[s]})` }))];
   const selectedTab = Math.max(0, tabs.findIndex((t) => t.id === data.stage));
   const placeable = selectedResources.filter((id) => items.find((i) => i.id === id)?.stage === "AWAITING_ORDER");
 
   return (
     <Page
-      title="Orders"
+      title={t("page.orders.title")}
       primaryAction={{
-        content: placeable.length ? `Place ${placeable.length} order(s)` : "Place orders",
+        content: placeable.length ? `${t("action.placeOrders")} (${placeable.length})` : t("action.placeOrders"),
         disabled: placeable.length === 0,
         loading: fetcher.state !== "idle",
         onAction: () => fetcher.submit({ intent: "place", ids: placeable.join(",") }, { method: "post" }),
       }}
       secondaryActions={[
-        { content: "Sync from Shopify", onAction: () => fetcher.submit({ intent: "sync", days: "30" }, { method: "post" }) },
-        { content: "Check supplier status", onAction: () => fetcher.submit({ intent: "sync-suppliers" }, { method: "post" }) },
-        { content: "Export CSV", url: `/app/orders/export?${params.toString()}`, external: true },
+        { content: t("orders.syncFromShopify"), onAction: () => fetcher.submit({ intent: "sync", days: "30" }, { method: "post" }) },
+        { content: t("orders.checkSupplierStatus"), onAction: () => fetcher.submit({ intent: "sync-suppliers" }, { method: "post" }) },
+        { content: t("action.export"), url: `/app/orders/export?${params.toString()}`, external: true },
       ]}
     >
       <Layout>
@@ -135,12 +137,12 @@ export default function OrdersPage() {
             />
             <div style={{ padding: "var(--p-space-300)" }}>
               <TextField
-                label="Search"
+                label={t("action.search")}
                 labelHidden
                 value={search}
                 onChange={setSearch}
                 autoComplete="off"
-                placeholder="Order number, customer, supplier order id or tracking number"
+                placeholder={t("orders.searchPlaceholder")}
                 clearButton
                 onClearButtonClick={() => {
                   setSearch("");
@@ -158,22 +160,22 @@ export default function OrdersPage() {
                       navigate(`?${sp.toString()}`);
                     }}
                   >
-                    Search
+                    {t("action.search")}
                   </Button>
                 }
               />
             </div>
             {items.length === 0 ? (
-              <EmptyState heading="No orders here" image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png" action={{ content: "Sync from Shopify", onAction: () => fetcher.submit({ intent: "sync", days: "30" }, { method: "post" }) }}>
-                <p>New Shopify orders arrive automatically via webhooks. Use sync to pull history.</p>
+              <EmptyState heading={t("orders.empty.heading")} image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png" action={{ content: t("orders.syncFromShopify"), onAction: () => fetcher.submit({ intent: "sync", days: "30" }, { method: "post" }) }}>
+                <p>{t("orders.empty.body")}</p>
               </EmptyState>
             ) : (
               <IndexTable
-                resourceName={{ singular: "order", plural: "orders" }}
+                resourceName={{ singular: t("orders.resource.singular"), plural: t("orders.resource.plural") }}
                 itemCount={items.length}
                 selectedItemsCount={allResourcesSelected ? "All" : selectedResources.length}
                 onSelectionChange={handleSelectionChange}
-                headings={[{ title: "Order" }, { title: "Customer" }, { title: "Ship to" }, { title: "Total" }, { title: "Cost" }, { title: "Stage" }, { title: "Supplier order" }, { title: "Issues" }]}
+                headings={[{ title: t("orders.column.order") }, { title: t("common.customer") }, { title: t("orders.column.shipTo") }, { title: t("common.total") }, { title: t("common.cost") }, { title: t("orders.column.stage") }, { title: t("orders.column.supplierOrder") }, { title: t("orders.column.issues") }]}
               >
                 {items.map((o, index) => {
                   const errors = o.issues.filter((i) => i.severity === "error");
@@ -188,7 +190,7 @@ export default function OrdersPage() {
                             </Text>
                           </Link>
                           <Text as="span" tone="subdued" variant="bodySm">
-                            {formatDate(o.createdAt)} · {o.items} item(s)
+                            {formatDate(o.createdAt)} · {o.items} {t("orders.items")}
                           </Text>
                         </BlockStack>
                       </IndexTable.Cell>
@@ -210,7 +212,7 @@ export default function OrdersPage() {
                             <InlineStack key={po.id} gap="100">
                               <StatusBadge status={po.status} />
                               <Text as="span" variant="bodySm">
-                                {po.externalOrderId ?? "not placed"}
+                                {po.externalOrderId ?? t("orders.notPlaced")}
                               </Text>
                               {po.tracking.length > 0 && <Badge tone="success">{po.tracking[0]}</Badge>}
                             </InlineStack>
@@ -220,15 +222,15 @@ export default function OrdersPage() {
                       <IndexTable.Cell>
                         {errors.length > 0 && (
                           <Tooltip content={errors.map((e) => e.message).join(" · ")}>
-                            <Badge tone="critical">{`${errors.length} blocking`}</Badge>
+                            <Badge tone="critical">{`${errors.length} ${t("orders.blocking")}`}</Badge>
                           </Tooltip>
                         )}
                         {warnings.length > 0 && (
                           <Tooltip content={warnings.map((e) => e.message).join(" · ")}>
-                            <Badge tone="warning">{`${warnings.length} warning(s)`}</Badge>
+                            <Badge tone="warning">{`${warnings.length} ${t("orders.warnings")}`}</Badge>
                           </Tooltip>
                         )}
-                        {o.managed === 0 && <Badge>Not managed</Badge>}
+                        {o.managed === 0 && <Badge>{t("orders.notManaged")}</Badge>}
                       </IndexTable.Cell>
                     </IndexTable.Row>
                   );
@@ -243,8 +245,4 @@ export default function OrdersPage() {
       </Layout>
     </Page>
   );
-}
-
-function label(stage: OrderStage) {
-  return stage.replace(/_/g, " ").toLowerCase().replace(/^\w/, (c) => c.toUpperCase());
 }

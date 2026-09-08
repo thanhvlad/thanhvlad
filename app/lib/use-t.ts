@@ -1,5 +1,5 @@
 import { useRouteLoaderData } from "@remix-run/react";
-import { makeT, type Locale, type Translator } from "./i18n";
+import { makeT, type I18nKey, type I18nVars, type Locale, type Translator } from "./i18n";
 
 /**
  * Translator bound to the shop's chosen language.
@@ -16,4 +16,27 @@ export function useT(): Translator {
 export function useLocale(): Locale {
   const data = useRouteLoaderData("routes/app") as { locale?: Locale } | undefined;
   return data?.locale ?? "en";
+}
+
+/**
+ * Text for an action's result banner.
+ *
+ * Actions run on the server, where `useT` cannot be called, so they return a
+ * translation key and its values rather than a finished English sentence — that
+ * is what stopped a Vietnamese merchant from seeing "Saved." after every save.
+ * A plain `message` is still honoured for anything that carries supplier or
+ * Shopify text we do not translate.
+ */
+export function useMessage(
+  result:
+    | { message?: string | null; messageKey?: string | null; messageVars?: I18nVars | null }
+    | undefined
+    | null,
+): string | undefined {
+  const t = useT();
+  if (!result) return undefined;
+  if (result.messageKey) {
+    return t(result.messageKey as I18nKey, result.messageVars ?? undefined) ?? result.message ?? undefined;
+  }
+  return result.message ?? undefined;
 }

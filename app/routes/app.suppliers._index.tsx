@@ -10,6 +10,7 @@ import { encryptionConfigured } from "~/lib/crypto.server";
 import { errorMessage } from "~/lib/errors";
 import { env } from "~/lib/env.server";
 import { formatDate, relativeTime } from "~/lib/format";
+import { useMessage, useT } from "~/lib/use-t";
 import { beginOAuth, connectSupplierAccount, createCredentiallessAccount, disconnectSupplierAccount, listSupplierAccounts, setDefaultSupplierAccount, testSupplierAccount } from "~/services/supplier-accounts.server";
 import { listPlatforms } from "~/services/suppliers/index.server";
 
@@ -47,10 +48,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       }
       case "default":
         await setDefaultSupplierAccount(shop.id, get("id"));
-        return { ok: true, message: "Default account updated." };
+        return { ok: true, messageKey: "msg.defaultAccountUpdated" };
       case "disconnect":
         await disconnectSupplierAccount(shop.id, get("id"));
-        return { ok: true, message: "Account disconnected." };
+        return { ok: true, messageKey: "msg.accountDisconnected" };
       case "test": {
         const result = await testSupplierAccount(shop.id, get("id"));
         return { ok: result.ok, message: result.ok ? result.message : undefined, error: result.ok ? undefined : result.message };
@@ -65,9 +66,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function SuppliersPage() {
+  const t = useT();
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const result = fetcher.data as { ok?: boolean; message?: string; error?: string; redirect?: string } | undefined;
+  const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
   const [cj, setCj] = useState({ email: "", apiKey: "", label: "", share: true });
   const [mockLabel, setMockLabel] = useState("Mock supplier");
 
@@ -85,22 +88,22 @@ export default function SuppliersPage() {
   }, [result?.redirect]);
 
   return (
-    <Page title="Suppliers" subtitle="Connect the accounts used to search catalogs and place orders.">
+    <Page title={t("page.suppliers.title")} subtitle={t("page.suppliers.subtitle")}>
       <Layout>
         <Layout.Section>
           {data.connected && (
             <Banner tone="success">
-              <p>Supplier account connected.</p>
+              <p>{t("suppliers.connected")}</p>
             </Banner>
           )}
           {data.oauthError && (
-            <Banner tone="critical" title="Connection failed">
+            <Banner tone="critical" title={t("suppliers.connectionFailed")}>
               <p>{data.oauthError}</p>
             </Banner>
           )}
-          {result?.message && (
+          {actionMessage && (
             <Banner tone="success">
-              <p>{result.message}</p>
+              <p>{actionMessage}</p>
             </Banner>
           )}
           {result?.error && (
@@ -109,15 +112,13 @@ export default function SuppliersPage() {
             </Banner>
           )}
           {data.mockMode && (
-            <Banner tone="info" title="Mock supplier mode">
-              <p>
-                SUPPLIER_DRIVER=mock: every platform is served by the built-in sample catalog, orders complete automatically and tracking is generated. Set SUPPLIER_DRIVER=live plus the platform API keys to go live.
-              </p>
+            <Banner tone="info" title={t("suppliers.mockMode.title")}>
+              <p>{t("suppliers.mockMode.body")}</p>
             </Banner>
           )}
           {!data.encryption && !data.mockMode && (
-            <Banner tone="warning" title="Token encryption is off">
-              <p>Set ENCRYPTION_KEY (32 bytes, base64) so supplier tokens are encrypted at rest.</p>
+            <Banner tone="warning" title={t("suppliers.encryptionOff.title")}>
+              <p>{t("suppliers.encryptionOff.body")}</p>
             </Banner>
           )}
         </Layout.Section>
@@ -126,11 +127,11 @@ export default function SuppliersPage() {
           <Card>
             <BlockStack gap="300">
               <Text as="h2" variant="headingMd">
-                Connected accounts
+                {t("suppliers.connectedAccounts")}
               </Text>
               {data.accounts.length === 0 && (
                 <Text as="p" tone="subdued">
-                  No supplier account yet. Connect one below.
+                  {t("suppliers.empty")}
                 </Text>
               )}
               {data.accounts.map((a) => (
@@ -142,39 +143,40 @@ export default function SuppliersPage() {
                         <Text as="span" fontWeight="semibold">
                           {a.label}
                         </Text>
-                        {a.isDefault && <Badge tone="success">Default</Badge>}
-                        {!a.isActive && <Badge tone="critical">Inactive</Badge>}
-                        {a.needsReauth && <Badge tone="critical">Reconnect needed</Badge>}
+                        {a.isDefault && <Badge tone="success">{t("suppliers.default")}</Badge>}
+                        {!a.isActive && <Badge tone="critical">{t("suppliers.inactive")}</Badge>}
+                        {a.needsReauth && <Badge tone="critical">{t("suppliers.reconnectNeeded")}</Badge>}
                         <Badge>{a.scope}</Badge>
                       </InlineStack>
                       <Text as="p" tone="subdued" variant="bodySm">
                         {a.externalUserId ? `ID ${a.externalUserId} · ` : ""}
-                        {a.expiresAt ? `token expires ${formatDate(a.expiresAt)} · ` : ""}
-                        {a.lastUsedAt ? `last used ${relativeTime(a.lastUsedAt)}` : "never used"}
-                        {a.storeRegisteredAt ? " · store registered" : ""}
+                        {a.expiresAt ? `${t("suppliers.tokenExpires")} ${formatDate(a.expiresAt)} · ` : ""}
+                        {a.lastUsedAt ? `${t("suppliers.lastUsed")} ${relativeTime(a.lastUsedAt)}` : t("suppliers.neverUsed")}
+                        {a.storeRegisteredAt ? ` · ${t("suppliers.storeRegistered")}` : ""}
                       </Text>
                       {a.needsReauth && (
                         <Text as="p" tone="critical" variant="bodySm">
-                          The platform rejected this account{a.lastErrorAt ? ` ${relativeTime(a.lastErrorAt)}` : ""}. Orders will not be placed until you reconnect.
+                          {t("suppliers.rejected")}
+                          {a.lastErrorAt ? ` ${relativeTime(a.lastErrorAt)}` : ""}. {t("suppliers.rejectedHelp")}
                         </Text>
                       )}
                     </BlockStack>
                     <InlineStack gap="100">
                       {a.needsReauth && (
                         <Button size="slim" variant="primary" onClick={() => fetcher.submit({ intent: "oauth", platform: a.platform }, { method: "post" })}>
-                          Reconnect
+                          {t("action.reconnect")}
                         </Button>
                       )}
                       <Button size="slim" onClick={() => fetcher.submit({ intent: "test", id: a.id }, { method: "post" })} loading={fetcher.state !== "idle"}>
-                        Test
+                        {t("action.test")}
                       </Button>
                       {!a.isDefault && (
                         <Button size="slim" onClick={() => fetcher.submit({ intent: "default", id: a.id }, { method: "post" })}>
-                          Make default
+                          {t("suppliers.makeDefault")}
                         </Button>
                       )}
                       <Button size="slim" tone="critical" onClick={() => fetcher.submit({ intent: "disconnect", id: a.id }, { method: "post" })}>
-                        Disconnect
+                        {t("suppliers.disconnect")}
                       </Button>
                     </InlineStack>
                   </InlineStack>
@@ -193,38 +195,38 @@ export default function SuppliersPage() {
                     <Text as="h3" variant="headingMd">
                       {p.displayName}
                     </Text>
-                    <Badge tone={p.configured ? "success" : "attention"}>{p.configured ? "Ready" : "Needs API keys"}</Badge>
+                    <Badge tone={p.configured ? "success" : "attention"}>{p.configured ? t("suppliers.ready") : t("suppliers.needsApiKeys")}</Badge>
                   </InlineStack>
                   <Text as="p" tone="subdued">
                     {p.description}
                   </Text>
                   <InlineStack gap="100" wrap>
-                    {p.capabilities.search && <Badge>Search</Badge>}
-                    {p.capabilities.imageSearch && <Badge>Image search</Badge>}
-                    {p.capabilities.placeOrder && <Badge>Auto order</Badge>}
-                    {p.capabilities.tracking && <Badge>Tracking</Badge>}
-                    {p.capabilities.shippingQuotes && <Badge>Shipping quotes</Badge>}
+                    {p.capabilities.search && <Badge>{t("action.search")}</Badge>}
+                    {p.capabilities.imageSearch && <Badge>{t("suppliers.capability.imageSearch")}</Badge>}
+                    {p.capabilities.placeOrder && <Badge>{t("suppliers.capability.placeOrder")}</Badge>}
+                    {p.capabilities.tracking && <Badge>{t("suppliers.capability.tracking")}</Badge>}
+                    {p.capabilities.shippingQuotes && <Badge>{t("suppliers.capability.shippingQuotes")}</Badge>}
                   </InlineStack>
                   {p.authMode === "oauth" && (
                     <Button variant="primary" disabled={!p.configured} onClick={() => fetcher.submit({ intent: "oauth", platform: p.platform }, { method: "post" })}>
-                      Connect with {p.displayName}
+                      {t("suppliers.connectWith")} {p.displayName}
                     </Button>
                   )}
                   {p.authMode === "apikey" && (
                     <BlockStack gap="200">
-                      <TextField label="Account email" value={cj.email} onChange={(v) => setCj({ ...cj, email: v })} autoComplete="off" />
-                      <TextField label="API key" type="password" value={cj.apiKey} onChange={(v) => setCj({ ...cj, apiKey: v })} autoComplete="off" />
-                      <TextField label="Label" value={cj.label} onChange={(v) => setCj({ ...cj, label: v })} autoComplete="off" placeholder="Main CJ account" />
-                      <Checkbox label="Share with all my stores" checked={cj.share} onChange={(v) => setCj({ ...cj, share: v })} />
+                      <TextField label={t("suppliers.accountEmail")} value={cj.email} onChange={(v) => setCj({ ...cj, email: v })} autoComplete="off" />
+                      <TextField label={t("suppliers.apiKey")} type="password" value={cj.apiKey} onChange={(v) => setCj({ ...cj, apiKey: v })} autoComplete="off" />
+                      <TextField label={t("suppliers.label")} value={cj.label} onChange={(v) => setCj({ ...cj, label: v })} autoComplete="off" placeholder={t("suppliers.labelPlaceholder")} />
+                      <Checkbox label={t("suppliers.shareAcrossStores")} checked={cj.share} onChange={(v) => setCj({ ...cj, share: v })} />
                       <Button variant="primary" disabled={!cj.email || !cj.apiKey} onClick={() => fetcher.submit({ intent: "apikey", platform: p.platform, ...cj, share: String(cj.share) }, { method: "post" })}>
-                        Connect
+                        {t("action.connect")}
                       </Button>
                     </BlockStack>
                   )}
                   {p.authMode === "none" && (
                     <BlockStack gap="200">
-                      <TextField label="Label" value={mockLabel} onChange={setMockLabel} autoComplete="off" />
-                      <Button onClick={() => fetcher.submit({ intent: "mock", platform: p.platform, label: mockLabel }, { method: "post" })}>Add mock account</Button>
+                      <TextField label={t("suppliers.label")} value={mockLabel} onChange={setMockLabel} autoComplete="off" />
+                      <Button onClick={() => fetcher.submit({ intent: "mock", platform: p.platform, label: mockLabel }, { method: "post" })}>{t("suppliers.addMockAccount")}</Button>
                     </BlockStack>
                   )}
                 </BlockStack>

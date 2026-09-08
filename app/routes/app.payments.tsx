@@ -22,6 +22,7 @@ import { PlatformBadge, StatusBadge } from "~/components/StatusBadge";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatDate, formatMoney, relativeTime } from "~/lib/format";
+import { useMessage, useT } from "~/lib/use-t";
 import { checkPayments, getPaymentQueue, markPaidManually, undoManualPayment } from "~/services/payments.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -48,11 +49,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       }
       case "mark-paid": {
         for (const id of ids) await markPaidManually(shop, id, actor);
-        return { ok: true, message: `${ids.length} order(s) marked as paid.` };
+        return { ok: true, messageKey: "msg.ordersMarkedPaid", messageVars: { n: ids.length } };
       }
       case "undo-paid": {
         await undoManualPayment(shop, get("id"));
-        return { ok: true, message: "Moved back to the payment queue." };
+        return { ok: true, messageKey: "msg.backToPaymentQueue" };
       }
       default:
         return { ok: false, error: "Unknown action" };
@@ -63,9 +64,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function PaymentsPage() {
+  const t = useT();
   const { queue } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const result = fetcher.data as { message?: string; error?: string } | undefined;
+  const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
   const [opened, setOpened] = useState<string[]>([]);
   const items = queue.items;
   const { selectedResources, allResourcesSelected, handleSelectionChange, clearSelection } = useIndexResourceState(items);
@@ -84,22 +87,22 @@ export default function PaymentsPage() {
     targets.slice(0, 10).forEach((item, index) => {
       setTimeout(() => window.open(item.paymentUrl!, "_blank", "noopener"), index * 350);
     });
-    setOpened((prev) => [...new Set([...prev, ...targets.slice(0, 10).map((t) => t.id)])]);
+    setOpened((prev) => [...new Set([...prev, ...targets.slice(0, 10).map((target) => target.id)])]);
   };
 
   return (
     <Page
-      title="Payments"
-      subtitle="Supplier orders are paid on the supplier's own site. Open them here, then confirm."
+      title={t("page.payments.title")}
+      subtitle={t("page.payments.subtitle")}
       primaryAction={{
-        content: selectedResources.length ? `Pay ${selectedResources.length} on supplier site` : "Pay on supplier site",
+        content: selectedResources.length ? `${t("action.pay")} (${selectedResources.length})` : t("action.pay"),
         disabled: selectedResources.length === 0,
         onAction: openSelected,
       }}
       secondaryActions={[
-        { content: "Check payment status", onAction: () => submit("check"), loading: fetcher.state !== "idle" },
+        { content: t("action.checkPayment"), onAction: () => submit("check"), loading: fetcher.state !== "idle" },
         {
-          content: "Mark selected as paid",
+          content: t("payments.markSelectedPaid"),
           disabled: selectedResources.length === 0,
           onAction: () => {
             submit("mark-paid");
@@ -110,9 +113,9 @@ export default function PaymentsPage() {
     >
       <Layout>
         <Layout.Section>
-          {result?.message && (
+          {actionMessage && (
             <Banner tone="success">
-              <p>{result.message}</p>
+              <p>{actionMessage}</p>
             </Banner>
           )}
           {result?.error && (
@@ -121,12 +124,14 @@ export default function PaymentsPage() {
             </Banner>
           )}
           {queue.overdue > 0 && (
-            <Banner tone="critical" title={`${queue.overdue} order(s) are past their payment deadline`}>
-              <p>AliExpress cancels unpaid orders after 24 hours. Check whether they still exist on the supplier site; if they were cancelled, retry them from the order page.</p>
+            <Banner tone="critical" title={`${queue.overdue} ${t("payments.overdueBannerTitle")}`}>
+              <p>
+                {t("payments.autoCancelWarning")} {t("payments.overdueBannerBody")}
+              </p>
             </Banner>
           )}
           {queue.expiringSoon > 0 && queue.overdue === 0 && (
-            <Banner tone="warning" title={`${queue.expiringSoon} order(s) must be paid within 6 hours`} />
+            <Banner tone="warning" title={`${queue.expiringSoon} ${t("payments.expiringSoonTitle")}`} />
           )}
         </Layout.Section>
 
@@ -137,13 +142,13 @@ export default function PaymentsPage() {
                 <Card key={total.currency}>
                   <BlockStack gap="100">
                     <Text as="p" tone="subdued" variant="bodySm">
-                      Outstanding ({total.currency})
+                      {t("payments.outstanding")} ({total.currency})
                     </Text>
                     <Text as="p" variant="headingLg">
                       {formatMoney(total.amount, total.currency)}
                     </Text>
                     <Text as="p" tone="subdued" variant="bodySm">
-                      {total.count} order(s)
+                      {total.count} {t("payments.orderCount")}
                     </Text>
                   </BlockStack>
                 </Card>
@@ -154,12 +159,12 @@ export default function PaymentsPage() {
                     <InlineStack gap="200" blockAlign="center">
                       <PlatformBadge platform={p.platform} />
                       <Text as="p" tone="subdued" variant="bodySm">
-                        {p.count} unpaid
+                        {p.count} {t("payments.unpaid")}
                       </Text>
                     </InlineStack>
                     {p.bulkUrl && (
                       <Button size="slim" url={p.bulkUrl} external>
-                        Open unpaid list
+                        {t("payments.openUnpaidList")}
                       </Button>
                     )}
                   </BlockStack>
@@ -172,22 +177,22 @@ export default function PaymentsPage() {
         <Layout.Section>
           <Card padding="0">
             {items.length === 0 ? (
-              <EmptyState heading="Nothing to pay" image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png" action={{ content: "View orders", url: "/app/orders" }}>
-                <p>Supplier orders waiting for payment show up here as soon as they are placed.</p>
+              <EmptyState heading={t("payments.empty")} image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png" action={{ content: t("payments.viewOrders"), url: "/app/orders" }}>
+                <p>{t("payments.emptyBody")}</p>
               </EmptyState>
             ) : (
               <IndexTable
-                resourceName={{ singular: "payment", plural: "payments" }}
+                resourceName={{ singular: t("payments.resourceSingular"), plural: t("payments.resourcePlural") }}
                 itemCount={items.length}
                 selectedItemsCount={allResourcesSelected ? "All" : selectedResources.length}
                 onSelectionChange={handleSelectionChange}
                 headings={[
-                  { title: "Shopify order" },
-                  { title: "Supplier order" },
-                  { title: "Items" },
-                  { title: "Shipping" },
-                  { title: "Total" },
-                  { title: "Deadline" },
+                  { title: t("payments.col.shopifyOrder") },
+                  { title: t("common.supplierOrder") },
+                  { title: t("payments.col.items") },
+                  { title: t("common.shipping") },
+                  { title: t("common.total") },
+                  { title: t("payments.deadline") },
                   { title: "" },
                 ]}
               >
@@ -215,11 +220,11 @@ export default function PaymentsPage() {
                             <StatusBadge status={item.status} />
                           </InlineStack>
                           <Text as="span" variant="bodySm">
-                            {item.externalOrderId ?? "not placed"}
+                            {item.externalOrderId ?? t("payments.notPlaced")}
                           </Text>
                           {item.supplierAccount && (
                             <Text as="span" tone="subdued" variant="bodySm">
-                              via {item.supplierAccount}
+                              {t("payments.via")} {item.supplierAccount}
                             </Text>
                           )}
                         </BlockStack>
@@ -241,7 +246,7 @@ export default function PaymentsPage() {
                         {item.paymentDueAt ? (
                           <Tooltip content={formatDate(item.paymentDueAt)}>
                             <Badge tone={overdue ? "critical" : soon ? "warning" : undefined}>
-                              {overdue ? "Overdue" : `${Math.floor(item.hoursLeft ?? 0)}h left`}
+                              {overdue ? t("payments.overdue") : `${Math.floor(item.hoursLeft ?? 0)} ${t("payments.hoursLeft")}`}
                             </Badge>
                           </Tooltip>
                         ) : (
@@ -260,11 +265,11 @@ export default function PaymentsPage() {
                               external
                               onClick={() => setOpened((p) => [...new Set([...p, item.id])])}
                             >
-                              {opened.includes(item.id) ? "Opened" : "Pay"}
+                              {opened.includes(item.id) ? t("payments.opened") : t("payments.pay")}
                             </Button>
                           )}
                           <Button size="slim" onClick={() => fetcher.submit({ intent: "mark-paid", ids: item.id }, { method: "post" })}>
-                            Paid
+                            {t("payments.paid")}
                           </Button>
                         </InlineStack>
                       </IndexTable.Cell>
@@ -280,15 +285,11 @@ export default function PaymentsPage() {
           <Card>
             <BlockStack gap="200">
               <Text as="h2" variant="headingMd">
-                How payment works
+                {t("payments.howItWorks.title")}
               </Text>
               <Box>
                 <Text as="p" tone="subdued">
-                  AliExpress does not let an app charge your account, so the app places the order and then hands you a
-                  direct link to pay it. Select the orders you want, click Pay, and each one opens on AliExpress in its own
-                  tab, already on the right order. After paying, use Check payment status — the app reads the status back
-                  from AliExpress and moves the order to Awaiting shipment on its own. Unpaid AliExpress orders are
-                  cancelled after 24 hours, which is what the deadline column counts down to.
+                  {t("payments.howItWorks.body")}
                 </Text>
               </Box>
             </BlockStack>

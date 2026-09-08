@@ -7,14 +7,16 @@ import { computePrice } from "~/domain/pricing/engine";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatMoney } from "~/lib/format";
+import type { Translator } from "~/lib/i18n";
+import { useMessage, useT } from "~/lib/use-t";
 import { createPricingRule, deletePricingRule, listPricingRules, setDefaultPricingRule, toRuleInput, updatePricingRule, type PricingRuleFormInput } from "~/services/pricing.server";
 
-const OP_OPTIONS: Array<{ label: string; value: PriceOp }> = [
-  { label: "Multiply cost by", value: "MULTIPLY" },
-  { label: "Add fixed amount", value: "ADD" },
-  { label: "Target margin %", value: "MARGIN" },
-  { label: "Fixed price", value: "FIXED" },
-  { label: "No change", value: "NONE" },
+const opOptions = (t: Translator): Array<{ label: string; value: PriceOp }> => [
+  { label: t("pricing.op.multiply"), value: "MULTIPLY" },
+  { label: t("pricing.op.add"), value: "ADD" },
+  { label: t("pricing.op.margin"), value: "MARGIN" },
+  { label: t("pricing.op.fixed"), value: "FIXED" },
+  { label: t("pricing.op.none"), value: "NONE" },
 ];
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -37,14 +39,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         const id = get("id");
         if (id) await updatePricingRule(shop.id, id, input);
         else await createPricingRule(shop.id, input);
-        return { ok: true, message: "Pricing rule saved." };
+        return { ok: true, messageKey: "msg.pricingRuleSaved" };
       }
       case "delete":
         await deletePricingRule(shop.id, get("id"));
-        return { ok: true, message: "Pricing rule deleted." };
+        return { ok: true, messageKey: "msg.pricingRuleDeleted" };
       case "default":
         await setDefaultPricingRule(shop.id, get("id"));
-        return { ok: true, message: "Default rule updated." };
+        return { ok: true, messageKey: "msg.defaultRuleUpdated" };
       default:
         return { ok: false, error: "Unknown action" };
     }
@@ -115,10 +117,13 @@ function toRuleInputFromForm(form: RuleForm): PricingRuleInput {
 }
 
 export default function PricingPage() {
+  const t = useT();
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const result = fetcher.data as { message?: string; error?: string } | undefined;
+  const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
   const [form, setForm] = useState<RuleForm | null>(null);
+  const opts = opOptions(t);
   const sampleCosts = [1, 2.5, 5, 10, 20, 50, 100];
   const preview = form ? sampleCosts.map((cost) => ({ cost, ...computePrice(toRuleInputFromForm(form), { cost, shippingCost: 2 }) })) : [];
 
@@ -146,12 +151,12 @@ export default function PricingPage() {
   };
 
   return (
-    <Page title="Pricing rules" subtitle="Turn supplier costs into store prices automatically." primaryAction={{ content: "New rule", onAction: () => setForm({ ...EMPTY, isDefault: data.rules.length === 0 }) }}>
+    <Page title={t("page.pricing.title")} subtitle={t("page.pricing.subtitle")} primaryAction={{ content: t("pricing.newRule"), onAction: () => setForm({ ...EMPTY, isDefault: data.rules.length === 0 }) }}>
       <Layout>
         <Layout.Section>
-          {result?.message && (
+          {actionMessage && (
             <Banner tone="success">
-              <p>{result.message}</p>
+              <p>{actionMessage}</p>
             </Banner>
           )}
           {result?.error && (
@@ -166,61 +171,61 @@ export default function PricingPage() {
             <Card>
               <BlockStack gap="400">
                 <Text as="h2" variant="headingMd">
-                  {form.id ? "Edit rule" : "New rule"}
+                  {form.id ? t("pricing.editRule") : t("pricing.newRule")}
                 </Text>
                 <FormLayout>
                   <FormLayout.Group>
-                    <TextField label="Name" value={form.name} onChange={(v) => setForm({ ...form, name: v })} autoComplete="off" placeholder="e.g. Standard 2x" />
-                    <TextField label="Description" value={form.description} onChange={(v) => setForm({ ...form, description: v })} autoComplete="off" />
+                    <TextField label={t("pricing.form.name")} value={form.name} onChange={(v) => setForm({ ...form, name: v })} autoComplete="off" placeholder={t("pricing.form.namePlaceholder")} />
+                    <TextField label={t("pricing.form.description")} value={form.description} onChange={(v) => setForm({ ...form, description: v })} autoComplete="off" />
                   </FormLayout.Group>
                   <InlineStack gap="400">
-                    <Checkbox label="Default rule for new imports" checked={form.isDefault} onChange={(v) => setForm({ ...form, isDefault: v })} />
-                    <Checkbox label="Enabled" checked={form.isEnabled} onChange={(v) => setForm({ ...form, isEnabled: v })} />
-                    <Checkbox label="Include supplier shipping in cost" checked={form.includeShipping} onChange={(v) => setForm({ ...form, includeShipping: v })} />
-                    <Checkbox label="Write cost to Shopify 'Cost per item'" checked={form.syncCostOfGoods} onChange={(v) => setForm({ ...form, syncCostOfGoods: v })} />
+                    <Checkbox label={t("pricing.form.isDefault")} checked={form.isDefault} onChange={(v) => setForm({ ...form, isDefault: v })} />
+                    <Checkbox label={t("pricing.form.isEnabled")} checked={form.isEnabled} onChange={(v) => setForm({ ...form, isEnabled: v })} />
+                    <Checkbox label={t("pricing.form.includeShipping")} checked={form.includeShipping} onChange={(v) => setForm({ ...form, includeShipping: v })} />
+                    <Checkbox label={t("pricing.form.syncCostOfGoods")} checked={form.syncCostOfGoods} onChange={(v) => setForm({ ...form, syncCostOfGoods: v })} />
                   </InlineStack>
                   <Divider />
                   <Text as="h3" variant="headingSm">
-                    Base formula (when no tier matches)
+                    {t("pricing.form.baseFormula")}
                   </Text>
                   <FormLayout.Group>
-                    <Select label="Price" options={OP_OPTIONS} value={form.basePriceOp} onChange={(v) => setForm({ ...form, basePriceOp: v as PriceOp })} />
-                    <TextField label="Value" type="number" value={form.basePriceValue} onChange={(v) => setForm({ ...form, basePriceValue: v })} autoComplete="off" />
-                    <Select label="Compare-at price" options={OP_OPTIONS} value={form.compareAtOp} onChange={(v) => setForm({ ...form, compareAtOp: v as PriceOp })} helpText="Applied to the computed price" />
-                    <TextField label="Value" type="number" value={form.compareAtValue} onChange={(v) => setForm({ ...form, compareAtValue: v })} autoComplete="off" disabled={form.compareAtOp === "NONE"} />
+                    <Select label={t("common.price")} options={opts} value={form.basePriceOp} onChange={(v) => setForm({ ...form, basePriceOp: v as PriceOp })} />
+                    <TextField label={t("pricing.form.value")} type="number" value={form.basePriceValue} onChange={(v) => setForm({ ...form, basePriceValue: v })} autoComplete="off" />
+                    <Select label={t("pricing.form.compareAtPrice")} options={opts} value={form.compareAtOp} onChange={(v) => setForm({ ...form, compareAtOp: v as PriceOp })} helpText={t("pricing.form.compareAtHelp")} />
+                    <TextField label={t("pricing.form.value")} type="number" value={form.compareAtValue} onChange={(v) => setForm({ ...form, compareAtValue: v })} autoComplete="off" disabled={form.compareAtOp === "NONE"} />
                   </FormLayout.Group>
                   <FormLayout.Group>
-                    <TextField label="Cents ending" type="number" value={form.centsEnding} onChange={(v) => setForm({ ...form, centsEnding: v })} autoComplete="off" helpText="e.g. 99 → 19.99; blank keeps cents" />
-                    <TextField label="Round up to multiple of" type="number" value={form.roundToMultiple} onChange={(v) => setForm({ ...form, roundToMultiple: v })} autoComplete="off" helpText="e.g. 5 → 21.40 becomes 25" />
-                    <TextField label="Minimum price" type="number" value={form.minPrice} onChange={(v) => setForm({ ...form, minPrice: v })} autoComplete="off" prefix={data.currency} />
-                    <TextField label="Maximum price" type="number" value={form.maxPrice} onChange={(v) => setForm({ ...form, maxPrice: v })} autoComplete="off" prefix={data.currency} />
+                    <TextField label={t("pricing.form.centsEnding")} type="number" value={form.centsEnding} onChange={(v) => setForm({ ...form, centsEnding: v })} autoComplete="off" helpText={t("pricing.form.centsEndingHelp")} />
+                    <TextField label={t("pricing.form.roundToMultiple")} type="number" value={form.roundToMultiple} onChange={(v) => setForm({ ...form, roundToMultiple: v })} autoComplete="off" helpText={t("pricing.form.roundToMultipleHelp")} />
+                    <TextField label={t("pricing.form.minPrice")} type="number" value={form.minPrice} onChange={(v) => setForm({ ...form, minPrice: v })} autoComplete="off" prefix={data.currency} />
+                    <TextField label={t("pricing.form.maxPrice")} type="number" value={form.maxPrice} onChange={(v) => setForm({ ...form, maxPrice: v })} autoComplete="off" prefix={data.currency} />
                   </FormLayout.Group>
                   <Divider />
                   <InlineStack align="space-between" blockAlign="center">
                     <Text as="h3" variant="headingSm">
-                      Cost-range tiers
+                      {t("pricing.tiers.title")}
                     </Text>
                     <Button size="slim" onClick={() => setForm({ ...form, tiers: [...form.tiers, { minCost: form.tiers.length ? form.tiers[form.tiers.length - 1].maxCost || "0" : "0", maxCost: "", priceOp: "MULTIPLY", priceValue: "2", compareAtOp: "NONE", compareAtValue: "" }] })}>
-                      Add tier
+                      {t("pricing.tiers.add")}
                     </Button>
                   </InlineStack>
                   {form.tiers.length === 0 && (
                     <Text as="p" tone="subdued" variant="bodySm">
-                      Optional. Tiers let cheap items carry a higher multiplier than expensive ones (e.g. $0–5 ×3, $5–20 ×2.2, $20+ ×1.8).
+                      {t("pricing.tiers.help")}
                     </Text>
                   )}
                   {form.tiers.map((tier, i) => (
                     <Box key={i} padding="200" background="bg-surface-secondary" borderRadius="200">
                       <InlineGrid columns={{ xs: 2, md: 7 }} gap="200">
-                        <TextField label="From cost" type="number" value={tier.minCost} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((t, j) => (j === i ? { ...t, minCost: v } : t)) })} autoComplete="off" />
-                        <TextField label="To cost" type="number" value={tier.maxCost} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((t, j) => (j === i ? { ...t, maxCost: v } : t)) })} autoComplete="off" placeholder="∞" />
-                        <Select label="Price" options={OP_OPTIONS} value={tier.priceOp} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((t, j) => (j === i ? { ...t, priceOp: v as PriceOp } : t)) })} />
-                        <TextField label="Value" type="number" value={tier.priceValue} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((t, j) => (j === i ? { ...t, priceValue: v } : t)) })} autoComplete="off" />
-                        <Select label="Compare-at" options={OP_OPTIONS} value={tier.compareAtOp} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((t, j) => (j === i ? { ...t, compareAtOp: v as PriceOp } : t)) })} />
-                        <TextField label="Value" type="number" value={tier.compareAtValue} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((t, j) => (j === i ? { ...t, compareAtValue: v } : t)) })} autoComplete="off" disabled={tier.compareAtOp === "NONE"} />
+                        <TextField label={t("pricing.tiers.fromCost")} type="number" value={tier.minCost} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, minCost: v } : tr)) })} autoComplete="off" />
+                        <TextField label={t("pricing.tiers.toCost")} type="number" value={tier.maxCost} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, maxCost: v } : tr)) })} autoComplete="off" placeholder="∞" />
+                        <Select label={t("common.price")} options={opts} value={tier.priceOp} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, priceOp: v as PriceOp } : tr)) })} />
+                        <TextField label={t("pricing.form.value")} type="number" value={tier.priceValue} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, priceValue: v } : tr)) })} autoComplete="off" />
+                        <Select label={t("pricing.tiers.compareAt")} options={opts} value={tier.compareAtOp} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, compareAtOp: v as PriceOp } : tr)) })} />
+                        <TextField label={t("pricing.form.value")} type="number" value={tier.compareAtValue} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, compareAtValue: v } : tr)) })} autoComplete="off" disabled={tier.compareAtOp === "NONE"} />
                         <Box paddingBlockStart="600">
                           <Button size="slim" tone="critical" onClick={() => setForm({ ...form, tiers: form.tiers.filter((_, j) => j !== i) })}>
-                            Remove
+                            {t("action.remove")}
                           </Button>
                         </Box>
                       </InlineGrid>
@@ -228,18 +233,18 @@ export default function PricingPage() {
                   ))}
                   <Divider />
                   <Text as="h3" variant="headingSm">
-                    Preview (supplier shipping assumed {formatMoney(2, data.currency)})
+                    {`${t("pricing.preview.title")} (${t("pricing.preview.shippingAssumed")} ${formatMoney(2, data.currency)})`}
                   </Text>
                   <DataTable
                     columnContentTypes={["numeric", "numeric", "numeric", "numeric", "text"]}
-                    headings={["Cost", "Price", "Compare-at", "Margin", "Tier"]}
-                    rows={preview.map((p) => [formatMoney(p.cost, data.currency), formatMoney(p.price, data.currency), p.compareAtPrice ? formatMoney(p.compareAtPrice, data.currency) : "—", `${p.marginPercent}%`, p.appliedTierId !== null ? `#${Number(p.appliedTierId) + 1}` : "base"])}
+                    headings={[t("common.cost"), t("common.price"), t("pricing.tiers.compareAt"), t("pricing.table.margin"), t("pricing.table.tier")]}
+                    rows={preview.map((p) => [formatMoney(p.cost, data.currency), formatMoney(p.price, data.currency), p.compareAtPrice ? formatMoney(p.compareAtPrice, data.currency) : "—", `${p.marginPercent}%`, p.appliedTierId !== null ? `#${Number(p.appliedTierId) + 1}` : t("pricing.table.base")])}
                   />
                   <InlineStack gap="200">
                     <Button variant="primary" onClick={save} disabled={!form.name.trim()} loading={fetcher.state !== "idle"}>
-                      Save rule
+                      {t("pricing.saveRule")}
                     </Button>
-                    <Button onClick={() => setForm(null)}>Cancel</Button>
+                    <Button onClick={() => setForm(null)}>{t("action.cancel")}</Button>
                   </InlineStack>
                 </FormLayout>
               </BlockStack>
@@ -252,8 +257,8 @@ export default function PricingPage() {
             {data.rules.length === 0 && !form && (
               <Card>
                 <BlockStack gap="200">
-                  <Text as="p">No pricing rule yet — imports use the built-in default (2× cost, compare-at 1.4×, .99 ending).</Text>
-                  <Button onClick={() => setForm({ ...EMPTY, isDefault: true })}>Create your first rule</Button>
+                  <Text as="p">{t("pricing.empty")}</Text>
+                  <Button onClick={() => setForm({ ...EMPTY, isDefault: true })}>{t("pricing.createFirst")}</Button>
                 </BlockStack>
               </Card>
             )}
@@ -265,25 +270,25 @@ export default function PricingPage() {
                       <Text as="h3" variant="headingMd">
                         {rule.name}
                       </Text>
-                      {rule.isDefault && <Badge tone="success">Default</Badge>}
-                      {!rule.isEnabled && <Badge>Disabled</Badge>}
+                      {rule.isDefault && <Badge tone="success">{t("pricing.badge.default")}</Badge>}
+                      {!rule.isEnabled && <Badge>{t("common.disabled")}</Badge>}
                     </InlineStack>
                     <Text as="p" tone="subdued" variant="bodySm">
-                      {describe(rule)}
+                      {describe(rule, t)}
                     </Text>
                     {rule.description && <Text as="p">{rule.description}</Text>}
                   </BlockStack>
                   <InlineStack gap="100">
                     <Button size="slim" onClick={() => setForm(toForm(rule))}>
-                      Edit
+                      {t("action.edit")}
                     </Button>
                     {!rule.isDefault && (
                       <Button size="slim" onClick={() => fetcher.submit({ intent: "default", id: rule.id! }, { method: "post" })}>
-                        Make default
+                        {t("pricing.makeDefault")}
                       </Button>
                     )}
                     <Button size="slim" tone="critical" onClick={() => fetcher.submit({ intent: "delete", id: rule.id! }, { method: "post" })}>
-                      Delete
+                      {t("action.delete")}
                     </Button>
                   </InlineStack>
                 </InlineStack>
@@ -296,14 +301,14 @@ export default function PricingPage() {
   );
 }
 
-function describe(rule: PricingRuleInput): string {
+function describe(rule: PricingRuleInput, t: Translator): string {
   const op = (o: PriceOp, v: string | number | null | undefined) =>
-    o === "MULTIPLY" ? `×${v}` : o === "ADD" ? `+${v}` : o === "MARGIN" ? `${v}% margin` : o === "FIXED" ? `fixed ${v}` : "no change";
-  const parts = [`Base ${op(rule.basePriceOp, rule.basePriceValue)}`];
-  if (rule.compareAtOp && rule.compareAtOp !== "NONE") parts.push(`compare-at ${op(rule.compareAtOp, rule.compareAtValue)}`);
-  if (rule.centsEnding !== null && rule.centsEnding !== undefined) parts.push(`.${String(rule.centsEnding).padStart(2, "0")} ending`);
-  if (rule.roundToMultiple) parts.push(`round to ${rule.roundToMultiple}`);
-  if (rule.tiers?.length) parts.push(`${rule.tiers.length} tier(s)`);
-  if (rule.includeShipping) parts.push("shipping included");
+    o === "MULTIPLY" ? `×${v}` : o === "ADD" ? `+${v}` : o === "MARGIN" ? `${t("pricing.describe.margin")} ${v}%` : o === "FIXED" ? `${t("pricing.describe.fixed")} ${v}` : t("pricing.describe.noChange");
+  const parts = [`${t("pricing.describe.base")} ${op(rule.basePriceOp, rule.basePriceValue)}`];
+  if (rule.compareAtOp && rule.compareAtOp !== "NONE") parts.push(`${t("pricing.describe.compareAt")} ${op(rule.compareAtOp, rule.compareAtValue)}`);
+  if (rule.centsEnding !== null && rule.centsEnding !== undefined) parts.push(`${t("pricing.describe.endsIn")} .${String(rule.centsEnding).padStart(2, "0")}`);
+  if (rule.roundToMultiple) parts.push(`${t("pricing.describe.roundTo")} ${rule.roundToMultiple}`);
+  if (rule.tiers?.length) parts.push(`${rule.tiers.length} ${t("pricing.describe.tiers")}`);
+  if (rule.includeShipping) parts.push(t("pricing.describe.shippingIncluded"));
   return parts.join(" · ");
 }

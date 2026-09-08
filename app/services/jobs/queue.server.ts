@@ -71,20 +71,30 @@ export function getQueue(): Queue | null {
 const inlineRunning = new Set<string>();
 
 /** Enqueue a job (or run it inline without Redis). Returns the queue job id. */
+/**
+ * Per-job options for BullMQ.
+ *
+ * A key is set only when it carries a value. BullMQ merges these over
+ * `defaultJobOptions`, and an explicit `undefined` overwrites the default — so
+ * passing `attempts: undefined` discarded `attempts: 3` and reduced every job in
+ * the app to a single attempt with no retry at all.
+ *
+ * Exported for the unit test; `now` is injectable so the dedupe bucket is
+ * deterministic there.
+ */
+export function buildJobOptions(options: EnqueueOptions, now = Date.now()): JobsOptions {
+  return {
+    ...(options.delayMs !== undefined ? { delay: options.delayMs } : {}),
+    ...(options.attempts !== undefined ? { attempts: options.attempts } : {}),
+    ...(options.priority !== undefined ? { priority: options.priority } : {}),
+    ...(options.dedupeKey ? { jobId: dedupeJobId(options.dedupeKey, dedupeWindow(options), now) } : {}),
+  };
+}
+
 export async function enqueue<N extends JobName>(name: N, payload: JobPayloads[N], options: EnqueueOptions = {}): Promise<string> {
   const q = getQueue();
   if (q) {
-    // Keys are added only when they carry a value. BullMQ merges the per-job
-    // options over defaultJobOptions, so an explicit `undefined` overwrites the
-    // default — passing `attempts: undefined` silently reduced every job to a
-    // single attempt and no job in the app was ever retried.
-    const opts: JobsOptions = {
-      ...(options.delayMs !== undefined ? { delay: options.delayMs } : {}),
-      ...(options.attempts !== undefined ? { attempts: options.attempts } : {}),
-      ...(options.priority !== undefined ? { priority: options.priority } : {}),
-      ...(options.dedupeKey ? { jobId: dedupeJobId(options.dedupeKey, dedupeWindow(options)) } : {}),
-    };
-    const job = await q.add(name, payload, opts);
+    const job = await q.add(name, payload, buildJobOptions(options));
     return job.id ?? name;
   }
 
@@ -226,8 +236,8 @@ function dedupeWindow(options: EnqueueOptions): number {
  * was a no-op until the next day. Bucketing by time makes the key mean what it
  * says: one run per window.
  */
-function dedupeJobId(key: string, windowMs: number): string {
-  const bucket = Math.floor(Date.now() / Math.max(1_000, windowMs));
+export function dedupeJobId(key: string, windowMs: number, now = Date.now()): string {
+  const bucket = Math.floor(now / Math.max(1_000, windowMs));
   return sanitizeJobId(`${key}-${bucket}`);
 }
 

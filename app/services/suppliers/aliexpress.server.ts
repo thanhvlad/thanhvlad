@@ -51,6 +51,26 @@ import type {
 
 type Json = Record<string, unknown>;
 
+/**
+ * TOP request signature: HMAC-SHA256 over the parameters sorted by key and
+ * concatenated as `key + value`, uppercase hex.
+ *
+ * `pathPrefix` is prepended for the REST gateway, where the API path is part of
+ * the signed string and `method` is not among the parameters.
+ *
+ * Exported and pure so it can be pinned by a test: every live call fails if this
+ * is wrong by one character, and nothing else in the app would notice.
+ */
+export function signTopParams(secret: string, params: Record<string, string>, pathPrefix = ""): string {
+  const base =
+    pathPrefix +
+    Object.keys(params)
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+      .map((k) => `${k}${params[k]}`)
+      .join("");
+  return crypto.createHmac("sha256", secret).update(base, "utf8").digest("hex").toUpperCase();
+}
+
 /** Upstream order_status → our lifecycle. */
 const ORDER_STATUS_MAP: Record<string, SupplierOrderState> = {
   PLACE_ORDER_SUCCESS: "AWAITING_PAYMENT",
@@ -142,13 +162,7 @@ export class AliExpressAdapter implements SupplierAdapter {
    * gateway) it is prepended and `method` must not be in `params`.
    */
   private sign(params: Record<string, string>, pathPrefix = ""): string {
-    const base =
-      pathPrefix +
-      Object.keys(params)
-        .sort((a, b) => a.localeCompare(b))
-        .map((k) => `${k}${params[k]}`)
-        .join("");
-    return crypto.createHmac("sha256", this.appSecret).update(base, "utf8").digest("hex").toUpperCase();
+    return signTopParams(this.appSecret, params, pathPrefix);
   }
 
   private systemParams(method: string): Record<string, string> {

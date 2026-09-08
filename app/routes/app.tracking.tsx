@@ -7,6 +7,7 @@ import { PlatformBadge, StatusBadge } from "~/components/StatusBadge";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatDate, pageParam, relativeTime } from "~/lib/format";
+import { useMessage, useT } from "~/lib/use-t";
 import { syncOpenPurchaseOrders, syncPendingTracking } from "~/services/fulfillment.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -66,11 +67,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   try {
     if (intent === "sync-tracking") {
       const result = await syncPendingTracking(shop, undefined, graphql);
-      return { ok: true, message: `${result.synced} synced, ${result.failed} failed.` };
+      return { ok: true, messageKey: "msg.trackingSyncResult", messageVars: { n: result.synced, failed: result.failed } };
     }
     if (intent === "poll-suppliers") {
       const result = await syncOpenPurchaseOrders(shop, { limit: 100 });
-      return { ok: true, message: `Checked ${result.checked} supplier order(s); ${result.changed} updated.` };
+      return { ok: true, messageKey: "msg.purchaseOrdersChecked", messageVars: { n: result.checked, changed: result.changed } };
     }
     return { ok: false, error: "Unknown action" };
   } catch (e) {
@@ -79,31 +80,33 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function TrackingPage() {
+  const t = useT();
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const result = fetcher.data as { message?: string; error?: string } | undefined;
+  const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
   const tabs = [
-    { id: "all", content: `All (${data.counts.all})` },
-    { id: "unsynced", content: `Not synced (${data.counts.unsynced})` },
-    { id: "failed", content: `Sync failed (${data.counts.failed})` },
-    { id: "delivered", content: "Delivered" },
+    { id: "all", content: `${t("common.all")} (${data.counts.all})` },
+    { id: "unsynced", content: `${t("tracking.tab.unsynced")} (${data.counts.unsynced})` },
+    { id: "failed", content: `${t("tracking.tab.failed")} (${data.counts.failed})` },
+    { id: "delivered", content: t("tracking.tab.delivered") },
   ];
-  const selected = Math.max(0, tabs.findIndex((t) => t.id === data.filter));
+  const selected = Math.max(0, tabs.findIndex((tab) => tab.id === data.filter));
 
   return (
     <Page
-      title="Tracking"
-      subtitle={`${data.awaitingShipment} supplier order(s) waiting for shipment`}
-      primaryAction={{ content: "Sync tracking to Shopify", onAction: () => fetcher.submit({ intent: "sync-tracking" }, { method: "post" }), loading: fetcher.state !== "idle", disabled: data.counts.unsynced === 0 }}
-      secondaryActions={[{ content: "Check suppliers for new tracking", onAction: () => fetcher.submit({ intent: "poll-suppliers" }, { method: "post" }) }]}
+      title={t("page.tracking.title")}
+      subtitle={`${data.awaitingShipment} ${t("tracking.awaitingShipment")}`}
+      primaryAction={{ content: t("tracking.syncToShopify"), onAction: () => fetcher.submit({ intent: "sync-tracking" }, { method: "post" }), loading: fetcher.state !== "idle", disabled: data.counts.unsynced === 0 }}
+      secondaryActions={[{ content: t("tracking.checkSuppliers"), onAction: () => fetcher.submit({ intent: "poll-suppliers" }, { method: "post" }) }]}
     >
       <Layout>
         <Layout.Section>
-          {result?.message && (
+          {actionMessage && (
             <Banner tone="success">
-              <p>{result.message}</p>
+              <p>{actionMessage}</p>
             </Banner>
           )}
           {result?.error && (
@@ -125,61 +128,61 @@ export default function TrackingPage() {
               }}
             />
             {data.list.items.length === 0 ? (
-              <EmptyState heading="No tracking numbers yet" image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png">
-                <p>Tracking numbers appear here once suppliers ship, and are pushed to Shopify as fulfilments.</p>
+              <EmptyState heading={t("tracking.empty")} image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png">
+                <p>{t("tracking.emptyBody")}</p>
               </EmptyState>
             ) : (
               <IndexTable
-                resourceName={{ singular: "tracking number", plural: "tracking numbers" }}
+                resourceName={{ singular: t("tracking.resourceSingular"), plural: t("tracking.resourcePlural") }}
                 itemCount={data.list.items.length}
                 selectable={false}
-                headings={[{ title: "Order" }, { title: "Supplier order" }, { title: "Tracking" }, { title: "Carrier" }, { title: "Status" }, { title: "Shopify" }, { title: "Received" }]}
+                headings={[{ title: t("tracking.col.order") }, { title: t("common.supplierOrder") }, { title: t("tracking.col.tracking") }, { title: t("tracking.col.carrier") }, { title: t("common.status") }, { title: "Shopify" }, { title: t("tracking.col.received") }]}
               >
-                {data.list.items.map((t, index) => (
-                  <IndexTable.Row id={t.id} key={t.id} position={index}>
+                {data.list.items.map((row, index) => (
+                  <IndexTable.Row id={row.id} key={row.id} position={index}>
                     <IndexTable.Cell>
-                      <Link to={`/app/orders/${t.orderId}`}>{t.orderName}</Link>
+                      <Link to={`/app/orders/${row.orderId}`}>{row.orderName}</Link>
                       <Text as="span" tone="subdued" variant="bodySm">
                         {" "}
-                        {t.country}
+                        {row.country}
                       </Text>
                     </IndexTable.Cell>
                     <IndexTable.Cell>
                       <InlineStack gap="100">
-                        <PlatformBadge platform={t.platform} />
+                        <PlatformBadge platform={row.platform} />
                         <Text as="span" variant="bodySm">
-                          {t.externalOrderId}
+                          {row.externalOrderId}
                         </Text>
-                        <StatusBadge status={t.poStatus} />
+                        <StatusBadge status={row.poStatus} />
                       </InlineStack>
                     </IndexTable.Cell>
                     <IndexTable.Cell>
-                      {t.url ? (
-                        <Button variant="plain" url={t.url} external>
-                          {t.number}
+                      {row.url ? (
+                        <Button variant="plain" url={row.url} external>
+                          {row.number}
                         </Button>
                       ) : (
-                        t.number
+                        row.number
                       )}
                     </IndexTable.Cell>
-                    <IndexTable.Cell>{t.carrier ?? "—"}</IndexTable.Cell>
-                    <IndexTable.Cell>{t.status ? <Badge>{t.status}</Badge> : "—"}</IndexTable.Cell>
+                    <IndexTable.Cell>{row.carrier ?? "—"}</IndexTable.Cell>
+                    <IndexTable.Cell>{row.status ? <Badge>{row.status}</Badge> : "—"}</IndexTable.Cell>
                     <IndexTable.Cell>
                       <BlockStack gap="050">
-                        <Badge tone={t.synced ? "success" : t.syncError ? "critical" : "attention"}>{t.synced ? "Fulfilled" : t.syncError ? "Failed" : "Pending"}</Badge>
-                        {t.syncError && (
+                        <Badge tone={row.synced ? "success" : row.syncError ? "critical" : "attention"}>{row.synced ? t("stage.FULFILLED") : row.syncError ? t("stage.FAILED") : t("stage.PENDING")}</Badge>
+                        {row.syncError && (
                           <Text as="span" tone="critical" variant="bodySm">
-                            {t.syncError}
+                            {row.syncError}
                           </Text>
                         )}
-                        {t.syncedAt && (
+                        {row.syncedAt && (
                           <Text as="span" tone="subdued" variant="bodySm">
-                            {formatDate(t.syncedAt)}
+                            {formatDate(row.syncedAt)}
                           </Text>
                         )}
                       </BlockStack>
                     </IndexTable.Cell>
-                    <IndexTable.Cell>{relativeTime(t.createdAt)}</IndexTable.Cell>
+                    <IndexTable.Cell>{relativeTime(row.createdAt)}</IndexTable.Cell>
                   </IndexTable.Row>
                 ))}
               </IndexTable>

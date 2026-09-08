@@ -5,6 +5,7 @@ import { Badge, BlockStack, Box, Button, Card, EmptyState, InlineStack, Layout, 
 import prisma from "~/db.server";
 import { requireShop } from "~/lib/auth.server";
 import { formatDate } from "~/lib/format";
+import { useT } from "~/lib/use-t";
 import { queueStats } from "~/services/jobs/index.server";
 import { listJobRuns } from "~/services/jobs.server";
 import { StatusBadge } from "~/components/StatusBadge";
@@ -30,6 +31,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 const LEVEL_TONE: Record<string, "critical" | "warning" | "info" | undefined> = { error: "critical", warn: "warning", info: undefined, debug: undefined };
 
 export default function LogsPage() {
+  const t = useT();
   const { logs, jobs, queue, filters } = useLoaderData<typeof loader>();
   // Polaris passes value/onChange straight to the DOM node, so a controlled
   // input with a no-op onChange cannot be typed in at all. Local state holds
@@ -52,18 +54,49 @@ export default function LogsPage() {
     return null;
   };
   return (
-    <Page title="Activity" subtitle={`Queue: ${queue.mode === "redis" ? `Redis · ${queue.waiting} waiting · ${queue.active} active · ${queue.failed} failed` : "inline (no Redis)"}`}>
+    <Page
+      title={t("page.logs.title")}
+      subtitle={`${t("logs.queue")}: ${
+        queue.mode === "redis"
+          ? `Redis · ${queue.waiting} ${t("logs.waiting")} · ${queue.active} ${t("logs.active")} · ${queue.failed} ${t("logs.failed")}`
+          : t("logs.queueInline")
+      }`}
+    >
       <Layout>
         <Layout.Section>
           <Card>
             <Form method="get">
               <InlineStack gap="200" blockAlign="end" wrap>
                 <div style={{ flex: 1, minWidth: 200 }}>
-                  <TextField label="Search" name="q" value={q} onChange={setQ} autoComplete="off" />
+                  <TextField label={t("action.search")} name="q" value={q} onChange={setQ} autoComplete="off" />
                 </div>
-                <Select label="Level" name="level" value={level} onChange={setLevel} options={[{ label: "All levels", value: "" }, { label: "Errors", value: "error" }, { label: "Warnings", value: "warn" }, { label: "Info", value: "info" }]} />
-                <Select label="Entity" name="entity" value={entity} onChange={setEntity} options={[{ label: "All", value: "" }, { label: "Orders", value: "Order" }, { label: "Products", value: "Product" }, { label: "Import list", value: "ImportedProduct" }, { label: "Pricing rules", value: "PricingRule" }, { label: "Supplier accounts", value: "SupplierAccount" }]} />
-                <Button submit>Filter</Button>
+                <Select
+                  label={t("logs.level")}
+                  name="level"
+                  value={level}
+                  onChange={setLevel}
+                  options={[
+                    { label: t("logs.allLevels"), value: "" },
+                    { label: t("logs.errors"), value: "error" },
+                    { label: t("logs.warnings"), value: "warn" },
+                    { label: t("logs.info"), value: "info" },
+                  ]}
+                />
+                <Select
+                  label={t("logs.entity")}
+                  name="entity"
+                  value={entity}
+                  onChange={setEntity}
+                  options={[
+                    { label: t("common.all"), value: "" },
+                    { label: t("nav.orders"), value: "Order" },
+                    { label: t("logs.products"), value: "Product" },
+                    { label: t("nav.import"), value: "ImportedProduct" },
+                    { label: t("nav.pricing"), value: "PricingRule" },
+                    { label: t("logs.supplierAccounts"), value: "SupplierAccount" },
+                  ]}
+                />
+                <Button submit>{t("logs.filter")}</Button>
               </InlineStack>
             </Form>
           </Card>
@@ -73,11 +106,11 @@ export default function LogsPage() {
           <Card>
             <BlockStack gap="300">
               <Text as="h2" variant="headingMd">
-                Background jobs
+                {t("logs.backgroundJobs")}
               </Text>
               {jobs.length === 0 && (
                 <Text as="p" tone="subdued">
-                  No jobs yet.
+                  {t("logs.noJobs")}
                 </Text>
               )}
               {jobs.map((j) => (
@@ -86,7 +119,7 @@ export default function LogsPage() {
                     <StatusBadge status={j.status} />
                     <Text as="span">{j.type}</Text>
                     <Text as="span" tone="subdued" variant="bodySm">
-                      {j.processed}/{j.total} · {j.succeeded} ok · {j.failed} failed
+                      {j.processed}/{j.total} · {j.succeeded} {t("logs.ok")} · {j.failed} {t("logs.failed")}
                     </Text>
                   </InlineStack>
                   <Text as="span" tone="subdued" variant="bodySm">
@@ -102,8 +135,8 @@ export default function LogsPage() {
         <Layout.Section>
           <Card padding="0">
             {logs.length === 0 ? (
-              <EmptyState heading="No activity yet" image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png">
-                <p>Every import, push, order placement and sync is recorded here.</p>
+              <EmptyState heading={t("logs.empty")} image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png">
+                <p>{t("logs.emptyBody")}</p>
               </EmptyState>
             ) : (
               logs.map((log) => {

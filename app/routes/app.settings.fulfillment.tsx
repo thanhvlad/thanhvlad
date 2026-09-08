@@ -17,6 +17,7 @@ import { StatusBadge } from "~/components/StatusBadge";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatDate, relativeTime } from "~/lib/format";
+import { useMessage, useT } from "~/lib/use-t";
 import prisma from "~/db.server";
 import {
   assignProductsToService,
@@ -56,17 +57,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     switch (intent) {
       case "register": {
         const service = await registerFulfillmentService(shop, graphql, actor);
-        return { ok: true, message: `Registered. Shopify created the location "${service.locationName ?? service.locationId}".` };
+        return { ok: true, messageKey: "msg.fulfillmentServiceRegistered", messageVars: { location: String(service.locationName ?? service.locationId) } };
       }
       case "unregister":
         await unregisterFulfillmentService(shop, graphql, actor);
-        return { ok: true, message: "Fulfilment service removed." };
+        return { ok: true, messageKey: "msg.fulfillmentServiceRemoved" };
       case "assign-all": {
         const products = await prisma.product.findMany({ where: { shopId: shop.id }, select: { id: true } });
         const result = await assignProductsToService(shop, graphql, products.map((p) => p.id), actor);
         return {
           ok: true,
-          message: `${result.assigned} of ${result.total} variant(s) stocked at the app's location.`,
+          messageKey: "msg.variantsStocked", messageVars: { n: result.assigned, total: result.total },
           errors: result.errors.slice(0, 8),
         };
       }
@@ -82,18 +83,20 @@ export default function FulfillmentServiceSettings() {
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const result = fetcher.data as { message?: string; error?: string; errors?: string[] } | undefined;
+  const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
   const { state } = data;
+  const t = useT();
   const coverage = state.totalVariants > 0 ? Math.round((state.assignedVariants / state.totalVariants) * 100) : 0;
 
   return (
     <Layout>
       <Layout.Section>
-        {result?.message && (
+        {actionMessage && (
           <Banner tone="success">
-            <p>{result.message}</p>
-            {result.errors?.length ? (
+            <p>{actionMessage}</p>
+            {result?.errors?.length ? (
               <List>
-                {result.errors.map((e) => (
+                {result.errors!.map((e) => (
                   <List.Item key={e}>{e}</List.Item>
                 ))}
               </List>
@@ -101,26 +104,23 @@ export default function FulfillmentServiceSettings() {
           </Banner>
         )}
         {result?.error && (
-          <Banner tone="critical" title="Shopify rejected the request">
+          <Banner tone="critical" title={t("settings.fulfillmentService.rejected")}>
             <p>{result.error}</p>
           </Banner>
         )}
       </Layout.Section>
 
-      <Layout.AnnotatedSection
-        title="Request fulfillment button"
-        description="Register the app as a Shopify fulfilment service so every order gets a native Request fulfillment button that sends the order straight here."
-      >
+      <Layout.AnnotatedSection title={t("settings.fulfillmentService.title")} description={t("settings.fulfillmentService.description")}>
         <Card>
           <BlockStack gap="400">
             <InlineStack gap="200" blockAlign="center">
               <Text as="span" fontWeight="semibold">
-                Status
+                {t("common.status")}
               </Text>
-              <Badge tone={state.registered ? "success" : undefined}>{state.registered ? "Registered" : "Not registered"}</Badge>
+              <Badge tone={state.registered ? "success" : undefined}>{state.registered ? t("settings.fulfillmentService.registered") : t("settings.fulfillmentService.notRegistered")}</Badge>
               {state.registeredAt && (
                 <Text as="span" tone="subdued" variant="bodySm">
-                  since {formatDate(state.registeredAt)}
+                  {t("settings.fulfillmentService.since")} {formatDate(state.registeredAt)}
                 </Text>
               )}
             </InlineStack>
@@ -128,42 +128,38 @@ export default function FulfillmentServiceSettings() {
             {state.registered ? (
               <BlockStack gap="300">
                 <Text as="p" tone="subdued">
-                  Shopify location: <strong>{state.locationName ?? state.locationId}</strong>
+                  {t("settings.fulfillmentService.location")}: <strong>{state.locationName ?? state.locationId}</strong>
                 </Text>
                 <BlockStack gap="100">
                   <InlineStack align="space-between">
-                    <Text as="span">Products routed to the app</Text>
+                    <Text as="span">{t("settings.fulfillmentService.productsRouted")}</Text>
                     <Text as="span" tone="subdued">
-                      {state.assignedVariants}/{state.totalVariants} variants
+                      {state.assignedVariants}/{state.totalVariants} {t("settings.fulfillmentService.variantsCount")}
                     </Text>
                   </InlineStack>
                   <ProgressBar progress={coverage} size="small" />
                 </BlockStack>
                 <Text as="p" tone="subdued" variant="bodySm">
-                  Only products stocked at that location show the button. Assign your managed products, then open any order in
-                  Shopify — you will see Request fulfillment next to the items.
+                  {t("settings.fulfillmentService.locationHelp")}
                 </Text>
                 <InlineStack gap="200">
                   <Button variant="primary" onClick={() => fetcher.submit({ intent: "assign-all" }, { method: "post" })} loading={fetcher.state !== "idle"}>
-                    Route all my products to the app
+                    {t("settings.fulfillmentService.routeAll")}
                   </Button>
                   <Button tone="critical" onClick={() => fetcher.submit({ intent: "unregister" }, { method: "post" })}>
-                    Unregister
+                    {t("settings.fulfillmentService.unregister")}
                   </Button>
                 </InlineStack>
               </BlockStack>
             ) : (
               <BlockStack gap="300">
-                <Text as="p">
-                  Registering creates a Shopify location owned by this app. Nothing else changes until you assign products to
-                  it, and you can unregister at any time.
-                </Text>
+                <Text as="p">{t("settings.fulfillmentService.registerHelp")}</Text>
                 <Text as="p" tone="subdued" variant="bodySm">
-                  Callback URL Shopify will be given: <code>{data.callbackUrl}</code>
+                  {t("settings.fulfillmentService.callbackUrl")}: <code>{data.callbackUrl}</code>
                 </Text>
                 <Box>
                   <Button variant="primary" onClick={() => fetcher.submit({ intent: "register" }, { method: "post" })} loading={fetcher.state !== "idle"}>
-                    Register fulfilment service
+                    {t("settings.fulfillmentService.register")}
                   </Button>
                 </Box>
               </BlockStack>
@@ -172,29 +168,28 @@ export default function FulfillmentServiceSettings() {
         </Card>
       </Layout.AnnotatedSection>
 
-      <Layout.AnnotatedSection title="How it behaves" description="What the app does when a merchant presses the button.">
+      <Layout.AnnotatedSection title={t("settings.fulfillmentService.how.title")} description={t("settings.fulfillmentService.how.description")}>
         <Card>
           <List type="number">
-            <List.Item>Shopify sends the fulfilment request to the app.</List.Item>
+            <List.Item>{t("settings.fulfillmentService.how.step1")}</List.Item>
             <List.Item>
-              The app re-checks the order: address validity, mapping, stock and payment. If a variant is not mapped it{" "}
-              <strong>rejects</strong> the request with the reason, so the merchant sees it in Shopify instead of silence.
+              {t("settings.fulfillmentService.how.step2Before")} <strong>{t("settings.fulfillmentService.how.step2Rejects")}</strong> {t("settings.fulfillmentService.how.step2After")}
             </List.Item>
-            <List.Item>Otherwise it accepts, places the supplier order, and the order moves to Awaiting payment.</List.Item>
+            <List.Item>{t("settings.fulfillmentService.how.step3")}</List.Item>
             <List.Item>
-              You pay on the supplier site from <Link to="/app/payments">Payments</Link>; tracking is pushed back to Shopify
-              automatically once the supplier ships.
+              {t("settings.fulfillmentService.how.step4Before")} <Link to="/app/payments">{t("nav.payments")}</Link>
+              {t("settings.fulfillmentService.how.step4After")}
             </List.Item>
-            <List.Item>A cancellation request is accepted automatically while nothing has shipped yet.</List.Item>
+            <List.Item>{t("settings.fulfillmentService.how.step5")}</List.Item>
           </List>
         </Card>
       </Layout.AnnotatedSection>
 
-      <Layout.AnnotatedSection title="Recent requests" description="Fulfilment requests Shopify has sent to the app.">
+      <Layout.AnnotatedSection title={t("settings.fulfillmentService.requests.title")} description={t("settings.fulfillmentService.requests.description")}>
         <Card>
           {data.requests.length === 0 ? (
             <Text as="p" tone="subdued">
-              No requests yet.
+              {t("settings.fulfillmentService.requests.empty")}
             </Text>
           ) : (
             <BlockStack gap="200">

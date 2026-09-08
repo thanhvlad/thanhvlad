@@ -28,6 +28,7 @@ import type { OrderIssue } from "~/domain/orders/pipeline";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { adminUrl, formatDate, formatMoney, legacyId } from "~/lib/format";
+import { useMessage, useT } from "~/lib/use-t";
 import { addManualTracking, cancelPurchaseOrder, markPurchaseOrderManual, placeSupplierOrders, retryPurchaseOrder, syncPendingTracking, syncPurchaseOrder } from "~/services/fulfillment.server";
 import { evaluateAndStoreOrder, getOrderDetail, refreshOrderFromShopify, setLineItemIgnored, updateOrderAddress } from "~/services/orders.server";
 import { listActivity } from "~/services/activity.server";
@@ -106,15 +107,15 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     switch (intent) {
       case "place": {
         const outcome = await placeSupplierOrders(shop, id, { actor, force: get("force") === "true" });
-        return outcome.ok ? { ok: true, message: `Supplier order(s) placed: ${outcome.purchaseOrderIds.length}.` } : { ok: false, error: outcome.error, issues: outcome.issues };
+        return outcome.ok ? { ok: true, messageKey: "msg.supplierOrdersPlaced", messageVars: { n: outcome.purchaseOrderIds.length } } : { ok: false, error: outcome.error, issues: outcome.issues };
       }
       case "re-evaluate":
         await evaluateAndStoreOrder(shop, id);
-        return { ok: true, message: "Order re-checked." };
+        return { ok: true, messageKey: "msg.orderRechecked" };
       case "refresh": {
         const order = await getOrderDetail(shop.id, id);
         if (order) await refreshOrderFromShopify(shop, graphql, order.shopifyOrderId);
-        return { ok: true, message: "Refreshed from Shopify." };
+        return { ok: true, messageKey: "msg.refreshedFromShopify" };
       }
       case "save-address": {
         await updateOrderAddress(
@@ -129,18 +130,20 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
           { pushToShopify: get("pushToShopify") === "true" },
           actor,
         );
-        return { ok: true, message: "Address saved." };
+        return { ok: true, messageKey: "msg.addressSaved" };
       }
       case "ignore-line":
         await setLineItemIgnored(shop, id, get("lineItemId"), get("ignored") === "true");
-        return { ok: true, message: "Line item updated." };
+        return { ok: true, messageKey: "msg.lineItemUpdated" };
       case "sync-po": {
         const result = await syncPurchaseOrder(shop, get("purchaseOrderId"));
-        return { ok: true, message: `Supplier says: ${result.status}${result.newTracking ? ` · ${result.newTracking} new tracking` : ""}.` };
+        return result.newTracking
+          ? { ok: true, messageKey: "msg.supplierSaysWithTracking", messageVars: { status: result.status, n: result.newTracking } }
+          : { ok: true, messageKey: "msg.supplierSays", messageVars: { status: result.status } };
       }
       case "retry-po": {
         const outcome = await retryPurchaseOrder(shop, get("purchaseOrderId"), actor);
-        return outcome.ok ? { ok: true, message: "Retried." } : { ok: false, error: outcome.error };
+        return outcome.ok ? { ok: true, messageKey: "msg.retried" } : { ok: false, error: outcome.error };
       }
       case "cancel-po": {
         const result = await cancelPurchaseOrder(shop, get("purchaseOrderId"), get("reason") || undefined, actor);
@@ -148,13 +151,15 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       }
       case "manual-po":
         await markPurchaseOrderManual(shop, get("purchaseOrderId"), get("externalOrderId"), actor);
-        return { ok: true, message: "Supplier order linked." };
+        return { ok: true, messageKey: "msg.supplierOrderLinked" };
       case "add-tracking":
         await addManualTracking(shop, get("purchaseOrderId"), { number: get("number"), carrierName: get("carrier") || null, url: get("url") || null }, actor);
-        return { ok: true, message: "Tracking added." };
+        return { ok: true, messageKey: "msg.trackingAdded" };
       case "sync-tracking": {
         const result = await syncPendingTracking(shop, get("purchaseOrderId") || undefined, graphql);
-        return { ok: true, message: `${result.synced} tracking number(s) synced${result.failed ? `, ${result.failed} failed` : ""}.` };
+        return result.failed
+          ? { ok: true, messageKey: "msg.trackingSyncedWithFailures", messageVars: { n: result.synced, failed: result.failed } }
+          : { ok: true, messageKey: "msg.trackingSynced", messageVars: { n: result.synced } };
       }
       default:
         return { ok: false, error: "Unknown action" };
@@ -165,9 +170,11 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 };
 
 export default function OrderDetailPage() {
+  const t = useT();
   const { order, activity, currency, shopDomain } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const result = fetcher.data as { ok?: boolean; message?: string; error?: string; issues?: string[] } | undefined;
+  const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
   const [editing, setEditing] = useState(false);
   const [address, setAddress] = useState<Record<string, string>>({
     firstName: order.address.firstName ?? "", lastName: order.address.lastName ?? "", company: order.address.company ?? "", address1: order.address.address1 ?? "", address2: order.address.address2 ?? "",
@@ -189,18 +196,18 @@ export default function OrderDetailPage() {
       title={order.name}
       titleMetadata={<StatusBadge status={order.stage} />}
       subtitle={`${formatDate(order.createdAt)} · ${order.customerName ?? order.customerEmail ?? ""}`}
-      primaryAction={{ content: order.stage === "PENDING" && errors.length ? "Place anyway (force)" : "Place supplier order", disabled: !canPlace, loading: busy, onAction: () => submit({ intent: "place", force: String(order.stage === "PENDING") }) }}
+      primaryAction={{ content: order.stage === "PENDING" && errors.length ? t("orders.detail.placeAnyway") : t("action.placeOrder"), disabled: !canPlace, loading: busy, onAction: () => submit({ intent: "place", force: String(order.stage === "PENDING") }) }}
       secondaryActions={[
-        { content: "Open in Shopify", url: adminUrl(shopDomain, `/orders/${legacyId(order.shopifyOrderId)}`), external: true },
-        { content: "Refresh from Shopify", onAction: () => submit({ intent: "refresh" }) },
-        { content: "Re-check", onAction: () => submit({ intent: "re-evaluate" }) },
+        { content: t("orders.detail.openInShopify"), url: adminUrl(shopDomain, `/orders/${legacyId(order.shopifyOrderId)}`), external: true },
+        { content: t("orders.detail.refreshFromShopify"), onAction: () => submit({ intent: "refresh" }) },
+        { content: t("orders.detail.recheck"), onAction: () => submit({ intent: "re-evaluate" }) },
       ]}
     >
       <Layout>
         <Layout.Section>
-          {result?.message && (
+          {actionMessage && (
             <Banner tone="success">
-              <p>{result.message}</p>
+              <p>{actionMessage}</p>
             </Banner>
           )}
           {result?.error && (
@@ -215,7 +222,7 @@ export default function OrderDetailPage() {
             </Banner>
           )}
           {errors.length > 0 && (
-            <Banner tone="critical" title="This order cannot be placed yet">
+            <Banner tone="critical" title={t("orders.detail.blockedTitle")}>
               <List>
                 {errors.map((i, idx) => (
                   <List.Item key={idx}>{i.message}</List.Item>
@@ -224,7 +231,7 @@ export default function OrderDetailPage() {
             </Banner>
           )}
           {warnings.length > 0 && (
-            <Banner tone="warning" title="Warnings">
+            <Banner tone="warning" title={t("orders.detail.warningsTitle")}>
               <List>
                 {warnings.map((i, idx) => (
                   <List.Item key={idx}>{i.message}</List.Item>
@@ -238,7 +245,7 @@ export default function OrderDetailPage() {
           <Card>
             <BlockStack gap="300">
               <Text as="h2" variant="headingMd">
-                Items
+                {t("orders.detail.items")}
               </Text>
               {order.lineItems.map((li) => (
                 <Box key={li.id} padding="200" background={li.isCanceled ? "bg-surface-secondary" : undefined} borderRadius="200" borderColor="border" borderWidth="025">
@@ -250,13 +257,13 @@ export default function OrderDetailPage() {
                           {li.quantity} × {li.title}
                         </Text>
                         {li.variantTitle && <Badge>{li.variantTitle}</Badge>}
-                        {li.isFulfilled && <Badge tone="success">Fulfilled</Badge>}
-                        {li.isCanceled && <Badge>Ignored</Badge>}
-                        {!li.managed && <Badge tone="attention">Not managed</Badge>}
+                        {li.isFulfilled && <Badge tone="success">{t("stage.FULFILLED")}</Badge>}
+                        {li.isCanceled && <Badge>{t("orders.detail.ignored")}</Badge>}
+                        {!li.managed && <Badge tone="attention">{t("orders.notManaged")}</Badge>}
                       </InlineStack>
                       <Text as="p" tone="subdued" variant="bodySm">
                         {li.sku ? `SKU ${li.sku} · ` : ""}
-                        {formatMoney(li.price, currency)} each
+                        {formatMoney(li.price, currency)} {t("orders.detail.each")}
                       </Text>
                       {li.managed && li.resolution && (
                         li.resolution.ok ? (
@@ -269,12 +276,12 @@ export default function OrderDetailPage() {
                           </BlockStack>
                         ) : (
                           <Text as="p" tone="critical" variant="bodySm">
-                            {li.resolution.failure ? FAILURE_LABELS[li.resolution.failure] : "Unresolved"}: {li.resolution.reason}
+                            {li.resolution.failure ? FAILURE_LABELS[li.resolution.failure] : t("orders.detail.unresolved")}: {li.resolution.reason}
                             {li.productId ? (
                               <>
                                 {" "}
                                 <Button variant="plain" url={`/app/products/${li.productId}`}>
-                                  Fix mapping
+                                  {t("orders.detail.fixMapping")}
                                 </Button>
                               </>
                             ) : null}
@@ -284,7 +291,7 @@ export default function OrderDetailPage() {
                       <InlineStack gap="200">
                         {li.managed && !li.isFulfilled && (
                           <Button size="micro" onClick={() => submit({ intent: "ignore-line", lineItemId: li.id, ignored: String(!li.isCanceled) })}>
-                            {li.isCanceled ? "Include" : "Ignore"}
+                            {li.isCanceled ? t("orders.detail.include") : t("orders.detail.ignore")}
                           </Button>
                         )}
                       </InlineStack>
@@ -294,10 +301,10 @@ export default function OrderDetailPage() {
               ))}
               <Divider />
               <InlineGrid columns={{ xs: 2, md: 4 }} gap="200">
-                <Stat label="Order total" value={formatMoney(order.total, currency)} />
-                <Stat label="Customer paid shipping" value={formatMoney(order.shipping, currency)} />
-                <Stat label="Supplier cost" value={formatMoney(order.supplierCost, currency)} />
-                <Stat label="Est. profit" value={formatMoney(Number(order.total) - Number(order.supplierCost) - Number(order.supplierShipping), currency)} />
+                <Stat label={t("orders.detail.orderTotal")} value={formatMoney(order.total, currency)} />
+                <Stat label={t("orders.detail.customerPaidShipping")} value={formatMoney(order.shipping, currency)} />
+                <Stat label={t("orders.detail.supplierCost")} value={formatMoney(order.supplierCost, currency)} />
+                <Stat label={t("orders.detail.estProfit")} value={formatMoney(Number(order.total) - Number(order.supplierCost) - Number(order.supplierShipping), currency)} />
               </InlineGrid>
             </BlockStack>
           </Card>
@@ -308,15 +315,15 @@ export default function OrderDetailPage() {
             <BlockStack gap="300">
               <InlineStack align="space-between" blockAlign="center">
                 <Text as="h2" variant="headingMd">
-                  Supplier orders
+                  {t("orders.detail.supplierOrders")}
                 </Text>
                 <Button size="slim" onClick={() => submit({ intent: "sync-tracking" })}>
-                  Sync tracking to Shopify
+                  {t("orders.detail.syncTracking")}
                 </Button>
               </InlineStack>
               {order.purchaseOrders.length === 0 && (
                 <Text as="p" tone="subdued">
-                  No supplier order yet.
+                  {t("orders.detail.noSupplierOrder")}
                 </Text>
               )}
               {order.purchaseOrders.map((po) => (
@@ -327,25 +334,25 @@ export default function OrderDetailPage() {
                         <PlatformBadge platform={po.platform} />
                         <StatusBadge status={po.status} />
                         <Text as="span" fontWeight="semibold">
-                          {po.externalOrderId ?? "not placed"}
+                          {po.externalOrderId ?? t("orders.notPlaced")}
                         </Text>
                         {po.account && (
                           <Text as="span" tone="subdued" variant="bodySm">
-                            via {po.account}
+                            {t("orders.detail.via")} {po.account}
                           </Text>
                         )}
                       </InlineStack>
                       <InlineStack gap="100">
                         {po.paymentUrl && ["PLACED", "AWAITING_PAYMENT"].includes(po.status) && (
                           <Button size="slim" url={po.paymentUrl} external variant="primary">
-                            Pay at supplier
+                            {t("action.pay")}
                           </Button>
                         )}
-                        {po.externalOrderId && <Button size="slim" onClick={() => submit({ intent: "sync-po", purchaseOrderId: po.id })}>Check status</Button>}
-                        {(po.status === "FAILED" || po.status === "CANCELED") && <Button size="slim" onClick={() => submit({ intent: "retry-po", purchaseOrderId: po.id })}>Retry</Button>}
+                        {po.externalOrderId && <Button size="slim" onClick={() => submit({ intent: "sync-po", purchaseOrderId: po.id })}>{t("orders.detail.checkStatus")}</Button>}
+                        {(po.status === "FAILED" || po.status === "CANCELED") && <Button size="slim" onClick={() => submit({ intent: "retry-po", purchaseOrderId: po.id })}>{t("action.retry")}</Button>}
                         {["PLACED", "AWAITING_PAYMENT", "PAID"].includes(po.status) && (
                           <Button size="slim" tone="critical" onClick={() => submit({ intent: "cancel-po", purchaseOrderId: po.id })}>
-                            Cancel
+                            {t("action.cancel")}
                           </Button>
                         )}
                       </InlineStack>
@@ -356,10 +363,10 @@ export default function OrderDetailPage() {
                       </Text>
                     )}
                     <Text as="p" variant="bodySm" tone="subdued">
-                      Items {formatMoney(po.itemsCost, po.currency)} · Shipping {formatMoney(po.shippingCost, po.currency)} · Total {formatMoney(po.totalCost, po.currency)}
+                      {t("orders.detail.itemsCost")} {formatMoney(po.itemsCost, po.currency)} · {t("common.shipping")} {formatMoney(po.shippingCost, po.currency)} · {t("common.total")} {formatMoney(po.totalCost, po.currency)}
                       {po.carrierName ? ` · ${po.carrierName}` : ""}
-                      {po.estimatedDays ? ` (~${po.estimatedDays} days)` : ""}
-                      {po.placedAt ? ` · placed ${formatDate(po.placedAt)}` : ""}
+                      {po.estimatedDays ? ` (~${po.estimatedDays} ${t("orders.detail.days")})` : ""}
+                      {po.placedAt ? ` · ${t("orders.detail.placedOn")} ${formatDate(po.placedAt)}` : ""}
                     </Text>
                     <BlockStack gap="050">
                       {po.items.map((i) => (
@@ -370,25 +377,25 @@ export default function OrderDetailPage() {
                     </BlockStack>
                     {po.trackings.length > 0 && (
                       <BlockStack gap="050">
-                        {po.trackings.map((t) => (
-                          <InlineStack key={t.id} gap="200" blockAlign="center">
-                            <Badge tone={t.synced ? "success" : "attention"}>{t.synced ? "Synced to Shopify" : "Not synced"}</Badge>
-                            {t.url ? (
-                              <Button variant="plain" url={t.url} external>
-                                {t.number}
+                        {po.trackings.map((tr) => (
+                          <InlineStack key={tr.id} gap="200" blockAlign="center">
+                            <Badge tone={tr.synced ? "success" : "attention"}>{tr.synced ? t("orders.detail.syncedToShopify") : t("orders.detail.notSynced")}</Badge>
+                            {tr.url ? (
+                              <Button variant="plain" url={tr.url} external>
+                                {tr.number}
                               </Button>
                             ) : (
-                              <Text as="span">{t.number}</Text>
+                              <Text as="span">{tr.number}</Text>
                             )}
-                            {t.carrier && (
+                            {tr.carrier && (
                               <Text as="span" tone="subdued" variant="bodySm">
-                                {t.carrier}
+                                {tr.carrier}
                               </Text>
                             )}
-                            {t.status && <Badge>{t.status}</Badge>}
-                            {t.syncError && (
+                            {tr.status && <Badge>{tr.status}</Badge>}
+                            {tr.syncError && (
                               <Text as="span" tone="critical" variant="bodySm">
-                                {t.syncError}
+                                {tr.syncError}
                               </Text>
                             )}
                           </InlineStack>
@@ -399,18 +406,18 @@ export default function OrderDetailPage() {
                       {!po.externalOrderId && (
                         <InlineStack gap="200" blockAlign="end">
                           <div style={{ flex: 1 }}>
-                            <TextField label="Placed manually? Enter the supplier order id" value={manual[po.id] ?? ""} onChange={(v) => setManual({ ...manual, [po.id]: v })} autoComplete="off" />
+                            <TextField label={t("orders.detail.manualIdLabel")} value={manual[po.id] ?? ""} onChange={(v) => setManual({ ...manual, [po.id]: v })} autoComplete="off" />
                           </div>
                           <Button onClick={() => submit({ intent: "manual-po", purchaseOrderId: po.id, externalOrderId: manual[po.id] ?? "" })} disabled={!manual[po.id]}>
-                            Link
+                            {t("orders.detail.link")}
                           </Button>
                         </InlineStack>
                       )}
                       <InlineStack gap="200" blockAlign="end">
-                        <TextField label="Add tracking number" value={tracking[po.id]?.number ?? ""} onChange={(v) => setTracking({ ...tracking, [po.id]: { number: v, carrier: tracking[po.id]?.carrier ?? "" } })} autoComplete="off" />
-                        <TextField label="Carrier" value={tracking[po.id]?.carrier ?? ""} onChange={(v) => setTracking({ ...tracking, [po.id]: { number: tracking[po.id]?.number ?? "", carrier: v } })} autoComplete="off" />
+                        <TextField label={t("orders.detail.addTrackingNumber")} value={tracking[po.id]?.number ?? ""} onChange={(v) => setTracking({ ...tracking, [po.id]: { number: v, carrier: tracking[po.id]?.carrier ?? "" } })} autoComplete="off" />
+                        <TextField label={t("orders.detail.carrier")} value={tracking[po.id]?.carrier ?? ""} onChange={(v) => setTracking({ ...tracking, [po.id]: { number: tracking[po.id]?.number ?? "", carrier: v } })} autoComplete="off" />
                         <Button onClick={() => submit({ intent: "add-tracking", purchaseOrderId: po.id, number: tracking[po.id]?.number ?? "", carrier: tracking[po.id]?.carrier ?? "" })} disabled={!tracking[po.id]?.number}>
-                          Add
+                          {t("orders.detail.add")}
                         </Button>
                       </InlineStack>
                     </InlineGrid>
@@ -427,10 +434,10 @@ export default function OrderDetailPage() {
               <BlockStack gap="300">
                 <InlineStack align="space-between" blockAlign="center">
                   <Text as="h2" variant="headingMd">
-                    Shipping address
+                    {t("orders.detail.shippingAddress")}
                   </Text>
                   <Button size="slim" onClick={() => setEditing(!editing)}>
-                    {editing ? "Close" : "Edit"}
+                    {editing ? t("orders.detail.close") : t("orders.detail.edit")}
                   </Button>
                 </InlineStack>
                 {!editing ? (
@@ -444,9 +451,13 @@ export default function OrderDetailPage() {
                     </Text>
                     <Text as="p">{order.address.country ?? order.address.countryCode}</Text>
                     <Text as="p" tone="subdued">
-                      {order.address.phone ?? order.phone ?? "No phone"}
+                      {order.address.phone ?? order.phone ?? t("orders.detail.noPhone")}
                     </Text>
-                    {order.address.taxNumber && <Text as="p">Tax ID: {order.address.taxNumber}</Text>}
+                    {order.address.taxNumber && (
+                      <Text as="p">
+                        {t("orders.detail.taxId")}: {order.address.taxNumber}
+                      </Text>
+                    )}
                     {order.customerEmail && (
                       <Text as="p" tone="subdued" variant="bodySm">
                         {order.customerEmail}
@@ -456,25 +467,25 @@ export default function OrderDetailPage() {
                 ) : (
                   <FormLayout>
                     <FormLayout.Group>
-                      <TextField label="First name" value={address.firstName} onChange={(v) => setAddress({ ...address, firstName: v })} autoComplete="off" />
-                      <TextField label="Last name" value={address.lastName} onChange={(v) => setAddress({ ...address, lastName: v })} autoComplete="off" />
+                      <TextField label={t("orders.address.firstName")} value={address.firstName} onChange={(v) => setAddress({ ...address, firstName: v })} autoComplete="off" />
+                      <TextField label={t("orders.address.lastName")} value={address.lastName} onChange={(v) => setAddress({ ...address, lastName: v })} autoComplete="off" />
                     </FormLayout.Group>
-                    <TextField label="Company / tax ID holder" value={address.company} onChange={(v) => setAddress({ ...address, company: v })} autoComplete="off" />
-                    <TextField label="Address 1" value={address.address1} onChange={(v) => setAddress({ ...address, address1: v })} autoComplete="off" maxLength={128} showCharacterCount />
-                    <TextField label="Address 2" value={address.address2} onChange={(v) => setAddress({ ...address, address2: v })} autoComplete="off" />
+                    <TextField label={t("orders.address.company")} value={address.company} onChange={(v) => setAddress({ ...address, company: v })} autoComplete="off" />
+                    <TextField label={t("orders.address.address1")} value={address.address1} onChange={(v) => setAddress({ ...address, address1: v })} autoComplete="off" maxLength={128} showCharacterCount />
+                    <TextField label={t("orders.address.address2")} value={address.address2} onChange={(v) => setAddress({ ...address, address2: v })} autoComplete="off" />
                     <FormLayout.Group>
-                      <TextField label="City" value={address.city} onChange={(v) => setAddress({ ...address, city: v })} autoComplete="off" />
-                      <TextField label="Province" value={address.province} onChange={(v) => setAddress({ ...address, province: v })} autoComplete="off" />
+                      <TextField label={t("orders.address.city")} value={address.city} onChange={(v) => setAddress({ ...address, city: v })} autoComplete="off" />
+                      <TextField label={t("orders.address.province")} value={address.province} onChange={(v) => setAddress({ ...address, province: v })} autoComplete="off" />
                     </FormLayout.Group>
                     <FormLayout.Group>
-                      <TextField label="ZIP" value={address.zip} onChange={(v) => setAddress({ ...address, zip: v })} autoComplete="off" />
-                      <TextField label="Country code" value={address.countryCode} onChange={(v) => setAddress({ ...address, countryCode: v.toUpperCase() })} autoComplete="off" />
+                      <TextField label={t("orders.address.zip")} value={address.zip} onChange={(v) => setAddress({ ...address, zip: v })} autoComplete="off" />
+                      <TextField label={t("orders.address.countryCode")} value={address.countryCode} onChange={(v) => setAddress({ ...address, countryCode: v.toUpperCase() })} autoComplete="off" />
                     </FormLayout.Group>
-                    <TextField label="Phone" value={address.phone} onChange={(v) => setAddress({ ...address, phone: v })} autoComplete="off" />
-                    <TextField label="Tax / customs ID (CPF, RUT, PCCC…)" value={address.taxNumber} onChange={(v) => setAddress({ ...address, taxNumber: v })} autoComplete="off" />
-                    <Checkbox label="Also update the address in Shopify" checked={pushToShopify} onChange={setPushToShopify} />
+                    <TextField label={t("orders.address.phone")} value={address.phone} onChange={(v) => setAddress({ ...address, phone: v })} autoComplete="off" />
+                    <TextField label={t("orders.address.taxNumber")} value={address.taxNumber} onChange={(v) => setAddress({ ...address, taxNumber: v })} autoComplete="off" />
+                    <Checkbox label={t("orders.address.pushToShopify")} checked={pushToShopify} onChange={setPushToShopify} />
                     <Button variant="primary" onClick={() => submit({ intent: "save-address", ...address, pushToShopify: String(pushToShopify) })} loading={busy}>
-                      Save address
+                      {t("orders.address.save")}
                     </Button>
                   </FormLayout>
                 )}
@@ -484,29 +495,29 @@ export default function OrderDetailPage() {
             <Card>
               <BlockStack gap="200">
                 <Text as="h2" variant="headingMd">
-                  Details
+                  {t("orders.detail.details")}
                 </Text>
                 <Text as="p" variant="bodySm">
-                  Payment: <Badge>{order.financialStatus ?? "unknown"}</Badge>
+                  {t("orders.detail.payment")}: <Badge>{order.financialStatus ?? t("orders.detail.unknown")}</Badge>
                 </Text>
                 <Text as="p" variant="bodySm">
-                  Fulfilment: <Badge>{order.fulfillmentStatus ?? "unfulfilled"}</Badge>
+                  {t("orders.detail.fulfilment")}: <Badge>{order.fulfillmentStatus ?? t("orders.detail.unfulfilled")}</Badge>
                 </Text>
                 {order.riskLevel && (
                   <Text as="p" variant="bodySm">
-                    Risk: <Badge tone={order.riskLevel === "HIGH" ? "critical" : undefined}>{order.riskLevel}</Badge>
+                    {t("orders.detail.risk")}: <Badge tone={order.riskLevel === "HIGH" ? "critical" : undefined}>{order.riskLevel}</Badge>
                   </Text>
                 )}
                 {order.tags.length > 0 && (
                   <InlineStack gap="100" wrap>
-                    {order.tags.map((t) => (
-                      <Badge key={t}>{t}</Badge>
+                    {order.tags.map((tag) => (
+                      <Badge key={tag}>{tag}</Badge>
                     ))}
                   </InlineStack>
                 )}
                 {order.note && (
                   <Text as="p" tone="subdued" variant="bodySm">
-                    Note: {order.note}
+                    {t("orders.detail.note")}: {order.note}
                   </Text>
                 )}
               </BlockStack>
@@ -515,11 +526,11 @@ export default function OrderDetailPage() {
             <Card>
               <BlockStack gap="200">
                 <Text as="h2" variant="headingMd">
-                  Timeline
+                  {t("orders.detail.timeline")}
                 </Text>
                 {activity.length === 0 && (
                   <Text as="p" tone="subdued">
-                    No activity yet.
+                    {t("orders.detail.noActivity")}
                   </Text>
                 )}
                 {activity.map((a) => (

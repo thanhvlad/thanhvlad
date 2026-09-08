@@ -87,7 +87,7 @@ const TERMINAL_PO: PurchaseOrderStatus[] = ["DELIVERED", "SHIPPED"];
  * A failed supplier order must be reported, but it does not stop a *different*
  * line item from being ordered, so it is excluded from the placement gate.
  */
-function blocksPlacement(issue: OrderIssue): boolean {
+export function blocksPlacement(issue: OrderIssue): boolean {
   return issue.severity === "error" && issue.code !== "SUPPLIER_ORDER_FAILED";
 }
 

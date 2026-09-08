@@ -1,4 +1,6 @@
 import { Badge } from "@shopify/polaris";
+import type { I18nKey } from "~/lib/i18n";
+import { useT } from "~/lib/use-t";
 
 type Tone = "info" | "success" | "warning" | "critical" | "attention" | "new" | undefined;
 
@@ -34,38 +36,26 @@ const STAGE_TONES: Record<string, Tone> = {
   DISABLED: undefined,
 };
 
-const LABELS: Record<string, string> = {
-  PENDING: "Pending",
-  AWAITING_ORDER: "Awaiting order",
-  AWAITING_PAYMENT: "Awaiting payment",
-  AWAITING_SHIPMENT: "Awaiting shipment",
-  AWAITING_DELIVERY: "Awaiting delivery",
-  FULFILLED: "Fulfilled",
-  CANCELED: "Canceled",
-  FAILED: "Failed",
-  IGNORED: "Not ours",
-  DRAFT: "Draft",
-  SUBMITTING: "Submitting",
-  PLACED: "Placed",
-  PAID: "Paid",
-  SHIPPED: "Shipped",
-  DELIVERED: "Delivered",
-  READY: "Ready",
-  PUSHING: "Pushing",
-  PUSHED: "Pushed",
-  ARCHIVED: "Archived",
-  QUEUED: "Queued",
-  RUNNING: "Running",
-  SUCCEEDED: "Succeeded",
-  ACTIVE: "Active",
-};
+/**
+ * Order pipeline stages live under `stage.*`; everything else (purchase orders,
+ * imports, jobs) under `status.*`. Both fall back to the raw value, so a status
+ * we have not seen still renders.
+ */
+const STAGE_KEYS = new Set([
+  "PENDING", "AWAITING_ORDER", "AWAITING_PAYMENT", "AWAITING_SHIPMENT",
+  "AWAITING_DELIVERY", "FULFILLED", "CANCELED", "FAILED", "IGNORED",
+]);
 
 export function StatusBadge({ status, label }: { status: string | null | undefined; label?: string }) {
+  const t = useT();
   if (!status) return null;
   const key = status.toUpperCase();
+  const translated = STAGE_KEYS.has(key)
+    ? t(`stage.${key}` as I18nKey)
+    : t(`status.${key}` as I18nKey);
   return (
     <Badge tone={STAGE_TONES[key]} progress={key === "RUNNING" || key === "PUSHING" || key === "SUBMITTING" ? "partiallyComplete" : undefined}>
-      {label ?? LABELS[key] ?? status}
+      {label ?? translated ?? status}
     </Badge>
   );
 }

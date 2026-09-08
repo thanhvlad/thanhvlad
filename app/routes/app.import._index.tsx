@@ -26,6 +26,7 @@ import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatMoney, pageParam } from "~/lib/format";
 import { useJobRun } from "~/lib/use-job-run";
+import { useMessage, useT } from "~/lib/use-t";
 import { applyPricingRuleToImport, listImportList, removeFromImportList, summarizeMargins, addToImportList } from "~/services/import.server";
 import { createJobRun } from "~/services/jobs.server";
 import { enqueue } from "~/services/jobs/index.server";
@@ -35,12 +36,7 @@ import type { ImportStatus } from "@prisma/client";
 /** Rows accepted per CSV paste. Anything past this is reported, not dropped. */
 const MAX_CSV_ROWS = 500;
 
-const TABS: Array<{ id: ImportStatus | "ALL"; label: string }> = [
-  { id: "ALL", label: "All" },
-  { id: "DRAFT", label: "Draft" },
-  { id: "FAILED", label: "Failed" },
-  { id: "PUSHED", label: "Pushed" },
-];
+const TABS: Array<ImportStatus | "ALL"> = ["ALL", "DRAFT", "FAILED", "PUSHED"];
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
@@ -90,16 +86,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       }
       case "remove": {
         const count = await removeFromImportList(shop.id, ids);
-        return { ok: true, message: `${count} product(s) removed.` };
+        return { ok: true, messageKey: "msg.productsRemoved", messageVars: { n: count } };
       }
       case "apply-rule": {
         const ruleId = get("ruleId") || null;
         for (const id of ids) await applyPricingRuleToImport(shop.id, id, ruleId);
-        return { ok: true, message: `Pricing rule applied to ${ids.length} product(s).` };
+        return { ok: true, messageKey: "msg.pricingRuleAppliedTo", messageVars: { n: ids.length } };
       }
       case "add": {
         const product = await addToImportList(shop, get("reference"), { actor });
-        return { ok: true, message: `"${product.title}" added.` };
+        return { ok: true, messageKey: "msg.productAdded", messageVars: { title: product.title } };
       }
       case "import-csv": {
         const text = get("csv");
@@ -132,8 +128,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function ImportListPage() {
+  const t = useT();
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
+  const actionMessage = useMessage(fetcher.data as Parameters<typeof useMessage>[0]);
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const [search, setSearch] = useState(data.search);
@@ -142,8 +140,11 @@ export default function ImportListPage() {
   const [csv, setCsv] = useState("");
   const items = data.list.items;
   const { selectedResources, allResourcesSelected, handleSelectionChange, clearSelection } = useIndexResourceState(items);
-  const selectedIndex = TABS.findIndex((t) => t.id === data.status);
+  const selectedIndex = TABS.findIndex((id) => id === data.status);
   const { jobRunId, clearJobRun } = useJobRun(fetcher.data, clearSelection);
+
+  const tabLabel = (id: ImportStatus | "ALL") =>
+    id === "DRAFT" ? t("import.tab.draft") : id === "FAILED" ? t("import.tab.failed") : id === "PUSHED" ? t("import.tab.pushed") : t("common.all");
 
   const submit = (intent: string, extra: Record<string, string> = {}) => {
     fetcher.submit({ intent, ids: selectedResources.join(","), ...extra }, { method: "post" });
@@ -151,17 +152,17 @@ export default function ImportListPage() {
 
   return (
     <Page
-      title="Import list"
-      subtitle="Review and edit products before they go to your store."
-      primaryAction={{ content: "Push selected to Shopify", disabled: selectedResources.length === 0, onAction: () => submit("push"), loading: fetcher.state !== "idle" }}
-      secondaryActions={[{ content: "Find products", url: "/app/search" }]}
+      title={t("page.import.title")}
+      subtitle={t("page.import.subtitle")}
+      primaryAction={{ content: t("import.pushSelected"), disabled: selectedResources.length === 0, onAction: () => submit("push"), loading: fetcher.state !== "idle" }}
+      secondaryActions={[{ content: t("nav.search"), url: "/app/search" }]}
     >
       <Layout>
         <Layout.Section>
           <JobProgress jobRunId={jobRunId} onDone={clearJobRun} />
-          {fetcher.data && "message" in fetcher.data && fetcher.data.message && (
+          {actionMessage && (
             <Banner tone="success">
-              <p>{fetcher.data.message}</p>
+              <p>{actionMessage}</p>
             </Banner>
           )}
           {fetcher.data && "error" in fetcher.data && fetcher.data.error && (
@@ -174,11 +175,17 @@ export default function ImportListPage() {
         <Layout.Section>
           <Card padding="0">
             <Tabs
-              tabs={TABS.map((t) => ({ id: t.id, content: t.id === "ALL" ? `All (${Object.values(data.list.counts).reduce((a, b) => a + (b ?? 0), 0)})` : `${t.label} (${data.list.counts[t.id as ImportStatus] ?? 0})` }))}
+              tabs={TABS.map((id) => ({
+                id,
+                content:
+                  id === "ALL"
+                    ? `${t("common.all")} (${Object.values(data.list.counts).reduce((a, b) => a + (b ?? 0), 0)})`
+                    : `${tabLabel(id)} (${data.list.counts[id as ImportStatus] ?? 0})`,
+              }))}
               selected={selectedIndex < 0 ? 0 : selectedIndex}
               onSelect={(i) => {
                 const sp = new URLSearchParams(params);
-                sp.set("status", TABS[i].id);
+                sp.set("status", TABS[i]);
                 sp.delete("page");
                 navigate(`?${sp.toString()}`);
               }}
@@ -187,12 +194,12 @@ export default function ImportListPage() {
               <InlineStack gap="300" blockAlign="end" wrap>
                 <div style={{ flex: 1, minWidth: 240 }}>
                   <TextField
-                    label="Search"
+                    label={t("action.search")}
                     labelHidden
                     value={search}
                     onChange={setSearch}
                     autoComplete="off"
-                    placeholder="Search import list"
+                    placeholder={t("import.searchPlaceholder")}
                     onClearButtonClick={() => {
                       setSearch("");
                       navigate("?");
@@ -208,31 +215,49 @@ export default function ImportListPage() {
                           navigate(`?${sp.toString()}`);
                         }}
                       >
-                        Search
+                        {t("action.search")}
                       </Button>
                     }
                   />
                 </div>
-                <Select label="Pricing rule" labelHidden options={[{ label: "Built-in default rule", value: "" }, ...data.rules.map((r) => ({ label: r.name, value: r.id }))]} value={ruleId} onChange={setRuleId} />
+                <Select
+                  label={t("import.pricingRule")}
+                  labelHidden
+                  options={[{ label: t("import.builtInDefaultRule"), value: "" }, ...data.rules.map((r) => ({ label: r.name, value: r.id }))]}
+                  value={ruleId}
+                  onChange={setRuleId}
+                />
                 <Button disabled={selectedResources.length === 0} onClick={() => submit("apply-rule", { ruleId })}>
-                  Apply rule
+                  {t("import.applyRule")}
                 </Button>
                 <Button tone="critical" disabled={selectedResources.length === 0} onClick={() => submit("remove")}>
-                  Remove
+                  {t("action.remove")}
                 </Button>
               </InlineStack>
             </div>
             {items.length === 0 ? (
-              <EmptyState heading="Your import list is empty" image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png" action={{ content: "Find products", url: "/app/search" }}>
-                <p>Search a supplier or paste product links to get started.</p>
+              <EmptyState
+                heading={t("import.empty.heading")}
+                image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
+                action={{ content: t("nav.search"), url: "/app/search" }}
+              >
+                <p>{t("import.empty.body")}</p>
               </EmptyState>
             ) : (
               <IndexTable
-                resourceName={{ singular: "product", plural: "products" }}
+                resourceName={{ singular: t("import.resource.singular"), plural: t("import.resource.plural") }}
                 itemCount={items.length}
                 selectedItemsCount={allResourcesSelected ? "All" : selectedResources.length}
                 onSelectionChange={handleSelectionChange}
-                headings={[{ title: "Product" }, { title: "Supplier" }, { title: "Variants" }, { title: "Cost" }, { title: "Price" }, { title: "Margin" }, { title: "Status" }]}
+                headings={[
+                  { title: t("import.column.product") },
+                  { title: t("common.supplier") },
+                  { title: t("common.variants") },
+                  { title: t("common.cost") },
+                  { title: t("common.price") },
+                  { title: t("import.margin") },
+                  { title: t("common.status") },
+                ]}
               >
                 {items.map((item, index) => (
                   <IndexTable.Row id={item.id} key={item.id} position={index} selected={selectedResources.includes(item.id)}>
@@ -261,7 +286,7 @@ export default function ImportListPage() {
                             {item.storeName}
                           </Text>
                         )}
-                        {!item.available && <Badge tone="critical">Unavailable</Badge>}
+                        {!item.available && <Badge tone="critical">{t("import.unavailable")}</Badge>}
                       </BlockStack>
                     </IndexTable.Cell>
                     <IndexTable.Cell>{item.variantCount}</IndexTable.Cell>
@@ -297,11 +322,11 @@ export default function ImportListPage() {
           <Card>
             <BlockStack gap="300">
               <Text as="h2" variant="headingMd">
-                Add by link
+                {t("import.addByLink")}
               </Text>
-              <TextField label="Product URL or ID" labelHidden value={reference} onChange={setReference} autoComplete="off" placeholder="https://www.aliexpress.com/item/1005006001.html" />
+              <TextField label={t("import.productUrlOrId")} labelHidden value={reference} onChange={setReference} autoComplete="off" placeholder="https://www.aliexpress.com/item/1005006001.html" />
               <Button onClick={() => fetcher.submit({ intent: "add", reference }, { method: "post" })} disabled={!reference.trim()} loading={fetcher.state !== "idle"}>
-                Add to import list
+                {t("action.addToImport")}
               </Button>
             </BlockStack>
           </Card>
@@ -310,14 +335,14 @@ export default function ImportListPage() {
           <Card>
             <BlockStack gap="300">
               <Text as="h2" variant="headingMd">
-                Bulk import from CSV
+                {t("import.bulkCsv.title")}
               </Text>
               <Text as="p" tone="subdued">
-                Paste CSV rows; the first column must be the product URL or ID. Up to 200 rows per batch.
+                {t("import.bulkCsv.help")}
               </Text>
-              <TextField label="CSV" labelHidden multiline={4} value={csv} onChange={setCsv} autoComplete="off" placeholder={"url\nhttps://www.aliexpress.com/item/1005006001.html\n1005006002"} />
+              <TextField label={t("import.bulkCsv.field")} labelHidden multiline={4} value={csv} onChange={setCsv} autoComplete="off" placeholder={"url\nhttps://www.aliexpress.com/item/1005006001.html\n1005006002"} />
               <Button onClick={() => fetcher.submit({ intent: "import-csv", csv }, { method: "post" })} disabled={!csv.trim()} loading={fetcher.state !== "idle"}>
-                Import CSV
+                {t("import.bulkCsv.action")}
               </Button>
             </BlockStack>
           </Card>

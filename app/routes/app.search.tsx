@@ -22,6 +22,7 @@ import { PlatformBadge } from "~/components/StatusBadge";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatMoney, pageParam } from "~/lib/format";
+import { useT } from "~/lib/use-t";
 import { addToImportList, pushImportedProduct } from "~/services/import.server";
 import { adapterForShop, listPlatforms } from "~/services/suppliers/index.server";
 import type { SupplierPlatform, SupplierSearchResult } from "~/services/suppliers/types";
@@ -115,41 +116,52 @@ export default function SearchPage() {
   const [image, setImage] = useState(data.imageUrl);
   const [bulk, setBulk] = useState("");
   const bulkFetcher = useFetcher<typeof action>();
+  const t = useT();
   const searching = navigation.state === "loading" && navigation.location?.pathname === "/app/search";
 
-  const platformOptions = data.platforms.map((p) => ({ label: `${p.displayName}${p.configured ? "" : " (not configured)"}`, value: p.platform }));
+  const platformOptions = data.platforms.map((p) => ({
+    label: `${p.displayName}${p.configured ? "" : ` (${t("search.notConfigured")})`}`,
+    value: p.platform,
+  }));
 
   return (
-    <Page title="Find products" subtitle="Search supplier catalogs or paste product links to import.">
+    <Page title={t("page.search.title")} subtitle={t("page.search.subtitle")}>
       <Layout>
         <Layout.Section>
           <Card>
             <Form method="get">
               <BlockStack gap="300">
                 <InlineGrid columns={{ xs: 1, md: ["twoThirds", "oneThird"] }} gap="300">
-                  <TextField label="Search" name="q" value={q} onChange={setQ} autoComplete="off" placeholder="e.g. wireless earbuds, yoga mat, phone case" />
-                  <Select label="Supplier" name="platform" options={platformOptions} value={platform} onChange={(v) => setPlatform(v as SupplierPlatform)} />
+                  <TextField
+                    label={t("action.search")}
+                    name="q"
+                    value={q}
+                    onChange={setQ}
+                    autoComplete="off"
+                    placeholder={t("search.queryPlaceholder")}
+                  />
+                  <Select label={t("common.supplier")} name="platform" options={platformOptions} value={platform} onChange={(v) => setPlatform(v as SupplierPlatform)} />
                 </InlineGrid>
                 <InlineGrid columns={{ xs: 1, md: ["twoThirds", "oneThird"] }} gap="300">
-                  <TextField label="Search by image URL (optional)" name="image" value={image} onChange={setImage} autoComplete="off" placeholder="https://…/photo.jpg" />
+                  <TextField label={t("search.imageUrl.label")} name="image" value={image} onChange={setImage} autoComplete="off" placeholder="https://…/photo.jpg" />
                   <Select
-                    label="Sort"
+                    label={t("search.sort.label")}
                     name="sort"
                     value={sort}
                     onChange={(v) => setSort(v as typeof sort)}
                     options={[
-                      { label: "Best match", value: "default" },
-                      { label: "Most orders", value: "orders" },
-                      { label: "Highest rating", value: "rating" },
-                      { label: "Price: low to high", value: "price_asc" },
-                      { label: "Price: high to low", value: "price_desc" },
-                      { label: "Newest", value: "newest" },
+                      { label: t("search.sort.default"), value: "default" },
+                      { label: t("search.sort.orders"), value: "orders" },
+                      { label: t("search.sort.rating"), value: "rating" },
+                      { label: t("search.sort.priceAsc"), value: "price_asc" },
+                      { label: t("search.sort.priceDesc"), value: "price_desc" },
+                      { label: t("search.sort.newest"), value: "newest" },
                     ]}
                   />
                 </InlineGrid>
                 <InlineStack gap="200">
                   <Button submit variant="primary" loading={searching}>
-                    Search
+                    {t("action.search")}
                   </Button>
                 </InlineStack>
               </BlockStack>
@@ -161,19 +173,19 @@ export default function SearchPage() {
           <Card>
             <BlockStack gap="300">
               <Text as="h2" variant="headingMd">
-                Import by link or ID
+                {t("search.importByLink.title")}
               </Text>
               <Text as="p" tone="subdued">
-                Paste one or many AliExpress / CJ product URLs or IDs (one per line). They will land on the import list with your default pricing rule applied.
+                {t("search.importByLink.help")}
               </Text>
-              <TextField label="Product links" labelHidden multiline={4} value={bulk} onChange={setBulk} autoComplete="off" placeholder={"https://www.aliexpress.com/item/1005006001.html\n1005006002"} />
+              <TextField label={t("search.productLinks.label")} labelHidden multiline={4} value={bulk} onChange={setBulk} autoComplete="off" placeholder={"https://www.aliexpress.com/item/1005006001.html\n1005006002"} />
               <InlineStack gap="200">
                 <Button
                   onClick={() => bulkFetcher.submit({ intent: "add-bulk", references: bulk, platform }, { method: "post" })}
                   loading={bulkFetcher.state !== "idle"}
                   disabled={!bulk.trim()}
                 >
-                  Add to import list
+                  {t("action.addToImport")}
                 </Button>
               </InlineStack>
               {bulkFetcher.data?.bulk && (
@@ -193,7 +205,7 @@ export default function SearchPage() {
 
         <Layout.Section>
           {data.error && (
-            <Banner tone="critical" title="Search failed">
+            <Banner tone="critical" title={t("search.failed")}>
               <p>{data.error}</p>
             </Banner>
           )}
@@ -204,8 +216,8 @@ export default function SearchPage() {
           )}
           {!data.results && !data.error && (
             <Card>
-              <EmptyState heading="Search a supplier catalog" image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png">
-                <p>Type a keyword above, or paste product links to import directly.</p>
+              <EmptyState heading={t("search.empty.heading")} image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png">
+                <p>{t("search.empty.body")}</p>
               </EmptyState>
             </Card>
           )}
@@ -213,11 +225,13 @@ export default function SearchPage() {
             <BlockStack gap="300">
               <InlineStack align="space-between">
                 <Text as="p" tone="subdued">
-                  {data.results.total !== null ? `${data.results.total} results` : `${data.results.items.length} results`} for “{data.q || "image"}”
+                  {`${data.results.total !== null ? data.results.total : data.results.items.length} ${t("search.resultsFor")} “${
+                    data.q || t("search.image")
+                  }”`}
                 </Text>
                 <InlineStack gap="200">
-                  {data.page > 1 && <Button url={`?${withPage(params, data.page - 1)}`}>Previous</Button>}
-                  {data.results.hasMore && <Button url={`?${withPage(params, data.page + 1)}`}>Next</Button>}
+                  {data.page > 1 && <Button url={`?${withPage(params, data.page - 1)}`}>{t("common.previous")}</Button>}
+                  {data.results.hasMore && <Button url={`?${withPage(params, data.page + 1)}`}>{t("common.next")}</Button>}
                 </InlineStack>
               </InlineStack>
               <InlineGrid columns={{ xs: 1, sm: 2, md: 3, lg: 4 }} gap="300">
@@ -242,6 +256,7 @@ function withPage(params: URLSearchParams, page: number) {
 function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["items"][number]; platform: SupplierPlatform; currency: string }) {
   const fetcher = useFetcher<typeof action>();
   const [pushing, setPushing] = useState(false);
+  const t = useT();
   const result = fetcher.data as SearchActionData | undefined;
   const added = result?.ok && result.reference === item.url;
   const failed = result && !result.ok && result.reference === item.url;
@@ -270,15 +285,15 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
           <InlineStack gap="100" wrap>
             <PlatformBadge platform={platform} />
             {item.rating ? <Badge>{`★ ${item.rating.toFixed(1)}`}</Badge> : null}
-            {item.orderCount ? <Badge>{`${item.orderCount.toLocaleString()} orders`}</Badge> : null}
+            {item.orderCount ? <Badge>{`${item.orderCount.toLocaleString()} ${t("search.orders")}`}</Badge> : null}
           </InlineStack>
           <Text as="p" variant="bodySm" tone="subdued">
             {item.shippingFrom !== null && item.shippingFrom !== undefined
               ? Number(item.shippingFrom) === 0
-                ? "Free shipping"
-                : `+ ${formatMoney(item.shippingFrom, currency)} shipping`
-              : "Shipping shown at import"}
-            {item.shipToDays ? ` · ~${item.shipToDays} days` : ""}
+                ? t("search.freeShipping")
+                : `+ ${formatMoney(item.shippingFrom, currency)} ${t("search.shippingSuffix")}`
+              : t("search.shippingAtImport")}
+            {item.shipToDays ? ` · ~${item.shipToDays} ${t("search.days")}` : ""}
           </Text>
           {item.storeName && (
             <Text as="p" tone="subdued" variant="bodySm" truncate>
@@ -288,7 +303,7 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
           <Divider />
           <InlineStack gap="100" align="space-between" blockAlign="center" wrap>
             <Button size="slim" url={item.url} target="_blank" external>
-              View
+              {t("common.view")}
             </Button>
             <InlineStack gap="100">
               <Button
@@ -300,7 +315,7 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
                   fetcher.submit({ intent: "add", reference: item.url, platform }, { method: "post" });
                 }}
               >
-                {added && !result?.productId ? "In list" : "Import"}
+                {added && !result?.productId ? t("search.inList") : t("action.import")}
               </Button>
               <Button
                 size="slim"
@@ -312,13 +327,13 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
                   fetcher.submit({ intent: "add-and-push", reference: item.url, platform }, { method: "post" });
                 }}
               >
-                {result?.productId ? "In shop" : "Add to shop"}
+                {result?.productId ? t("search.inShop") : t("action.addToShop")}
               </Button>
             </InlineStack>
           </InlineStack>
           {result?.productId && (
             <Button size="micro" variant="plain" url={`/app/products/${result.productId}`}>
-              Open in the app
+              {t("search.openInApp")}
             </Button>
           )}
           {failed && (

@@ -6,13 +6,8 @@ import { Badge, Banner, BlockStack, Box, Button, Card, FormLayout, InlineStack, 
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatDate } from "~/lib/format";
+import { useMessage, useT } from "~/lib/use-t";
 import { ROLE_PERMISSIONS, inviteStaff, listStaff, removeStaff, updateStaffRole } from "~/services/staff.server";
-
-const ROLES: Array<{ label: string; value: StaffRole }> = [
-  { label: "Admin — everything except staff management", value: "ADMIN" },
-  { label: "Staff — import, map and place orders", value: "STAFF" },
-  { label: "Read only", value: "READ_ONLY" },
-];
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
@@ -28,13 +23,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     switch (intent) {
       case "invite":
         await inviteStaff(shop.id, shop.accountId, { email: get("email"), name: get("name") || null, role: get("role") as StaffRole });
-        return { ok: true, message: `${get("email")} invited.` };
+        return { ok: true, messageKey: "msg.staffInvited", messageVars: { email: get("email") } };
       case "role":
         await updateStaffRole(shop.id, get("id"), get("role") as StaffRole);
-        return { ok: true, message: "Role updated." };
+        return { ok: true, messageKey: "msg.roleUpdated" };
       case "remove":
         await removeStaff(shop.id, get("id"));
-        return { ok: true, message: "Member removed." };
+        return { ok: true, messageKey: "msg.memberRemoved" };
       default:
         return { ok: false, error: "Unknown action" };
     }
@@ -47,14 +42,22 @@ export default function StaffSettings() {
   const { staff } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const result = fetcher.data as { message?: string; error?: string } | undefined;
+  const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
   const [form, setForm] = useState({ email: "", name: "", role: "STAFF" as StaffRole });
+  const t = useT();
+
+  const roles: Array<{ label: string; value: StaffRole }> = [
+    { label: t("settings.staff.role.admin"), value: "ADMIN" },
+    { label: t("settings.staff.role.staff"), value: "STAFF" },
+    { label: t("settings.staff.role.readOnly"), value: "READ_ONLY" },
+  ];
 
   return (
     <Layout>
       <Layout.Section>
-        {result?.message && (
+        {actionMessage && (
           <Banner tone="success">
-            <p>{result.message}</p>
+            <p>{actionMessage}</p>
           </Banner>
         )}
         {result?.error && (
@@ -63,21 +66,21 @@ export default function StaffSettings() {
           </Banner>
         )}
         <Banner tone="info">
-          <p>Staff members sign in through Shopify as usual (add them as staff in Shopify admin). Roles here control what they can do inside the app across all your connected stores.</p>
+          <p>{t("settings.staff.intro")}</p>
         </Banner>
       </Layout.Section>
       <Layout.Section variant="oneThird">
         <Card>
           <BlockStack gap="300">
             <Text as="h2" variant="headingMd">
-              Invite a member
+              {t("settings.staff.inviteTitle")}
             </Text>
             <FormLayout>
-              <TextField label="Email" type="email" value={form.email} onChange={(v) => setForm({ ...form, email: v })} autoComplete="off" />
-              <TextField label="Name" value={form.name} onChange={(v) => setForm({ ...form, name: v })} autoComplete="off" />
-              <Select label="Role" options={ROLES} value={form.role} onChange={(v) => setForm({ ...form, role: v as StaffRole })} />
+              <TextField label={t("settings.staff.email")} type="email" value={form.email} onChange={(v) => setForm({ ...form, email: v })} autoComplete="off" />
+              <TextField label={t("settings.staff.name")} value={form.name} onChange={(v) => setForm({ ...form, name: v })} autoComplete="off" />
+              <Select label={t("settings.staff.role.label")} options={roles} value={form.role} onChange={(v) => setForm({ ...form, role: v as StaffRole })} />
               <Button variant="primary" disabled={!form.email} onClick={() => fetcher.submit({ intent: "invite", ...form }, { method: "post" })} loading={fetcher.state !== "idle"}>
-                Invite
+                {t("action.invite")}
               </Button>
             </FormLayout>
           </BlockStack>
@@ -87,11 +90,11 @@ export default function StaffSettings() {
         <Card>
           <BlockStack gap="300">
             <Text as="h2" variant="headingMd">
-              Team
+              {t("settings.staff.team")}
             </Text>
             {staff.length === 0 && (
               <Text as="p" tone="subdued">
-                Only the store owner has access.
+                {t("settings.staff.empty")}
               </Text>
             )}
             {staff.map((m) => (
@@ -103,16 +106,16 @@ export default function StaffSettings() {
                         {m.name ?? m.email}
                       </Text>
                       <Badge tone={m.role === "OWNER" || m.role === "ADMIN" ? "success" : undefined}>{m.role}</Badge>
-                      {m.disabledAt && <Badge tone="critical">Disabled</Badge>}
+                      {m.disabledAt && <Badge tone="critical">{t("settings.staff.disabled")}</Badge>}
                     </InlineStack>
                     <Text as="p" tone="subdued" variant="bodySm">
-                      {m.email} · invited {formatDate(m.invitedAt)}
+                      {m.email} · {t("settings.staff.invitedOn")} {formatDate(m.invitedAt)}
                     </Text>
                   </BlockStack>
                   <InlineStack gap="200" blockAlign="center">
-                    <Select label="Role" labelHidden options={ROLES} value={m.role === "OWNER" ? "ADMIN" : m.role} onChange={(v) => fetcher.submit({ intent: "role", id: m.id, role: v }, { method: "post" })} disabled={m.role === "OWNER"} />
+                    <Select label={t("settings.staff.role.label")} labelHidden options={roles} value={m.role === "OWNER" ? "ADMIN" : m.role} onChange={(v) => fetcher.submit({ intent: "role", id: m.id, role: v }, { method: "post" })} disabled={m.role === "OWNER"} />
                     <Button size="slim" tone="critical" onClick={() => fetcher.submit({ intent: "remove", id: m.id }, { method: "post" })} disabled={m.role === "OWNER"}>
-                      Remove
+                      {t("action.remove")}
                     </Button>
                   </InlineStack>
                 </InlineStack>

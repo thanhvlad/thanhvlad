@@ -3,6 +3,7 @@ import { Link, useFetcher, useLoaderData } from "@remix-run/react";
 import { Badge, BlockStack, Box, Button, Card, EmptyState, InlineStack, Layout, Page, Text } from "@shopify/polaris";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { relativeTime } from "~/lib/format";
+import { useT } from "~/lib/use-t";
 import { archiveNotifications, listNotifications, markRead } from "~/services/notifications.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -24,20 +25,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 const TONES: Record<string, "info" | "warning" | "critical" | "success" | undefined> = { info: "info", warning: "warning", critical: "critical" };
 
 export default function NotificationsPage() {
+  const t = useT();
   const { notifications } = useLoaderData<typeof loader>();
   const fetcher = useFetcher();
   return (
     <Page
-      title="Notifications"
-      primaryAction={{ content: "Mark all read", onAction: () => fetcher.submit({ intent: "read-all" }, { method: "post" }), disabled: notifications.every((n) => n.readAt) }}
-      secondaryActions={[{ content: "Archive all", onAction: () => fetcher.submit({ intent: "archive-all" }, { method: "post" }), disabled: notifications.length === 0 }]}
+      title={t("page.notifications.title")}
+      primaryAction={{ content: t("notifications.markAllRead"), onAction: () => fetcher.submit({ intent: "read-all" }, { method: "post" }), disabled: notifications.every((n) => n.readAt) }}
+      secondaryActions={[{ content: t("notifications.archiveAll"), onAction: () => fetcher.submit({ intent: "archive-all" }, { method: "post" }), disabled: notifications.length === 0 }]}
     >
       <Layout>
         <Layout.Section>
           <Card padding="0">
             {notifications.length === 0 ? (
-              <EmptyState heading="You're all caught up" image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png">
-                <p>Failed orders, supplier price changes, stock-outs and finished jobs show up here.</p>
+              <EmptyState heading={t("notifications.empty")} image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png">
+                <p>{t("notifications.emptyBody")}</p>
               </EmptyState>
             ) : (
               <BlockStack gap="0">
@@ -63,11 +65,11 @@ export default function NotificationsPage() {
                       <InlineStack gap="100">
                         {!n.readAt && (
                           <Button size="slim" onClick={() => fetcher.submit({ intent: "read", id: n.id }, { method: "post" })}>
-                            Mark read
+                            {t("notifications.markRead")}
                           </Button>
                         )}
                         <Button size="slim" onClick={() => fetcher.submit({ intent: "archive", id: n.id }, { method: "post" })}>
-                          Archive
+                          {t("notifications.archive")}
                         </Button>
                       </InlineStack>
                     </InlineStack>

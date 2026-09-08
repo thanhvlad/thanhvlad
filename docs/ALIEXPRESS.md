@@ -117,18 +117,43 @@ The app translates AliExpress's error codes into advice, for example:
 
 ---
 
+### Ordering the same goods twice
+
+Two things stop it, and both matter:
+
+- Each purchase order carries a stable reference derived from the Shopify order, the
+  platform and the exact lines it covers. It is sent as `out_order_id` and it does not
+  change when you retry, so AliExpress can recognise the retry as the same order.
+- The transport never retries order creation. A read that times out says nothing about
+  whether AliExpress committed the order, so the app records the purchase order as
+  **unconfirmed** rather than failed, tells you to check your AliExpress order list, and
+  refuses to retry a purchase order that already has an AliExpress order id.
+
+Placing an order is also serialised per Shopify order, so the scheduled auto-place and
+your own "Order now" click cannot both decide the order is unplaced.
+
+---
+
 ## Verification status
 
-The adapter was written against the published DS API surface and the official SDK
-type definitions, not against a live merchant account, because this environment has no
-network access to AliExpress. Method names, parameter names, signing and response
-shapes come from those sources. Field mappings for less common responses may still
-need a small adjustment once you connect a real account — the Activity log records the
-exact request and error for anything that does not match, which is enough to fix it.
+The adapter was written against the published DS API surface and the official SDK type
+definitions, not against a live merchant account: this environment has no network
+access to AliExpress. Method names, parameter names, signing and response shapes come
+from those sources. Field mappings for less common responses may still need a small
+adjustment once you connect a real account — the Activity log records the exact request
+and error for anything that does not match, which is enough to fix it.
 
-Everything downstream of the adapter — import, mapping, pricing, order pipeline,
-fulfilment, tracking sync, reports — is covered by the integration test suite running
-against a real PostgreSQL database.
+What *is* verified here:
+
+- **The request signature** is pinned by a test against fixed expected values, for both
+  gateways, including the code-point key ordering AliExpress uses. Every live call fails
+  if this is wrong by one character, and the failure reads like a permissions problem.
+- **Every Shopify GraphQL document** in the app is validated against Shopify's real
+  Admin schema for the API version the app pins.
+- **Everything downstream of the adapter** — import, mapping, pricing, the order
+  pipeline, fulfilment, tracking sync, reports — is covered by an integration suite that
+  runs against a real PostgreSQL database, including concurrent order placement and
+  split-parcel tracking.
 
 ---
 
