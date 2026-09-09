@@ -136,16 +136,23 @@ export async function rewriteLandingPage(input: RewriteInput): Promise<RewriteRe
   const response = await client.messages.parse({
     model: env().AI_MAPPING_MODEL,
     max_tokens: 16000,
-    // The contract is stable across every product, so it is the cache prefix.
-    // Everything that varies per product sits in the user turn, after it.
-    system: [{ type: "text", text: LUMORA_WRITING_CONTRACT, cache_control: { type: "ephemeral" } }],
+    // Two cache breakpoints, both stable. The contract never varies, and the
+    // worked examples are identical for every product in a batch. Leaving the
+    // examples in the user turn meant paying full price for the same ~10k
+    // tokens on every single product.
+    system: [
+      { type: "text" as const, text: LUMORA_WRITING_CONTRACT, cache_control: { type: "ephemeral" as const } },
+      ...(exampleBlock
+        ? [{ type: "text" as const, text: exampleBlock, cache_control: { type: "ephemeral" as const } }]
+        : []),
+    ],
     output_config: { format: jsonSchemaOutputFormat(REWRITE_SCHEMA), effort: "high" },
     messages: [
       {
         role: "user",
         content: [
           ...visionImages.map((url) => ({ type: "image" as const, source: { type: "url" as const, url } })),
-          { type: "text" as const, text: `${facts}${exampleBlock}` },
+          { type: "text" as const, text: facts },
         ],
       },
     ],
