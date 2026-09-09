@@ -6,7 +6,7 @@ import { blocksPlacement } from "~/domain/orders/pipeline";
 import { logger } from "~/lib/logger.server";
 import { logActivity } from "./activity.server";
 import { notify } from "./notifications.server";
-import { placeSupplierOrders } from "./fulfillment.server";
+import { cancelPurchaseOrder, placeSupplierOrders } from "./fulfillment.server";
 import { evaluateAndStoreOrder, orderIssues, refreshOrderFromShopify } from "./orders.server";
 import type { ShopWithSettings } from "./shop.server";
 import { gid, offlineClient, type GraphqlClient } from "./shopify/graphql.server";
@@ -18,6 +18,7 @@ import {
   deleteFulfillmentService,
   inventoryLevelsFor,
   listFulfillmentServices,
+  rejectCancellationRequest,
   rejectFulfillmentRequest,
   updateFulfillmentServiceCallback,
   type RejectionReason,
@@ -242,10 +243,34 @@ export async function handleFulfillmentRequest(shop: ShopWithSettings, topic: st
       where: { orderId: order.id, shopifyFulfillmentOrderId: parsed.fulfillmentOrderId },
       data: { status: "CANCELLATION_REQUESTED" },
     });
-    // Nothing shipped yet means the cancellation is safe to accept.
-    const shipped = await prisma.trackingNumber.count({ where: { purchaseOrder: { orderId: order.id } } });
+    // Only a live supplier order can block a cancellation. Counting tracking
+    // across every purchase order on the Shopify order, cancelled ones
+    // included, let old history veto a new cancellation.
+    const livePurchaseOrders = await prisma.purchaseOrder.findMany({
+      where: { orderId: order.id, status: { notIn: ["CANCELED", "FAILED"] } },
+      select: { id: true },
+    });
+    const shipped = livePurchaseOrders.length
+      ? await prisma.trackingNumber.count({ where: { purchaseOrderId: { in: livePurchaseOrders.map((p) => p.id) } } })
+      : 0;
+
     if (shipped === 0) {
       await acceptCancellationRequest(client, parsed.fulfillmentOrderId, "Cancelled before the supplier shipped.");
+
+      // Cancel upstream as well. Accepting in Shopify while leaving the supplier
+      // order open kept it in the payment queue and in payment reminders, so the
+      // merchant was chased to pay for an order Shopify had already abandoned.
+      for (const po of livePurchaseOrders) {
+        try {
+          await cancelPurchaseOrder(shop, po.id, "Cancelled by the merchant in Shopify", "fulfillment-service");
+        } catch (error) {
+          logger.warn("Could not cancel the supplier order after a Shopify cancellation", {
+            purchaseOrderId: po.id,
+            error,
+          });
+        }
+      }
+
       await prisma.fulfillmentRequest.updateMany({
         where: { orderId: order.id, shopifyFulfillmentOrderId: parsed.fulfillmentOrderId },
         data: { status: "CANCELLED", respondedAt: new Date() },
@@ -257,12 +282,20 @@ export async function handleFulfillmentRequest(shop: ShopWithSettings, topic: st
         message: `${order.name}: fulfilment cancelled at the merchant's request.`,
       });
     } else {
+      // Shopify has to be told. Writing only a log line left the cancellation
+      // request pending in the admin forever, with nothing on the other end.
+      const message = `Already shipped: the supplier has ${shipped} tracking number(s) for this order.`;
+      await rejectCancellationRequest(client, parsed.fulfillmentOrderId, message);
+      await prisma.fulfillmentRequest.updateMany({
+        where: { orderId: order.id, shopifyFulfillmentOrderId: parsed.fulfillmentOrderId },
+        data: { status: "CLOSED", responseMessage: message, respondedAt: new Date() },
+      });
       await logActivity(shop.id, {
         action: "fulfillment_service.cancel_rejected",
         entity: "Order",
         entityId: order.id,
         level: "warn",
-        message: `${order.name}: cancellation requested but the supplier already shipped.`,
+        message: `${order.name}: cancellation refused, the supplier already shipped.`,
       });
     }
     return;
