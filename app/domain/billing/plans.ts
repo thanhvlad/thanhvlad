@@ -26,7 +26,8 @@ export interface PlanLimits {
   stores: number | null;
   /** Staff members on the account (the owner is not counted). */
   staff: number | null;
-  /** Claude-assisted variant mapping and supplier switching. */
+  /** Claude-assisted variant mapping. Supplier ranking is deterministic and
+   * is gated by `supplierOptimizer`, not by this flag. */
   aiMapping: boolean;
   /** Supplier comparison and the one-click optimizer. */
   supplierOptimizer: boolean;

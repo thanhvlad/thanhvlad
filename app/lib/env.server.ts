@@ -60,7 +60,9 @@ const schema = z.object({
   /** Shown on the public support page and used as the reply-to address. */
   SUPPORT_EMAIL: z.string().optional(),
 
-  /** Optional: enables AI-assisted variant mapping and supplier picking. */
+  /** Optional: enables AI-assisted variant mapping. Supplier ranking is a
+   * deterministic weighted score (app/domain/suppliers/score.ts) and does not
+   * use this key. */
   ANTHROPIC_API_KEY: z.string().optional(),
   AI_MAPPING_MODEL: z.string().default("claude-opus-5"),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),

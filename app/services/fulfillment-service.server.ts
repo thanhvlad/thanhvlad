@@ -286,10 +286,13 @@ export async function handleFulfillmentRequest(shop: ShopWithSettings, topic: st
   // failed earlier is an error worth showing, but it is not a reason to refuse
   // to place the lines that are still outstanding.
   const blocking = orderIssues(evaluated).filter(blocksPlacement);
-  const unresolvedMapping = blocking.filter((i) => i.code.startsWith("NO_MAPPING") || i.code === "MAPPING_NOT_RESOLVED");
 
-  if (unresolvedMapping.length > 0) {
-    const message = `Not fulfillable yet: ${unresolvedMapping[0].message}`;
+  // Reject on ANY blocking issue. Only the mapping codes were checked here
+  // before, so OUT_OF_STOCK, NOT_PAID and HIGH_RISK fell through to accept:
+  // Shopify then believed the app owned a fulfilment that was going nowhere,
+  // with no rejection to prompt the merchant and no retry.
+  if (blocking.length > 0) {
+    const message = `Not fulfillable yet: ${blocking[0].message}`;
     await rejectFulfillmentRequest(client, parsed.fulfillmentOrderId, message, reasonFor(blocking));
     await prisma.fulfillmentRequest.update({
       where: { id: request.id },

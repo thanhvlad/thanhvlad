@@ -217,15 +217,23 @@ export async function placeSupplierOrders(shop: ShopWithSettings, orderId: strin
 
     try {
       const result = await adapter.placeOrder(payload);
-      const converted = await toShopCurrency(shop.currency, result.currency, result.itemsCost, result.shippingCost);
+      // A supplier that does not itemise the order returns "0.00" for these.
+      // Storing that verbatim wipes the cost this app already computed from the
+      // mapped variants and the chosen shipping quote, so the purchase order -
+      // and every payment total built from it - reads zero for a real order.
+      // Take the adapter's figure only when it actually carries one.
+      const itemsCost = d(result.itemsCost).isZero() ? d(po.itemsCost) : d(result.itemsCost);
+      const shippingCost = d(result.shippingCost).isZero() ? d(po.shippingCost) : d(result.shippingCost);
+      const totalCost = d(result.totalCost).isZero() ? itemsCost.plus(shippingCost) : d(result.totalCost);
+      const converted = await toShopCurrency(shop.currency, result.currency, itemsCost, shippingCost);
       await prisma.purchaseOrder.update({
         where: { id: po.id },
         data: {
           status: toPurchaseOrderStatus(result.status),
           externalOrderId: result.externalOrderId,
-          itemsCost: result.itemsCost,
-          shippingCost: result.shippingCost,
-          totalCost: result.totalCost,
+          itemsCost: money(itemsCost),
+          shippingCost: money(shippingCost),
+          totalCost: money(totalCost),
           currency: result.currency,
           ...converted,
           placedAt: new Date(),
