@@ -3,6 +3,7 @@ import { Link, Outlet, useLoaderData, useRouteError } from "@remix-run/react";
 import { boundary } from "@shopify/shopify-app-remix/server";
 import { AppProvider } from "@shopify/shopify-app-remix/react";
 import { NavMenu } from "@shopify/app-bridge-react";
+import { Banner, Box } from "@shopify/polaris";
 import polarisStyles from "@shopify/polaris/build/esm/styles.css?url";
 import { requireShop } from "~/lib/auth.server";
 import { env } from "~/lib/env.server";
@@ -18,7 +19,7 @@ export const links = () => [
 ];
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { shop } = await requireShop(request);
+  const { shop, role } = await requireShop(request);
   const [unread, unpaid] = await Promise.all([countUnread(shop.id), countUnpaid(shop.id)]);
 
   // Shopify passes the admin's language as `locale` when it opens the app. A
@@ -38,13 +39,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     apiKey: env().SHOPIFY_API_KEY,
     shopDomain: shop.domain,
     locale,
+    role,
     unread,
     unpaid,
   };
 };
 
 export default function App() {
-  const { apiKey, unread, unpaid, locale } = useLoaderData<typeof loader>();
+  const { apiKey, unread, unpaid, locale, role } = useLoaderData<typeof loader>();
   const t = makeT(locale);
 
   return (
@@ -70,6 +72,13 @@ export default function App() {
         <Link to="/app/logs">{t("nav.logs")}</Link>
         <Link to="/app/settings">{t("nav.settings")}</Link>
       </NavMenu>
+      {role === "READ_ONLY" && (
+        <Box padding="400" paddingBlockEnd="0">
+          <Banner tone="info" title={t("access.readOnly.title")}>
+            <p>{t("access.readOnly.body")}</p>
+          </Banner>
+        </Box>
+      )}
       <Outlet />
     </AppProvider>
   );

@@ -7,7 +7,6 @@ import {
   Box,
   Button,
   Card,
-  Grid,
   InlineGrid,
   InlineStack,
   Layout,
@@ -16,6 +15,7 @@ import {
   ProgressBar,
   Text,
 } from "@shopify/polaris";
+import { CountTile, Stat } from "~/components/Stat";
 import { StatusBadge } from "~/components/StatusBadge";
 import { STAGE_ORDER } from "~/domain/orders/pipeline";
 import { readForm, requireShop } from "~/lib/auth.server";
@@ -195,22 +195,15 @@ export default function Dashboard() {
               <Text as="h2" variant="headingMd">
                 {t("dashboard.ordersPipeline")}
               </Text>
-              <Grid>
+              <InlineGrid columns={{ xs: 2, sm: 3, md: 4, lg: 4 }} gap="300">
                 {STAGE_ORDER.map((stage) => (
-                  <Grid.Cell key={stage} columnSpan={{ xs: 3, sm: 3, md: 3, lg: 3, xl: 3 }}>
-                    <Link to={`/app/orders?stage=${stage}`} style={{ textDecoration: "none" }}>
-                      <Box padding="300" background="bg-surface-secondary" borderRadius="200">
-                        <BlockStack gap="100">
-                          <StatusBadge status={stage} />
-                          <Text as="p" variant="headingLg">
-                            {stats.stages[stage]}
-                          </Text>
-                        </BlockStack>
-                      </Box>
-                    </Link>
-                  </Grid.Cell>
+                  <Link key={stage} to={`/app/orders?stage=${stage}`} style={{ textDecoration: "none" }}>
+                    <CountTile label={t(`stage.${stage}` as never)} count={stats.stages[stage]}>
+                      <StatusBadge status={stage} />
+                    </CountTile>
+                  </Link>
                 ))}
-              </Grid>
+              </InlineGrid>
               {stats.recentFailures > 0 && (
                 <Text as="p" tone="critical">
                   {stats.recentFailures} {t("dashboard.ordersFailedAtSupplier")}{" "}
@@ -292,25 +285,5 @@ export default function Dashboard() {
         </Layout.Section>
       </Layout>
     </Page>
-  );
-}
-
-function Stat({ label, value, hint }: { label: string; value: string; hint?: string }) {
-  return (
-    <Card>
-      <BlockStack gap="100">
-        <Text as="p" tone="subdued" variant="bodySm">
-          {label}
-        </Text>
-        <Text as="p" variant="headingLg">
-          {value}
-        </Text>
-        {hint && (
-          <Text as="p" tone="subdued" variant="bodySm">
-            {hint}
-          </Text>
-        )}
-      </BlockStack>
-    </Card>
   );
 }

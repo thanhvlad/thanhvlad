@@ -19,6 +19,7 @@ import {
   Text,
   TextField,
 } from "@shopify/polaris";
+import { Stat as StatBlock } from "~/components/Stat";
 import { PlatformBadge, StatusBadge } from "~/components/StatusBadge";
 import { Thumb } from "~/components/Thumb";
 import type { ResolveResult } from "~/domain/mapping/types";
@@ -338,9 +339,9 @@ export default function OrderDetailPage() {
                     ))}
                     <Divider />
                     <InlineGrid columns={{ xs: 1, md: 3 }} gap="200">
-                      <Stat label={t("orders.detail.supplierItems")} value={formatMoney(approval.quote.itemsCost, approval.quote.currency)} />
-                      <Stat label={t("orders.detail.supplierShipping")} value={formatMoney(approval.quote.shippingCost, approval.quote.currency)} />
-                      <Stat label={t("orders.detail.youWillPay")} value={formatMoney(approval.quote.totalCost, approval.quote.currency)} />
+                      <StatBlock plain size="medium" label={t("orders.detail.supplierItems")} value={formatMoney(approval.quote.itemsCost, approval.quote.currency)} />
+                      <StatBlock plain size="medium" label={t("orders.detail.supplierShipping")} value={formatMoney(approval.quote.shippingCost, approval.quote.currency)} />
+                      <StatBlock plain size="medium" label={t("orders.detail.youWillPay")} value={formatMoney(approval.quote.totalCost, approval.quote.currency)} />
                     </InlineGrid>
                     {approval.quote.unpriced.length > 0 && (
                       <Banner tone="warning" title={t("orders.detail.partialQuote")}>
@@ -479,10 +480,10 @@ export default function OrderDetailPage() {
               ))}
               <Divider />
               <InlineGrid columns={{ xs: 2, md: 4 }} gap="200">
-                <Stat label={t("orders.detail.orderTotal")} value={formatMoney(order.total, currency)} />
-                <Stat label={t("orders.detail.customerPaidShipping")} value={formatMoney(order.shipping, currency)} />
-                <Stat label={t("orders.detail.supplierCost")} value={formatMoney(order.supplierCost, currency)} />
-                <Stat label={t("orders.detail.estProfit")} value={formatMoney(Number(order.total) - Number(order.supplierCost) - Number(order.supplierShipping), currency)} />
+                <StatBlock plain size="medium" label={t("orders.detail.orderTotal")} value={formatMoney(order.total, currency)} />
+                <StatBlock plain size="medium" label={t("orders.detail.customerPaidShipping")} value={formatMoney(order.shipping, currency)} />
+                <StatBlock plain size="medium" label={t("orders.detail.supplierCost")} value={formatMoney(order.supplierCost, currency)} />
+                <StatBlock plain size="medium" label={t("orders.detail.estProfit")} value={formatMoney(Number(order.total) - Number(order.supplierCost) - Number(order.supplierShipping), currency)} />
               </InlineGrid>
             </BlockStack>
           </Card>
@@ -727,18 +728,5 @@ export default function OrderDetailPage() {
         </Layout.Section>
       </Layout>
     </Page>
-  );
-}
-
-function Stat({ label, value }: { label: string; value: string }) {
-  return (
-    <BlockStack gap="050">
-      <Text as="p" tone="subdued" variant="bodySm">
-        {label}
-      </Text>
-      <Text as="p" fontWeight="semibold">
-        {value}
-      </Text>
-    </BlockStack>
   );
 }

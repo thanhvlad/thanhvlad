@@ -129,6 +129,8 @@ const en = {
 
   // ---- common --------------------------------------------------------------
   "common.days": "days",
+  "access.readOnly.title": "You have view-only access",
+  "access.readOnly.body": "You can see everything here but cannot change anything. Ask an admin to change your role under Settings → Staff.",
   "common.disabled": "Disabled",
   "common.done": "Done",
   "common.enabled": "Enabled",
@@ -1151,6 +1153,8 @@ const vi: Partial<Record<I18nKey, string>> = {
 
   // ---- common --------------------------------------------------------------
   "common.days": "ngày",
+  "access.readOnly.title": "Bạn đang ở chế độ chỉ xem",
+  "access.readOnly.body": "Bạn xem được mọi thứ nhưng chưa thay đổi được gì. Nhờ quản trị viên đổi vai trò cho bạn ở Cài đặt → Nhân sự.",
   "common.disabled": "Đang tắt",
   "common.done": "Xong",
   "common.enabled": "Bật",
