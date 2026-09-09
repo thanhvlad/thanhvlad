@@ -1,0 +1,62 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+# Run `shopify app config link` to bind this file to an app in your Partner dashboard;
+# the CLI fills in client_id and application_url.
+
+name = "WS Fullfill App"
+handle = "ws-fullfill-app"
+client_id = ""
+application_url = "https://dropship.windspace.agency"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = false
+include_config_on_deploy = true
+
+[webhooks]
+api_version = "2026-07"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/uninstalled", "app/scopes_update", "app_subscriptions/update" ]
+  uri = "/webhooks/app"
+
+  [[webhooks.subscriptions]]
+  topics = [ "orders/create", "orders/updated", "orders/cancelled", "orders/paid", "orders/fulfilled" ]
+  uri = "/webhooks/orders"
+
+  [[webhooks.subscriptions]]
+  topics = [ "products/update", "products/delete" ]
+  uri = "/webhooks/products"
+
+  [[webhooks.subscriptions]]
+  topics = [ "fulfillments/create", "fulfillments/update" ]
+  uri = "/webhooks/fulfillments"
+
+  # Fires when a merchant clicks "Request fulfillment" on an order whose items
+  # are stocked at the app's fulfilment location.
+  [[webhooks.subscriptions]]
+  topics = [
+    "fulfillment_orders/fulfillment_request_submitted",
+    "fulfillment_orders/cancellation_request_submitted",
+    "fulfillment_orders/order_routing_complete",
+  ]
+  uri = "/webhooks/fulfillment-orders"
+
+  [[webhooks.subscriptions]]
+  compliance_topics = [ "customers/data_request", "customers/redact", "shop/redact" ]
+  uri = "/webhooks/compliance"
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+# read_publications / write_publications are required by publishProduct():
+# `publications` and `publishablePublish` are refused without them, so
+# "publish on push" silently failed for every product.
+scopes = "read_products,write_products,read_publications,write_publications,read_orders,write_orders,read_fulfillments,write_fulfillments,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,read_assigned_fulfillment_orders,write_assigned_fulfillment_orders,read_inventory,write_inventory,read_locations,read_customers"
+
+[auth]
+redirect_urls = [
+  "https://dropship.windspace.agency/auth/callback",
+  "https://dropship.windspace.agency/auth/shopify/callback"
+]
+
+[pos]
+embedded = false

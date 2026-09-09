@@ -4,6 +4,11 @@ export interface SupplierVariantSnapshot {
   id: string;
   supplierProductId: string;
   externalSkuId: string;
+  /**
+   * AliExpress `sku_attr` ("14:350853#Black;5:361386"). Order placement needs
+   * this, not the numeric sku id — see app/services/suppliers/aliexpress.server.ts.
+   */
+  skuAttr?: string | null;
   /** Upstream product id, needed to place the order. */
   externalProductId: string;
   platform: string;
@@ -52,6 +57,8 @@ export interface ResolvedSupplierLine {
   supplierVariantId: string;
   externalProductId: string;
   externalSkuId: string;
+  /** Attribute-encoded SKU, required by AliExpress order creation. */
+  skuAttr?: string | null;
   platform: string;
   title: string;
   /** Units to buy from the supplier. */

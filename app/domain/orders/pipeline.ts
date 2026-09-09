@@ -9,7 +9,8 @@ export type OrderStage =
   | "AWAITING_DELIVERY"
   | "FULFILLED"
   | "CANCELED"
-  | "FAILED";
+  | "FAILED"
+  | "IGNORED";
 
 export type PurchaseOrderStatus =
   | "DRAFT"
@@ -50,6 +51,16 @@ export interface PipelineInput {
   lineItems: PipelineLineItem[];
   addressIssues: AddressIssue[];
   purchaseOrders: Array<{ status: PurchaseOrderStatus; hasTracking: boolean }>;
+  /**
+   * Ids of line items that a live purchase order already covers.
+   *
+   * Without it the evaluator cannot tell a partly-ordered order from a fully
+   * ordered one and would report supplier progress for the whole order as soon
+   * as any purchase order exists, stranding the lines nobody ordered. Callers
+   * that read purchase orders should always pass it; when it is omitted every
+   * outstanding line is assumed covered.
+   */
+  coveredLineItemIds?: string[];
   settings: {
     /** Only place supplier orders once Shopify says the order is paid. */
     requirePaidOrder: boolean;
@@ -73,6 +84,14 @@ export interface PipelineResult {
 const TERMINAL_PO: PurchaseOrderStatus[] = ["DELIVERED", "SHIPPED"];
 
 /**
+ * A failed supplier order must be reported, but it does not stop a *different*
+ * line item from being ordered, so it is excluded from the placement gate.
+ */
+export function blocksPlacement(issue: OrderIssue): boolean {
+  return issue.severity === "error" && issue.code !== "SUPPLIER_ORDER_FAILED";
+}
+
+/**
  * Derive the internal pipeline stage and the list of blocking problems for one
  * Shopify order. Pure: everything it needs is passed in, so the orders list,
  * the order detail page and the bulk "place orders" job all agree on state.
@@ -87,53 +106,89 @@ export function evaluateOrder(input: PipelineInput): PipelineResult {
 
   const managed = input.lineItems.filter((li) => li.isManaged && !li.isCanceled);
   const outstanding = managed.filter((li) => !li.isFulfilled && li.fulfillableQuantity > 0);
-
-  // ---- Supplier-side progress wins over local readiness ---------------------
   const pos = input.purchaseOrders;
-  if (pos.length > 0) {
-    const allTerminal = pos.every((po) => TERMINAL_PO.includes(po.status));
-    const anyFailed = pos.some((po) => po.status === "FAILED");
-    const anyShipped = pos.some((po) => po.status === "SHIPPED" || po.hasTracking);
-    const anyPaid = pos.some((po) => po.status === "PAID");
-    const anyAwaitingPayment = pos.some(
-      (po) => po.status === "PLACED" || po.status === "AWAITING_PAYMENT",
-    );
 
-    if (anyFailed && !anyShipped) {
-      issues.push({
-        code: "SUPPLIER_ORDER_FAILED",
-        severity: "error",
-        message: `${pos.filter((p) => p.status === "FAILED").length} supplier order(s) failed. Review the error and retry.`,
-      });
-      return { stage: "FAILED", issues, canPlaceOrder: false, blockedLineItemIds: [] };
-    }
-    if (allTerminal && input.fulfillmentStatus === "fulfilled") {
-      return { stage: "FULFILLED", issues, canPlaceOrder: false, blockedLineItemIds: [] };
-    }
-    if (anyShipped) {
-      return { stage: "AWAITING_DELIVERY", issues, canPlaceOrder: false, blockedLineItemIds: [] };
-    }
-    if (anyPaid) {
-      return { stage: "AWAITING_SHIPMENT", issues, canPlaceOrder: false, blockedLineItemIds: [] };
-    }
-    if (anyAwaitingPayment) {
-      return { stage: "AWAITING_PAYMENT", issues, canPlaceOrder: false, blockedLineItemIds: [] };
-    }
-  }
-
-  if (input.fulfillmentStatus === "fulfilled" && outstanding.length === 0) {
-    return { stage: "FULFILLED", issues, canPlaceOrder: false, blockedLineItemIds: [] };
-  }
-
-  // ---- Local readiness checks ----------------------------------------------
+  // Nothing on this order is ours. Its own terminal stage, so it does not sit in
+  // Pending forever with no action attached to it.
   if (managed.length === 0) {
     issues.push({
       code: "NO_MANAGED_ITEMS",
       severity: "warning",
       message: "No line item on this order is managed by the app.",
     });
+    return { stage: "IGNORED", issues, canPlaceOrder: false, blockedLineItemIds: [] };
   }
 
+  // ---- Supplier-side progress ----------------------------------------------
+  const covered = input.coveredLineItemIds ? new Set(input.coveredLineItemIds) : null;
+  // Without coverage information every outstanding line is assumed covered,
+  // which is the historical behaviour.
+  const needsOrdering = covered ? outstanding.filter((li) => !covered.has(li.id)) : outstanding;
+  const uncovered = covered ? needsOrdering : [];
+
+  const failedCount = pos.filter((po) => po.status === "FAILED").length;
+  if (failedCount > 0) {
+    // Reported whatever else happened: a failure hidden behind a sibling
+    // purchase order that shipped is a failure the merchant never fixes.
+    issues.push({
+      code: "SUPPLIER_ORDER_FAILED",
+      severity: "error",
+      message: `${failedCount} supplier order(s) failed. Review the error and retry.`,
+    });
+  }
+
+  if (pos.length > 0) {
+    const live = pos.filter((po) => po.status !== "CANCELED" && po.status !== "FAILED");
+    const anyShipped = live.some(
+      (po) => po.status === "SHIPPED" || po.status === "DELIVERED" || po.hasTracking,
+    );
+    const anyPaid = live.some((po) => po.status === "PAID");
+    const anyAwaitingPayment = live.some(
+      (po) => po.status === "PLACED" || po.status === "AWAITING_PAYMENT",
+    );
+    const anyLive = anyShipped || anyPaid || anyAwaitingPayment;
+
+    if (!anyLive) {
+      if (failedCount > 0) {
+        return { stage: "FAILED", issues, canPlaceOrder: false, blockedLineItemIds: [] };
+      }
+    } else if (uncovered.length === 0) {
+      // The whole order is in flight upstream. Supplier progress decides the
+      // stage even once Shopify's line items are fulfilled: the app creates the
+      // fulfilment the moment tracking arrives, so an order whose parcel is
+      // still in transit would otherwise read as delivered.
+      const allDelivered = live.every((po) => po.status === "DELIVERED");
+      const allTerminal = live.every((po) => TERMINAL_PO.includes(po.status));
+      if (allDelivered || (allTerminal && input.fulfillmentStatus === "fulfilled" && outstanding.length === 0)) {
+        return { stage: "FULFILLED", issues, canPlaceOrder: false, blockedLineItemIds: [] };
+      }
+      if (anyShipped) {
+        return { stage: "AWAITING_DELIVERY", issues, canPlaceOrder: false, blockedLineItemIds: [] };
+      }
+      if (anyPaid) {
+        return { stage: "AWAITING_SHIPMENT", issues, canPlaceOrder: false, blockedLineItemIds: [] };
+      }
+      return { stage: "AWAITING_PAYMENT", issues, canPlaceOrder: false, blockedLineItemIds: [] };
+    } else {
+      // Part of the order is upstream and part of it was never sent. Say so and
+      // fall through, so the remaining lines can still be placed.
+      issues.push({
+        code: "LINES_NOT_ORDERED",
+        severity: "warning",
+        message: `${uncovered.length} line item(s) on this order have not been sent to a supplier yet.`,
+      });
+    }
+  }
+
+  // Every managed line is done and no supplier order is still in flight.
+  // Shopify's own fulfillmentStatus can sit at "partial" indefinitely because of
+  // an unmanaged line (a gift card, a service, a locally stocked item), so it is
+  // not the signal we key on.
+  if (outstanding.length === 0) {
+    return { stage: "FULFILLED", issues, canPlaceOrder: false, blockedLineItemIds: [] };
+  }
+
+  // ---- Local readiness checks ----------------------------------------------
   for (const issue of input.addressIssues) {
     issues.push({
       code: `ADDRESS_${issue.code}`,
@@ -168,7 +223,10 @@ export function evaluateOrder(input: PipelineInput): PipelineResult {
     });
   }
 
-  for (const line of outstanding) {
+  // Only the lines still to be ordered need a resolvable supplier; a line
+  // already covered by a live purchase order is settled whatever its mapping
+  // looks like today.
+  for (const line of needsOrdering) {
     const resolution = line.resolution;
     if (!resolution) {
       blocked.add(line.id);
@@ -191,11 +249,10 @@ export function evaluateOrder(input: PipelineInput): PipelineResult {
     }
   }
 
-  const hasBlockingIssue = issues.some((i) => i.severity === "error");
-  const canPlaceOrder = !hasBlockingIssue && outstanding.length > 0;
+  const canPlaceOrder = !issues.some(blocksPlacement) && needsOrdering.length > 0;
 
   return {
-    stage: canPlaceOrder ? "AWAITING_ORDER" : "PENDING",
+    stage: canPlaceOrder ? "AWAITING_ORDER" : failedCount > 0 ? "FAILED" : "PENDING",
     issues,
     canPlaceOrder,
     blockedLineItemIds: [...blocked],
@@ -235,6 +292,7 @@ export const STAGE_LABELS: Record<OrderStage, string> = {
   FULFILLED: "Fulfilled",
   CANCELED: "Canceled",
   FAILED: "Failed",
+  IGNORED: "Not ours",
 };
 
 /** Tab order for the Orders page. */
@@ -247,4 +305,5 @@ export const STAGE_ORDER: OrderStage[] = [
   "FULFILLED",
   "CANCELED",
   "FAILED",
+  "IGNORED",
 ];

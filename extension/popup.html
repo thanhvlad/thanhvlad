@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { font: 14px/1.4 -apple-system, Segoe UI, Roboto, sans-serif; width: 300px; padding: 12px; margin: 0; color: #202223; }
+      button { width: 100%; padding: 10px; border: 0; border-radius: 8px; background: #008060; color: #fff; font-weight: 600; cursor: pointer; }
+      button:disabled { background: #c9cccf; cursor: default; }
+      #status { margin-top: 10px; min-height: 1.4em; }
+      .ok { color: #008060; } .err { color: #d72c0d; }
+      a { color: #2c6ecb; }
+      small { color: #6d7175; }
+    </style>
+  </head>
+  <body>
+    <div id="url"><small>Reading current tab…</small></div>
+    <p><button id="add" disabled>Add to import list</button></p>
+    <div id="status"></div>
+    <p><small><a href="#" id="options">Configure app URL &amp; token</a></small></p>
+    <script src="popup.js"></script>
+  </body>
+</html>

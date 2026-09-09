@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "DropshipHub Product Capture",
+  "version": "1.2.0",
+  "description": "Add the AliExpress or CJ product you are viewing to your DropshipHub import list, straight from the product page.",
+  "permissions": [
+    "activeTab",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://*.aliexpress.com/*",
+    "https://*.aliexpress.us/*",
+    "https://cjdropshipping.com/*",
+    "https://*.cjdropshipping.com/*"
+  ],
+  "action": {
+    "default_title": "Add to DropshipHub",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "icons": {},
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.aliexpress.com/item/*",
+        "https://*.aliexpress.com/i/*",
+        "https://*.aliexpress.us/item/*",
+        "https://*.aliexpress.us/i/*",
+        "https://cjdropshipping.com/product/*",
+        "https://*.cjdropshipping.com/product/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://*.aliexpress.com/item/*",
+        "https://*.aliexpress.com/i/*",
+        "https://*.aliexpress.us/item/*",
+        "https://*.aliexpress.us/i/*",
+        "https://cjdropshipping.com/product/*",
+        "https://*.cjdropshipping.com/product/*"
+      ],
+      "js": [
+        "page-reader.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ]
+}

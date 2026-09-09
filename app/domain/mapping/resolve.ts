@@ -25,6 +25,7 @@ function toLine(
     supplierVariantId: variant.id,
     externalProductId: variant.externalProductId,
     externalSkuId: variant.externalSkuId,
+    skuAttr: variant.skuAttr ?? null,
     platform: variant.platform,
     title: variant.title,
     quantity,
@@ -86,9 +87,15 @@ export function resolveMapping(ctx: ResolveContext): ResolveResult {
 
   switch (ctx.type) {
     case "BASIC": {
-      const row =
-        enabled.find((r) => r.isDefault) ??
-        [...enabled].sort((a, b) => a.priority - b.priority)[0];
+      // Total order, like ADVANCED: default first, then priority, then id. The
+      // rows arrive in whatever order Postgres returned them, so a tie broken by
+      // array position would silently change which supplier is charged between
+      // two evaluations of the same order.
+      const row = [...enabled].sort((a, b) => {
+        if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1;
+        if (a.priority !== b.priority) return a.priority - b.priority;
+        return a.id.localeCompare(b.id);
+      })[0];
       const variant = ctx.supplierVariants[row.supplierVariantId];
       const needed = qty * Math.max(1, row.quantity);
       if (!variant) {
@@ -212,10 +219,16 @@ export function resolveMapping(ctx: ResolveContext): ResolveResult {
       for (const [groupKey, rows] of ordered) {
         const lines: ResolvedSupplierLine[] = [];
         let complete = true;
+        // Requirements accumulate per supplier SKU: the same SKU listed twice in
+        // one group needs both quantities out of the same shelf, so checking each
+        // row against the full stock figure would accept a bundle the supplier
+        // cannot fill.
+        const claimed = new Map<string, number>();
         for (const row of rows) {
           const variant = ctx.supplierVariants[row.supplierVariantId];
           const needed = qty * Math.max(1, row.quantity);
-          if (!variant || !hasStock(variant, needed, ignoreStock)) {
+          const total = (claimed.get(row.supplierVariantId) ?? 0) + needed;
+          if (!variant || !hasStock(variant, total, ignoreStock)) {
             skipped.push({
               mappingRowId: row.id,
               reason: variant ? "out of stock" : "supplier variant missing",
@@ -223,6 +236,7 @@ export function resolveMapping(ctx: ResolveContext): ResolveResult {
             complete = false;
             break;
           }
+          claimed.set(row.supplierVariantId, total);
           lines.push(toLine(row, variant, needed));
         }
         if (complete && lines.length > 0) {

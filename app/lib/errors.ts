@@ -54,3 +54,22 @@ export function errorMessage(error: unknown): string {
     return String(error);
   }
 }
+
+/**
+ * The failure payload an action returns for `useErrorMessage`.
+ *
+ * Errors that know their translation key (a plan limit) pass it along; anything
+ * else is shown as its message.
+ */
+export function actionFailure(error: unknown): { ok: false; error: string; errorKey?: string; errorVars?: Record<string, string | number> } {
+  const withKey = error as { messageKey?: unknown; messageVars?: unknown };
+  if (error instanceof AppError && typeof withKey.messageKey === "string") {
+    return {
+      ok: false,
+      error: error.message,
+      errorKey: withKey.messageKey,
+      errorVars: (withKey.messageVars as Record<string, string | number> | undefined) ?? {},
+    };
+  }
+  return { ok: false, error: errorMessage(error) };
+}

@@ -21,6 +21,15 @@ const schema = z.object({
     .string()
     .default("false")
     .transform((v) => v === "true" || v === "1"),
+  /**
+   * True once `shopify app deploy` has published the [webhooks] block of
+   * shopify.app.toml as app-level subscriptions. Until then each install
+   * registers its own shop-level ones; after, those are removed as duplicates.
+   */
+  WEBHOOKS_FROM_APP_CONFIG: z
+    .string()
+    .default("false")
+    .transform((v) => v === "true" || v === "1"),
 
   SUPPLIER_DRIVER: z.enum(["mock", "live"]).default("mock"),
 
@@ -36,8 +45,54 @@ const schema = z.object({
   CJ_API_KEY: z.string().optional(),
 
   ENCRYPTION_KEY: z.string().optional(),
+
+  /**
+   * Force Shopify Billing into test mode (no real charges). Always on outside
+   * production and on development stores; set it on a staging deployment that
+   * talks to a live store.
+   */
+  BILLING_TEST: z
+    .string()
+    .default("false")
+    .transform((v) => v === "true" || v === "1"),
+
+  /**
+   * Outbound email. Pick a provider explicitly, or leave it unset and the app
+   * uses Resend when RESEND_API_KEY is present, else SMTP when SMTP_URL is,
+   * else keeps notifications in the in-app feed only.
+   */
+  EMAIL_PROVIDER: z.enum(["smtp", "resend", "none"]).optional(),
+  EMAIL_FROM: z.string().default("DropshipHub <no-reply@example.com>"),
+  /** smtp://user:pass@host:587 or smtps://user:pass@host:465 */
+  SMTP_URL: z.string().optional(),
+  RESEND_API_KEY: z.string().optional(),
+  /** Shown on the public support page and used as the reply-to address. */
+  SUPPORT_EMAIL: z.string().optional(),
+
+  /** Optional: enables AI-assisted variant mapping. Supplier ranking is a
+   * deterministic weighted score (app/domain/suppliers/score.ts) and does not
+   * use this key. */
+  ANTHROPIC_API_KEY: z.string().optional(),
+  AI_MAPPING_MODEL: z.string().default("claude-opus-5"),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
   EXCHANGE_RATE_API_URL: z.string().default("https://open.er-api.com/v6/latest"),
+}).superRefine((values, ctx) => {
+  // Every default above exists so a bare checkout can run tests and generate
+  // the Prisma client. In production a missing value is a misconfiguration
+  // that must stop the boot with a clear message, not surface later as a
+  // failed OAuth, a plaintext supplier token or a job that never runs.
+  if (values.NODE_ENV !== "production") return;
+  const missing = (key: string) => ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: "required in production" });
+  if (!values.SHOPIFY_API_KEY) missing("SHOPIFY_API_KEY");
+  if (!values.SHOPIFY_API_SECRET) missing("SHOPIFY_API_SECRET");
+  if (!/^https:\/\//.test(values.SHOPIFY_APP_URL)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["SHOPIFY_APP_URL"], message: "must be the public https URL of this deployment" });
+  }
+  if (!values.DATABASE_URL) missing("DATABASE_URL");
+  if (!values.ENCRYPTION_KEY) missing("ENCRYPTION_KEY");
+  if (values.SUPPLIER_DRIVER === "live" && !(values.ALIEXPRESS_APP_KEY || values.CJ_API_KEY)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["SUPPLIER_DRIVER"], message: "live driver needs ALIEXPRESS_APP_KEY/SECRET or CJ_API_KEY" });
+  }
 });
 
 export type AppEnv = z.infer<typeof schema>;

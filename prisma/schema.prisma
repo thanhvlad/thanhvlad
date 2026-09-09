@@ -46,6 +46,8 @@ model Session {
   locale        String?
   collaborator  Boolean?  @default(false)
   emailVerified Boolean?  @default(false)
+  refreshToken  String?
+  refreshTokenExpires DateTime?
 
   @@index([shop])
 }
@@ -59,6 +61,17 @@ model Account {
   ownerEmail String?
   plan      Plan     @default(FREE)
   planRenewsAt DateTime?
+  /// Shopify AppSubscription gid behind `plan`; null on the free tier.
+  subscriptionId     String?
+  /// Last status Shopify reported (ACTIVE, CANCELLED, EXPIRED, FROZEN, ...).
+  subscriptionStatus String?
+  /// The plan name Shopify echoes back, kept for reconciliation.
+  subscriptionName   String?
+  /// Subscriptions are per store on Shopify's side: this is the store that
+  /// approved the charge, and the only one whose `billing.check()` is authoritative.
+  billingShopId      String?
+  trialEndsAt        DateTime?
+  planChangedAt      DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -91,7 +104,18 @@ model Shop {
   installedAt   DateTime  @default(now())
   uninstalledAt DateTime?
   isActive      Boolean   @default(true)
+  /// Partner development stores cannot be charged; billing runs in test mode there.
+  isDevelopmentStore Boolean @default(false)
   onboardingStep String   @default("connect_supplier")
+  /// Bearer token for the browser extension / public import API.
+  apiToken      String?   @unique
+
+  /// Shopify FulfillmentService id + its location, once the app is registered
+  /// as a fulfilment service. Products assigned to that location get a native
+  /// "Request fulfillment" button in the Shopify order page.
+  fulfillmentServiceId  String?
+  fulfillmentLocationId String?
+  fulfillmentServiceRegisteredAt DateTime?
 
   /// Free-form UI/behaviour preferences (see app/domain/settings/shop-settings.ts).
   settings Json @default("{}")
@@ -172,6 +196,15 @@ model SupplierAccount {
   isDefault Boolean  @default(false)
   isActive  Boolean  @default(true)
   lastUsedAt DateTime?
+
+  /// Set when the platform rejected our token; the UI then asks the merchant
+  /// to reconnect instead of failing every order silently.
+  needsReauth   Boolean   @default(false)
+  lastErrorCode String?
+  lastErrorAt   DateTime?
+  /// Store registered with the platform's dropshipping programme.
+  storeRegisteredAt DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -220,6 +253,7 @@ model SupplierProduct {
   shippingOptions  SupplierShippingOption[]
   importedProducts ImportedProduct[]
   priceSnapshots   SupplierPriceSnapshot[]
+  candidates       SupplierCandidate[]
 
   @@unique([platform, externalId])
   @@index([platform, isAvailable])
@@ -270,11 +304,17 @@ model SupplierShippingOption {
   hasTracking     Boolean @default(true)
   isFreeShipping  Boolean @default(false)
 
+  /// Quantity and SKU the quote was priced for. Suppliers price per parcel, so
+  /// a 1-unit quote served for a 5-unit order understates the shipping cost and
+  /// can point at a carrier that will not take the parcel.
+  quantity      Int     @default(1)
+  externalSkuId String  @default("")
+
   fetchedAt DateTime @default(now())
 
   supplierProduct SupplierProduct @relation(fields: [supplierProductId], references: [id], onDelete: Cascade)
 
-  @@unique([supplierProductId, shipFromCountry, shipToCountry, carrierCode])
+  @@unique([supplierProductId, shipFromCountry, shipToCountry, carrierCode, quantity, externalSkuId])
   @@index([supplierProductId, shipToCountry])
 }
 
@@ -313,6 +353,11 @@ model ImportedProduct {
 
   status      ImportStatus @default(DRAFT)
   pushedProductId String?
+  /// The Shopify product this row created, recorded the moment Shopify answers
+  /// and before the local mirror is written. A push that fails after Shopify
+  /// has created the product would otherwise orphan it, and the retry would
+  /// create a second listing of the same item.
+  shopifyProductId String?
   pushError   String?
   pushedAt    DateTime?
 
@@ -381,9 +426,10 @@ model Product {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  shop     Shop             @relation(fields: [shopId], references: [id], onDelete: Cascade)
-  variants ProductVariant[]
-  mapping  ProductMapping?
+  shop       Shop             @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  variants   ProductVariant[]
+  mapping    ProductMapping?
+  candidates SupplierCandidate[]
 
   @@unique([shopId, shopifyProductId])
   @@index([shopId])
@@ -404,6 +450,9 @@ model ProductVariant {
   cost              Decimal? @db.Decimal(18, 4)
   inventoryQuantity Int     @default(0)
   position          Int     @default(1)
+  /// True once this variant's inventory is stocked at the app's fulfilment
+  /// location, which is what makes Shopify route its fulfilment orders here.
+  fulfillmentAssigned Boolean @default(false)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -419,6 +468,12 @@ model ProductVariant {
 // -----------------------------------------------------------------------------
 // 6. Mapping
 // -----------------------------------------------------------------------------
+
+enum MappingSource {
+  MANUAL
+  AUTO
+  AI
+}
 
 enum MappingType {
   /// One Shopify variant -> one supplier SKU.
@@ -467,6 +522,11 @@ model VariantMapping {
 
   isDefault Boolean @default(false)
   isEnabled Boolean @default(true)
+
+  /// How this row was created: manual, auto (exact option match) or ai.
+  source     MappingSource @default(MANUAL)
+  /// 0-1 match confidence for auto/ai rows; null for manual ones.
+  confidence Float?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -642,6 +702,8 @@ enum OrderStage {
   FULFILLED
   CANCELED
   FAILED
+  /// No line item on the order is managed by the app, so there is nothing to do.
+  IGNORED
 }
 
 model Order {
@@ -691,6 +753,7 @@ model Order {
   shop           Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
   lineItems      OrderLineItem[]
   purchaseOrders PurchaseOrder[]
+  fulfillmentRequests FulfillmentRequest[]
 
   @@unique([shopId, shopifyOrderId])
   @@index([shopId, stage])
@@ -757,10 +820,24 @@ model PurchaseOrder {
   externalOrderId   String?
   status            PurchaseOrderStatus @default(DRAFT)
 
+  /// Stable across retries and sent upstream as the supplier's own order
+  /// reference, so a retry after a lost response cannot place a second order.
+  /// Derived from the Shopify order, the platform and the line items it covers.
+  idempotencyKey String?
+
   currency        String  @default("USD")
   itemsCost       Decimal @default(0) @db.Decimal(18, 4)
   shippingCost    Decimal @default(0) @db.Decimal(18, 4)
   totalCost       Decimal @default(0) @db.Decimal(18, 4)
+
+  /// The same amounts converted to the shop's currency at placement time.
+  /// Order-level totals are summed from these: adding a USD purchase order to a
+  /// CNY one and calling the result GBP is how a profit report goes wrong.
+  shopCurrency     String?
+  shopItemsCost    Decimal? @db.Decimal(18, 4)
+  shopShippingCost Decimal? @db.Decimal(18, 4)
+  /// Rate used for that conversion, for the audit trail.
+  fxRate           Decimal? @db.Decimal(18, 8)
 
   carrierCode     String?
   carrierName     String?
@@ -769,6 +846,15 @@ model PurchaseOrder {
 
   /// Free-text note pushed to the supplier ("no invoice, no promotion"...).
   supplierNote String?
+
+  /// Deep link where the merchant pays this order on the supplier's site.
+  paymentUrl        String?
+  /// When the supplier auto-cancels the order if it is still unpaid.
+  paymentDueAt      DateTime?
+  /// Last time we warned the merchant that payment is outstanding.
+  paymentReminderAt DateTime?
+  /// Set when the merchant ticks "I paid this" before the supplier reports it.
+  paymentMarkedAt   DateTime?
 
   errorCode    String?
   errorMessage String?
@@ -790,6 +876,7 @@ model PurchaseOrder {
   items           PurchaseOrderItem[]
   trackings       TrackingNumber[]
 
+  @@unique([orderId, idempotencyKey])
   @@index([orderId])
   @@index([platform, externalOrderId])
   @@index([status])
@@ -803,16 +890,27 @@ model PurchaseOrderItem {
 
   externalProductId String?
   externalSkuId     String?
+  /// Attribute-encoded SKU; AliExpress order creation needs this, not the id.
+  externalSkuAttr   String?
   title             String
   quantity          Int     @default(1)
   unitCost          Decimal @default(0) @db.Decimal(18, 4)
   currency          String  @default("USD")
+
+  /// Chosen per item: two products on one platform routinely ship from
+  /// different warehouses and support different carriers.
+  carrierCode       String?
+  carrierName       String?
+  shipFromCountry   String?
+  estimatedDeliveryDays Int?
+  shippingCost      Decimal? @db.Decimal(18, 4)
 
   purchaseOrder   PurchaseOrder    @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
   orderLineItem   OrderLineItem?   @relation(fields: [orderLineItemId], references: [id], onDelete: SetNull)
   supplierVariant SupplierVariant? @relation(fields: [supplierVariantId], references: [id], onDelete: SetNull)
 
   @@index([purchaseOrderId])
+  @@index([orderLineItemId])
 }
 
 model TrackingNumber {
@@ -830,6 +928,11 @@ model TrackingNumber {
   syncError              String?
   /// Whether Shopify should email the customer when we create the fulfilment.
   notifyCustomer         Boolean   @default(true)
+
+  /// Quantities Shopify accepted for this tracking, keyed by Shopify line item
+  /// id. A supplier order that ships in several parcels must not re-fulfil the
+  /// whole order once per parcel.
+  fulfilledQuantities Json @default("{}")
 
   status        String?
   lastCheckedAt DateTime?
@@ -918,11 +1021,14 @@ model Notification {
 
   readAt     DateTime?
   archivedAt DateTime?
+  /// When the notification went out by email (instantly or in a digest).
+  emailedAt  DateTime?
   createdAt  DateTime  @default(now())
 
   shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
 
   @@index([shopId, readAt])
+  @@index([shopId, emailedAt])
 }
 
 /// Webhook de-duplication. Shopify retries, and at-least-once delivery would
@@ -994,4 +1100,92 @@ model DailyMetric {
 
   @@unique([shopId, day])
   @@index([shopId, day])
+}
+
+
+// -----------------------------------------------------------------------------
+// 10. Fulfilment service (native "Request fulfillment" button)
+// -----------------------------------------------------------------------------
+
+enum FulfillmentRequestStatus {
+  SUBMITTED
+  /// Accepted in Shopify, priced, and waiting for the merchant to approve the spend.
+  AWAITING_APPROVAL
+  ACCEPTED
+  REJECTED
+  CANCELLATION_REQUESTED
+  CANCELLED
+  CLOSED
+}
+
+/// A Shopify fulfilment request routed to this app because the merchant clicked
+/// "Request fulfillment" on an order whose items sit at the app's location.
+model FulfillmentRequest {
+  id      String @id @default(cuid())
+  orderId String
+
+  shopifyFulfillmentOrderId String
+  status                    FulfillmentRequestStatus @default(SUBMITTED)
+  /// Note the merchant typed in the request dialog.
+  requestMessage            String?
+  /// Reason we sent back when rejecting.
+  responseMessage           String?
+  /// [{ fulfillmentOrderLineItemId, shopifyLineItemId, quantity }]
+  lineItems                 Json  @default("[]")
+
+  /// What the supplier order will cost, priced when the request arrived, so the
+  /// merchant approves a number rather than a promise.
+  /// { currency, itemsCost, shippingCost, totalCost, groups: [...], pricedFrom }
+  quote       Json?
+  quotedAt    DateTime?
+  quoteError  String?
+  approvedAt  DateTime?
+  approvedBy  String?
+
+  requestedAt DateTime  @default(now())
+  respondedAt DateTime?
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId, shopifyFulfillmentOrderId])
+  @@index([status])
+}
+
+// -----------------------------------------------------------------------------
+// 11. Supplier comparison
+// -----------------------------------------------------------------------------
+
+/// A candidate supplier product for an existing managed product, with the
+/// landed cost and score used by the supplier optimizer.
+model SupplierCandidate {
+  id                String @id @default(cuid())
+  productId         String
+  supplierProductId String
+
+  itemCost      Decimal  @db.Decimal(18, 4)
+  shippingCost  Decimal  @default(0) @db.Decimal(18, 4)
+  landedCost    Decimal  @db.Decimal(18, 4)
+  currency      String   @default("USD")
+  deliveryDays  Int?
+  carrierName   String?
+  rating        Float?
+  orderCount    Int?
+  /// 0-100; higher is better. See app/domain/suppliers/score.ts.
+  score         Float    @default(0)
+  /// Why it scored that way, for the comparison table.
+  scoreBreakdown Json    @default("{}")
+
+  /// True for the supplier the product is mapped to right now.
+  isCurrent   Boolean @default(false)
+  /// Set when the merchant dismisses this candidate.
+  dismissedAt DateTime?
+
+  evaluatedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  product         Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  supplierProduct SupplierProduct @relation(fields: [supplierProductId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, supplierProductId])
+  @@index([productId, score])
 }

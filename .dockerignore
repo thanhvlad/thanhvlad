@@ -1,0 +1,17 @@
+node_modules
+build
+public/build
+coverage
+.cache
+.git
+.github
+.shopify
+.env
+.env.*
+!.env.example
+*.log
+docs
+tests
+extension
+.vscode
+.idea
