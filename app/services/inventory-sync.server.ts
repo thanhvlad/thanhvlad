@@ -10,6 +10,7 @@ import type { ShopWithSettings } from "./shop.server";
 import type { GraphqlClient } from "./shopify/graphql.server";
 import { setInventoryQuantities, setProductStatus, updateVariantPrices } from "./shopify/products.server";
 import { refreshSupplierProduct } from "./suppliers/catalog.server";
+import { findAlternativeSuppliers } from "./supplier-comparison.server";
 
 export interface InventorySyncSummary {
   productsChecked: number;
@@ -183,7 +184,22 @@ async function applyActions(shop: ShopWithSettings, client: GraphqlClient, produ
       summary.inventoryUpdates += withItems.length;
       const outOfStock = withItems.filter((a) => (a.quantity ?? 0) === 0);
       if (outOfStock.length && shop.parsedSettings.notifications.onOutOfStock) {
-        await notify(shop.id, { type: "stock.out", severity: "warning", title: `${title}: ${outOfStock.length} variant(s) out of stock at supplier`, link: `/app/products/${productId}`, dedupeKey: `stock:${productId}`, dedupeMinutes: 360 });
+        // Look for a replacement before telling the merchant. The comparison
+        // engine and its screen both existed already; nothing ever ran them on
+        // a stock-out, so the merchant was told the product had died and left
+        // to go looking for an alternative by hand.
+        let body: string | undefined;
+        try {
+          const comparison = await findAlternativeSuppliers(shop, productId, { limit: 4, actor: "inventory-sync" });
+          if (comparison.betterOption) {
+            const alt = comparison.betterOption;
+            body = `A cheaper supplier is available: ${alt.storeName ?? alt.title} at ${alt.landedCost} ${alt.currency ?? ""}`.trim();
+          }
+        } catch (error) {
+          // A failed search must not cost the merchant the stock-out warning.
+          logger.warn("Could not look for an alternative supplier on stock-out", { productId, error });
+        }
+        await notify(shop.id, { type: "stock.out", severity: "warning", title: `${title}: ${outOfStock.length} variant(s) out of stock at supplier`, body, link: `/app/products/${productId}`, dedupeKey: `stock:${productId}`, dedupeMinutes: 360 });
         summary.notifications += 1;
       }
       for (const a of withItems) {
