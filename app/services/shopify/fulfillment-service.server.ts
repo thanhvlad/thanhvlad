@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { assertNoUserErrors, gql, type GraphqlClient, type UserError } from "./graphql.server";
 
 /**
@@ -258,9 +259,22 @@ export async function rejectCancellationRequest(client: GraphqlClient, fulfillme
 // Moving inventory onto the app's location
 // ---------------------------------------------------------------------------
 
+// The @idempotent key is REQUIRED on this mutation from Admin API 2026-04
+// onwards, and this app pins 2026-07. Without it every assignment is rejected -
+// which is why assigning products to the fulfilment service could never succeed.
+/**
+ * A stable idempotency key. Shopify requires one on the inventory mutations from
+ * API 2026-04; deriving it from the payload means a genuine retry of the same
+ * write reuses it, which is the entire point. A fresh uuid per attempt would
+ * satisfy the API and protect nothing.
+ */
+function idempotencyKey(...parts: unknown[]): string {
+  return createHash("sha256").update(JSON.stringify(parts)).digest("hex").slice(0, 36);
+}
+
 const INVENTORY_ACTIVATE = `#graphql
-  mutation DropshipInventoryActivate($inventoryItemId: ID!, $locationId: ID!, $available: Int) {
-    inventoryActivate(inventoryItemId: $inventoryItemId, locationId: $locationId, available: $available) {
+  mutation DropshipInventoryActivate($inventoryItemId: ID!, $locationId: ID!, $available: Int, $key: String!) {
+    inventoryActivate(inventoryItemId: $inventoryItemId, locationId: $locationId, available: $available) @idempotent(key: $key) {
       inventoryLevel { id quantities(names: ["available"]) { name quantity } }
       userErrors { field message }
     }
@@ -301,6 +315,7 @@ export async function assignVariantToLocation(
     inventoryItemId,
     locationId,
     available: Math.max(0, available),
+    key: idempotencyKey("inventoryActivate", inventoryItemId, locationId, available),
   });
   assertNoUserErrors(data.inventoryActivate.userErrors, "inventoryActivate");
 }

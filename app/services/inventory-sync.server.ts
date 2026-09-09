@@ -174,9 +174,14 @@ async function applyActions(shop: ShopWithSettings, client: GraphqlClient, produ
   }
 
   if (inventoryUpdates.length) {
-    const locationId = shop.primaryLocationId;
+    // Once the app is registered as a fulfilment service, stock lives at ITS
+    // location, not the merchant's primary one. Writing to primary regardless
+    // meant a variant stocked at both was zeroed where nobody sells from while
+    // staying sellable from the app's location - and after the primary link is
+    // dropped, every push would land on a location the item no longer has.
+    const locationId = shop.fulfillmentLocationId ?? shop.primaryLocationId;
     if (!locationId) {
-      summary.errors.push(`${title}: no primary location configured; cannot update inventory.`);
+      summary.errors.push(`${title}: no fulfilment or primary location configured; cannot update inventory.`);
     } else {
       const withItems = inventoryUpdates.filter((a) => a.inventoryItemId);
       await setInventoryQuantities(client, locationId, withItems.map((a) => ({ inventoryItemId: a.inventoryItemId!, quantity: a.quantity ?? 0 })));
