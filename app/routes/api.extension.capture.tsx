@@ -6,6 +6,7 @@ import { bootJobs } from "~/services/jobs/index.server";
 import { addToImportList } from "~/services/import.server";
 import { withSettings } from "~/services/shop.server";
 import { detectPlatform } from "~/services/suppliers/index.server";
+import { CapturedProduct, capturedToDetail } from "~/services/suppliers/captured.server";
 
 /**
  * Public endpoint for the browser extension.
@@ -56,7 +57,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     );
   }
 
-  let body: { url?: string; urls?: string[]; pricingRuleId?: string } = {};
+  let body: { url?: string; urls?: string[]; pricingRuleId?: string; product?: unknown } = {};
   try {
     body = (await request.json()) as typeof body;
   } catch {
@@ -73,7 +74,20 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       continue;
     }
     try {
-      const product = await addToImportList(shop, url, { pricingRuleId: body.pricingRuleId ?? null, actor: "extension" });
+      // A payload read off the supplier's page imports without any supplier API
+      // call. It is only honoured for a single url, so one capture cannot be
+      // filed against a list of unrelated links.
+      let captured;
+      if (body.product !== undefined && refs.length === 1) {
+        const parsed = CapturedProduct.safeParse(body.product);
+        if (!parsed.success) {
+          const first = parsed.error.issues[0];
+          results.push({ url, ok: false, error: `Captured product rejected: ${first.path.join(".") || "payload"} ${first.message}` });
+          continue;
+        }
+        captured = capturedToDetail(parsed.data, detected.platform, detected.externalId);
+      }
+      const product = await addToImportList(shop, url, { pricingRuleId: body.pricingRuleId ?? null, actor: "extension", captured });
       results.push({ url, ok: true, importedProductId: product.id, title: product.title, platform: detected.platform });
     } catch (error) {
       results.push({ url, ok: false, error: errorMessage(error) });

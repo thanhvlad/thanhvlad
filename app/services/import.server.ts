@@ -12,7 +12,7 @@ import { resolvePricingRule } from "./pricing.server";
 import type { ShopWithSettings } from "./shop.server";
 import type { GraphqlClient } from "./shopify/graphql.server";
 import { createProduct, publishProduct } from "./shopify/products.server";
-import { fetchAndCacheByReference, type CachedSupplierProduct } from "./suppliers/catalog.server";
+import { cacheSupplierProduct, fetchAndCacheByReference, type CachedSupplierProduct } from "./suppliers/catalog.server";
 import type { SupplierPlatform, SupplierProductDetail } from "./suppliers/types";
 
 export type ImportedProductFull = ImportedProduct & {
@@ -32,17 +32,32 @@ export type ImportedProductFull = ImportedProduct & {
 export async function addToImportList(
   shop: ShopWithSettings,
   reference: string,
-  options: { pricingRuleId?: string | null; platform?: SupplierPlatform; actor?: string } = {},
+  options: {
+    pricingRuleId?: string | null;
+    platform?: SupplierPlatform;
+    actor?: string;
+    /**
+     * A product the browser extension read off the supplier's own page. The
+     * merchant's browser already loaded and rendered it, so there is nothing
+     * left to fetch - and therefore no supplier API account to require.
+     */
+    captured?: SupplierProductDetail;
+  } = {},
 ): Promise<ImportedProductFull> {
-  const { product, detail } = await fetchAndCacheByReference(shop.id, reference, {
-    platform: options.platform,
-    shipToCountry: shop.country ?? "US",
-  });
+  const { product, detail } = options.captured
+    ? { product: await cacheSupplierProduct(options.captured), detail: options.captured }
+    : await fetchAndCacheByReference(shop.id, reference, {
+        platform: options.platform,
+        shipToCountry: shop.country ?? "US",
+      });
 
   const existing = await prisma.importedProduct.findUnique({
     where: { shopId_supplierProductId: { shopId: shop.id, supplierProductId: product.id } },
   });
-  if (existing && existing.status !== "ARCHIVED") {
+  // A fresh capture is the merchant asking for THIS page's product, so it
+  // refreshes the row rather than silently handing back whatever was imported
+  // the first time. Reference-based adds keep the old no-op behaviour.
+  if (existing && existing.status !== "ARCHIVED" && !options.captured) {
     return (await getImportedProduct(shop.id, existing.id))!;
   }
 
