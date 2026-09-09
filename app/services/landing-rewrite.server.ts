@@ -134,19 +134,31 @@ export async function rewriteImportedProduct(
 
   const rejected = result.imageVerdicts.filter((v) => !v.usable).map((v) => ({ index: v.index, reason: v.reason }));
 
+  // The merchant asked for the images to be judged. If the endpoint would not
+  // carry them the page still ships, but they are told the verdicts are guesses
+  // from the filenames rather than quietly given a weaker result.
+  const warnings = [...check.warnings];
+  if (!result.imagesAssessed && input.images.length > 0) {
+    warnings.push("The AI endpoint would not accept the images, so they were not looked at. Check them yourself before this goes live.");
+  }
+
   await logActivity(shop.id, {
     actor: options.actor,
     action: "landing.rewritten",
     entity: "ImportedProduct",
     entityId: product.id,
-    message: `${result.title} — rewritten to contract ${result.contractVersion}, ${check.wordCount} words${rejected.length ? `, ${rejected.length} image(s) flagged` : ""}.`,
+    level: result.imagesAssessed ? "info" : "warn",
+    message:
+      `${result.title} — rewritten to contract ${result.contractVersion}, ${check.wordCount} words` +
+      `${rejected.length ? `, ${rejected.length} image(s) flagged` : ""}` +
+      `${result.imagesAssessed ? "" : "; images not assessed"}.`,
   });
 
   return {
     importedProductId,
     ok: true,
     title: result.title,
-    warnings: check.warnings,
+    warnings,
     rejectedImages: rejected.length ? rejected : undefined,
   };
 }

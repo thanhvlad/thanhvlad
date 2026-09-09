@@ -11,6 +11,7 @@ import { convertToShopCurrency } from "./currency.server";
 import { resolvePricingRule } from "./pricing.server";
 import type { ShopWithSettings } from "./shop.server";
 import type { GraphqlClient } from "./shopify/graphql.server";
+import { assignVariantToLocation } from "./shopify/fulfillment-service.server";
 import { createProduct, publishProduct } from "./shopify/products.server";
 import { cacheSupplierProduct, fetchAndCacheByReference, type CachedSupplierProduct } from "./suppliers/catalog.server";
 import type { SupplierPlatform, SupplierProductDetail } from "./suppliers/types";
@@ -539,12 +540,16 @@ export async function pushImportedProduct(shop: ShopWithSettings, client: Graphq
       data: { status: "PUSHED", pushedProductId: local.id, pushedAt: new Date(), pushError: null },
     });
 
+    const routed = await routeNewProductToService(shop, client, local.id);
+
     await logActivity(shop.id, {
       actor,
       action: "product.pushed",
       entity: "Product",
       entityId: local.id,
-      message: `"${pushed.title}" pushed to Shopify with ${pushed.variants.length} variant(s).`,
+      message:
+        `"${pushed.title}" pushed to Shopify with ${pushed.variants.length} variant(s)` +
+        (routed === null ? "." : `; ${routed} variant(s) routed to the app's fulfilment location.`),
       meta: { shopifyProductId: pushed.id },
     });
     return { importedProductId, ok: true, productId: local.id, shopifyProductId: pushed.id };
@@ -555,6 +560,44 @@ export async function pushImportedProduct(shop: ShopWithSettings, client: Graphq
     await logActivity(shop.id, { actor, action: "product.push_failed", entity: "ImportedProduct", entityId: product.id, level: "error", message: `Push failed for "${product.title}": ${message}` });
     return { importedProductId, ok: false, error: message };
   }
+}
+
+/**
+ * Move a freshly pushed product's stock onto the app's fulfilment location.
+ *
+ * Without this the merchant had to remember to visit Settings → Fulfilment
+ * service and press "Stock all products" after every push; until they did,
+ * Shopify routed the order to their own location and the app was never asked to
+ * fulfil it. A product pushed while the service is registered should just work.
+ *
+ * Returns the number of variants routed, or null when the shop has not
+ * registered the service — in which case there is nothing to say about it.
+ * Never throws: the product is already live in the store, and a routing problem
+ * is a warning to fix, not a reason to report the push as failed.
+ */
+async function routeNewProductToService(
+  shop: ShopWithSettings,
+  client: GraphqlClient,
+  productId: string,
+): Promise<number | null> {
+  if (!shop.fulfillmentLocationId) return null;
+  const variants = await prisma.productVariant.findMany({
+    where: { productId, inventoryItemId: { not: null } },
+    select: { id: true, inventoryItemId: true, inventoryQuantity: true },
+  });
+  const release = shop.primaryLocationId ? [shop.primaryLocationId] : [];
+
+  let routed = 0;
+  for (const variant of variants) {
+    try {
+      await assignVariantToLocation(client, variant.inventoryItemId!, shop.fulfillmentLocationId, variant.inventoryQuantity, release);
+      await prisma.productVariant.update({ where: { id: variant.id }, data: { fulfillmentAssigned: true } });
+      routed += 1;
+    } catch (error) {
+      logger.warn("Could not route variant to the fulfilment location", { productId, variantId: variant.id, error });
+    }
+  }
+  return routed;
 }
 
 function matchVariant(

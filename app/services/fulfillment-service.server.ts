@@ -1,4 +1,4 @@
-import type { FulfillmentRequestStatus, Prisma } from "@prisma/client";
+import { Prisma, type FulfillmentRequestStatus } from "@prisma/client";
 import prisma from "~/db.server";
 import { errorMessage } from "~/lib/errors";
 import { env } from "~/lib/env.server";
@@ -6,7 +6,7 @@ import { blocksPlacement } from "~/domain/orders/pipeline";
 import { logger } from "~/lib/logger.server";
 import { logActivity } from "./activity.server";
 import { notify } from "./notifications.server";
-import { cancelPurchaseOrder, placeSupplierOrders } from "./fulfillment.server";
+import { cancelPurchaseOrder, placeSupplierOrders, quoteSupplierOrders, type SupplierQuote } from "./fulfillment.server";
 import { evaluateAndStoreOrder, orderIssues, refreshOrderFromShopify } from "./orders.server";
 import type { ShopWithSettings } from "./shop.server";
 import { gid, offlineClient, type GraphqlClient } from "./shopify/graphql.server";
@@ -54,7 +54,9 @@ export interface FulfillmentServiceState {
 export async function getFulfillmentServiceState(shop: ShopWithSettings, client?: GraphqlClient): Promise<FulfillmentServiceState> {
   const [totalVariants, pendingRequests] = await Promise.all([
     prisma.productVariant.count({ where: { product: { shopId: shop.id } } }),
-    prisma.fulfillmentRequest.count({ where: { order: { shopId: shop.id }, status: "SUBMITTED" } }),
+    // Both states are "the merchant still has to do something": SUBMITTED is
+    // one we have not answered, AWAITING_APPROVAL is one waiting on them.
+    prisma.fulfillmentRequest.count({ where: { order: { shopId: shop.id }, status: { in: ["SUBMITTED", "AWAITING_APPROVAL"] } } }),
   ]);
 
   let locationName: string | null = null;
@@ -151,13 +153,29 @@ export async function assignProductsToService(
     select: { id: true, inventoryItemId: true, inventoryQuantity: true, product: { select: { title: true } } },
   });
 
+  // Shopify routes a fulfilment order to the location holding the stock. Leaving
+  // a variant stocked at the merchant's own location means their "Request
+  // fulfillment" button goes there and this app is never asked, so the primary
+  // location is released as part of assigning.
+  const release = shop.primaryLocationId ? [shop.primaryLocationId] : [];
+
   let assigned = 0;
   const errors: string[] = [];
+  const stillStocked: string[] = [];
   for (const variant of variants) {
     try {
-      await assignVariantToLocation(client, variant.inventoryItemId!, shop.fulfillmentLocationId, variant.inventoryQuantity);
+      const outcome = await assignVariantToLocation(
+        client,
+        variant.inventoryItemId!,
+        shop.fulfillmentLocationId,
+        variant.inventoryQuantity,
+        release,
+      );
       await prisma.productVariant.update({ where: { id: variant.id }, data: { fulfillmentAssigned: true } });
       assigned += 1;
+      for (const blocked of outcome.stillStocked) {
+        stillStocked.push(`${variant.product.title}: still stocked at ${blocked.locationName} — ${blocked.reason}`);
+      }
     } catch (error) {
       errors.push(`${variant.product.title}: ${errorMessage(error)}`);
     }
@@ -165,9 +183,15 @@ export async function assignProductsToService(
   await logActivity(shop.id, {
     actor,
     action: "fulfillment_service.assigned",
-    message: `${assigned} variant(s) stocked at the app's fulfilment location${errors.length ? `; ${errors.length} failed` : ""}.`,
+    level: errors.length || stillStocked.length ? "warn" : "info",
+    message:
+      `${assigned} of ${variants.length} variant(s) stocked at the app's fulfilment location` +
+      `${errors.length ? `; ${errors.length} failed` : ""}` +
+      `${stillStocked.length ? `; ${stillStocked.length} still stocked elsewhere` : ""}.`,
   });
-  return { assigned, total: variants.length, errors };
+  // A variant left on both locations is assigned but will not route here, so the
+  // caller is told about it in the same list as the outright failures.
+  return { assigned, total: variants.length, errors: [...errors, ...stillStocked] };
 }
 
 export async function locationsForVariant(client: GraphqlClient, inventoryItemId: string) {
@@ -342,11 +366,7 @@ export async function handleFulfillmentRequest(shop: ShopWithSettings, topic: st
     return;
   }
 
-  await acceptFulfillmentRequest(client, parsed.fulfillmentOrderId, "Sent to the supplier by DropshipHub.");
-  await prisma.fulfillmentRequest.update({
-    where: { id: request.id },
-    data: { status: "ACCEPTED", respondedAt: new Date() },
-  });
+  await acceptFulfillmentRequest(client, parsed.fulfillmentOrderId, "Received by DropshipHub.");
   await logActivity(shop.id, {
     action: "fulfillment_service.accepted",
     entity: "Order",
@@ -354,39 +374,165 @@ export async function handleFulfillmentRequest(shop: ShopWithSettings, topic: st
     message: `${order.name}: fulfilment request accepted from Shopify.`,
   });
 
-  // Place the supplier order right away when nothing blocks it; otherwise the
-  // order sits in the pipeline with its reasons visible, as usual.
-  if (blocking.length === 0) {
-    // Only the lines Shopify actually asked about. parsed.lineItems was stored
-    // on the request row and never read, so a request covering one fulfilment
-    // order placed every outstanding line on the whole order upstream.
-    const requestedLineIds = parsed.lineItems
-      .map((li) => li.shopifyLineItemId)
-      .filter((id): id is string => Boolean(id));
-    const outcome = await placeSupplierOrders(shop, order.id, {
-      actor: "fulfillment-request",
-      shopifyLineItemIds: requestedLineIds,
-    });
-    if (!outcome.ok) {
-      await notify(shop.id, {
-        type: "order.failed",
-        severity: "critical",
-        title: `${order.name}: could not place the supplier order`,
-        body: outcome.error,
-        link: `/app/orders/${order.id}`,
-        dedupeKey: `fo-place:${request.id}`,
-      });
+  // Only the lines Shopify actually asked about. parsed.lineItems was stored
+  // on the request row and never read, so a request covering one fulfilment
+  // order placed every outstanding line on the whole order upstream.
+  const requestedLineIds = parsed.lineItems
+    .map((li) => li.shopifyLineItemId)
+    .filter((id): id is string => Boolean(id));
+
+  // The merchant's own money is about to be spent on the strength of a button
+  // pressed in a different product. Unless they have said otherwise, price the
+  // order and stop here so the spend is a decision they take knowingly.
+  if (shop.parsedSettings.orders.requireApprovalOnFulfillmentRequest) {
+    let quote: SupplierQuote | null = null;
+    let quoteError: string | null = null;
+    try {
+      quote = await quoteSupplierOrders(shop, order.id, { shopifyLineItemIds: requestedLineIds });
+    } catch (error) {
+      quoteError = errorMessage(error);
+      logger.warn("Could not price a fulfilment request", { requestId: request.id, error });
     }
-  } else {
+
+    await prisma.fulfillmentRequest.update({
+      where: { id: request.id },
+      data: {
+        status: "AWAITING_APPROVAL",
+        quote: (quote as unknown as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+        quotedAt: new Date(),
+        quoteError,
+        respondedAt: new Date(),
+      },
+    });
+
     await notify(shop.id, {
       type: "order.failed",
-      severity: "warning",
-      title: `${order.name}: accepted but on hold`,
-      body: blocking[0].message,
+      severity: "info",
+      title: `${order.name}: waiting for you to approve the supplier order`,
+      body: quote
+        ? `${quote.totalCost} ${quote.currency} — ${quote.itemsCost} of items plus ${quote.shippingCost} shipping.`
+        : `The cost could not be worked out: ${quoteError ?? "unknown reason"}.`,
       link: `/app/orders/${order.id}`,
-      dedupeKey: `fo-hold:${request.id}`,
+      dedupeKey: `fo-approve:${request.id}`,
+    });
+    return;
+  }
+
+  await prisma.fulfillmentRequest.update({
+    where: { id: request.id },
+    data: { status: "ACCEPTED", respondedAt: new Date() },
+  });
+
+  const outcome = await placeSupplierOrders(shop, order.id, {
+    actor: "fulfillment-request",
+    shopifyLineItemIds: requestedLineIds,
+  });
+  if (!outcome.ok) {
+    await notify(shop.id, {
+      type: "order.failed",
+      severity: "critical",
+      title: `${order.name}: could not place the supplier order`,
+      body: outcome.error,
+      link: `/app/orders/${order.id}`,
+      dedupeKey: `fo-place:${request.id}`,
     });
   }
+}
+
+/**
+ * Approve a held fulfilment request and send it to the supplier.
+ *
+ * This is the merchant pressing "pay" in the app. It cannot literally pay the
+ * supplier — AliExpress will not take a payment from a third party on the
+ * merchant's behalf — so what it does is commit the order upstream and hand
+ * back the supplier's own payment link, which is the furthest a Shopify app can
+ * carry this without holding the merchant's card.
+ */
+export async function approveFulfillmentRequest(shop: ShopWithSettings, requestId: string, actor?: string) {
+  const request = await prisma.fulfillmentRequest.findFirst({
+    where: { id: requestId, order: { shopId: shop.id } },
+    include: { order: { select: { id: true, name: true } } },
+  });
+  if (!request) return { ok: false as const, error: "Fulfilment request not found" };
+  if (request.status !== "AWAITING_APPROVAL") {
+    return { ok: false as const, error: `This request is ${request.status.toLowerCase().replace(/_/g, " ")}, not waiting for approval.` };
+  }
+
+  const lineItems = (request.lineItems ?? []) as unknown as Array<{ shopifyLineItemId: string | null }>;
+  const shopifyLineItemIds = lineItems.map((li) => li.shopifyLineItemId).filter((id): id is string => Boolean(id));
+
+  const outcome = await placeSupplierOrders(shop, request.orderId, {
+    actor: actor ?? "approval",
+    shopifyLineItemIds,
+  });
+
+  if (!outcome.ok) {
+    // The request stays AWAITING_APPROVAL so the merchant can fix the reason
+    // and press approve again, rather than losing the request entirely.
+    await prisma.fulfillmentRequest.update({ where: { id: request.id }, data: { quoteError: outcome.error ?? null } });
+    return { ok: false as const, error: outcome.error ?? "Could not place the supplier order", issues: outcome.issues };
+  }
+
+  await prisma.fulfillmentRequest.update({
+    where: { id: request.id },
+    data: { status: "ACCEPTED", approvedAt: new Date(), approvedBy: actor ?? null, quoteError: null, respondedAt: new Date() },
+  });
+  await logActivity(shop.id, {
+    actor,
+    action: "fulfillment_service.approved",
+    entity: "Order",
+    entityId: request.orderId,
+    message: `${request.order.name}: supplier order approved and placed.`,
+  });
+  return { ok: true as const, purchaseOrderIds: outcome.purchaseOrderIds };
+}
+
+/**
+ * Refuse a held fulfilment request and tell Shopify why.
+ *
+ * Without this the only way out of the approval queue was to approve: a
+ * merchant who changed their mind left Shopify believing the app still owned a
+ * fulfilment it was never going to carry out.
+ */
+export async function declineFulfillmentRequest(shop: ShopWithSettings, requestId: string, reason: string, actor?: string) {
+  const request = await prisma.fulfillmentRequest.findFirst({
+    where: { id: requestId, order: { shopId: shop.id } },
+    include: { order: { select: { id: true, name: true } } },
+  });
+  if (!request) return { ok: false as const, error: "Fulfilment request not found" };
+
+  const message = reason.trim() || "The merchant declined this fulfilment.";
+  const client = await offlineClient(shop.domain);
+  await rejectFulfillmentRequest(client, request.shopifyFulfillmentOrderId, message, "OTHER");
+  await prisma.fulfillmentRequest.update({
+    where: { id: request.id },
+    data: { status: "REJECTED", responseMessage: message, respondedAt: new Date() },
+  });
+  await logActivity(shop.id, {
+    actor,
+    action: "fulfillment_service.declined",
+    entity: "Order",
+    entityId: request.orderId,
+    level: "warn",
+    message: `${request.order.name}: fulfilment request declined — ${message}`,
+  });
+  return { ok: true as const };
+}
+
+/** The request still waiting on the merchant for this order, if there is one. */
+export async function pendingApproval(shopId: string, orderId: string) {
+  const request = await prisma.fulfillmentRequest.findFirst({
+    where: { orderId, order: { shopId }, status: "AWAITING_APPROVAL" },
+    orderBy: { requestedAt: "desc" },
+  });
+  if (!request) return null;
+  return {
+    id: request.id,
+    requestedAt: request.requestedAt,
+    requestMessage: request.requestMessage,
+    quote: (request.quote as unknown as SupplierQuote | null) ?? null,
+    quoteError: request.quoteError,
+  };
 }
 
 function reasonFor(issues: Array<{ code: string }>): RejectionReason {

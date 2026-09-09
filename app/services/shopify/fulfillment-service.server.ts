@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { errorMessage } from "~/lib/errors";
 import { assertNoUserErrors, gql, type GraphqlClient, type UserError } from "./graphql.server";
 
 /**
@@ -300,17 +301,35 @@ const INVENTORY_LEVELS_QUERY = `#graphql
   }
 `;
 
+export interface AssignVariantResult {
+  /** Names of locations the variant was removed from, for the merchant to read. */
+  unstocked: string[];
+  /** Locations Shopify refused to release, with its reason. */
+  stillStocked: Array<{ locationName: string; reason: string }>;
+}
+
 /**
  * Stock a variant at the app's fulfilment location so Shopify routes its
- * fulfilment orders to us. Existing locations are left alone — a merchant may
- * legitimately stock the same SKU in their own warehouse too.
+ * fulfilment orders to us.
+ *
+ * Activating our location is not enough on its own. Shopify groups an order's
+ * line items into one fulfilment order per location, and a variant that is
+ * still stocked at the merchant's own location is routed *there* — the merchant
+ * presses "Request fulfillment" and nothing ever reaches this app. So the
+ * locations named in `releaseLocationIds` (in practice the shop's primary one,
+ * where `productSet` stocks every new product) are deactivated afterwards.
+ *
+ * Deactivation is best-effort by design: Shopify refuses to release a location
+ * that still holds committed or incoming stock, and that refusal must not undo
+ * an activation that succeeded. The reasons come back to the caller instead.
  */
 export async function assignVariantToLocation(
   client: GraphqlClient,
   inventoryItemId: string,
   locationId: string,
   available: number,
-) {
+  releaseLocationIds: string[] = [],
+): Promise<AssignVariantResult> {
   const data = await gql<{ inventoryActivate: { userErrors: UserError[] } }>(client, INVENTORY_ACTIVATE, {
     inventoryItemId,
     locationId,
@@ -318,6 +337,22 @@ export async function assignVariantToLocation(
     key: idempotencyKey("inventoryActivate", inventoryItemId, locationId, available),
   });
   assertNoUserErrors(data.inventoryActivate.userErrors, "inventoryActivate");
+
+  const release = releaseLocationIds.filter((id) => id && id !== locationId);
+  if (release.length === 0) return { unstocked: [], stillStocked: [] };
+
+  const result: AssignVariantResult = { unstocked: [], stillStocked: [] };
+  const levels = await inventoryLevelsFor(client, inventoryItemId);
+  for (const level of levels) {
+    if (!release.includes(level.locationId)) continue;
+    try {
+      await deactivateInventoryLevel(client, level.id);
+      result.unstocked.push(level.locationName);
+    } catch (error) {
+      result.stillStocked.push({ locationName: level.locationName, reason: errorMessage(error) });
+    }
+  }
+  return result;
 }
 
 export async function inventoryLevelsFor(client: GraphqlClient, inventoryItemId: string) {

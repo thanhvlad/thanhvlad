@@ -66,6 +66,7 @@ export default function GeneralSettings() {
             <Checkbox label={t("settings.orders.blockHighRisk.label")} checked={s.orders.blockHighRisk} onChange={(v) => set("orders", { blockHighRisk: v })} />
             <Checkbox label={t("settings.orders.blockPartiallyPaid.label")} checked={s.orders.blockPartiallyPaid} onChange={(v) => set("orders", { blockPartiallyPaid: v })} />
             <Checkbox label={t("settings.orders.autoPlace.label")} checked={s.orders.autoPlaceOrders} onChange={(v) => set("orders", { autoPlaceOrders: v })} helpText={t("settings.orders.autoPlace.help")} />
+            <Checkbox label={t("settings.orders.requireApproval.label")} checked={s.orders.requireApprovalOnFulfillmentRequest} onChange={(v) => set("orders", { requireApprovalOnFulfillmentRequest: v })} helpText={t("settings.orders.requireApproval.help")} />
             <TextField label={t("settings.orders.autoPlaceDelay.label")} type="number" value={String(s.orders.autoPlaceDelayMinutes)} onChange={(v) => set("orders", { autoPlaceDelayMinutes: Number(v) })} autoComplete="off" disabled={!s.orders.autoPlaceOrders} />
             <TextField label={t("settings.orders.supplierNote.label")} value={s.orders.supplierNote} onChange={(v) => set("orders", { supplierNote: v })} autoComplete="off" multiline={2} maxLength={500} showCharacterCount />
             <InlineGrid columns={2} gap="200">

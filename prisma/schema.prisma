@@ -1109,6 +1109,8 @@ model DailyMetric {
 
 enum FulfillmentRequestStatus {
   SUBMITTED
+  /// Accepted in Shopify, priced, and waiting for the merchant to approve the spend.
+  AWAITING_APPROVAL
   ACCEPTED
   REJECTED
   CANCELLATION_REQUESTED
@@ -1130,6 +1132,15 @@ model FulfillmentRequest {
   responseMessage           String?
   /// [{ fulfillmentOrderLineItemId, shopifyLineItemId, quantity }]
   lineItems                 Json  @default("[]")
+
+  /// What the supplier order will cost, priced when the request arrived, so the
+  /// merchant approves a number rather than a promise.
+  /// { currency, itemsCost, shippingCost, totalCost, groups: [...], pricedFrom }
+  quote       Json?
+  quotedAt    DateTime?
+  quoteError  String?
+  approvedAt  DateTime?
+  approvedBy  String?
 
   requestedAt DateTime  @default(now())
   respondedAt DateTime?

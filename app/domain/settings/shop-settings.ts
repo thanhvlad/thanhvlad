@@ -14,6 +14,15 @@ export const shopSettingsSchema = z.object({
       blockPartiallyPaid: z.boolean().default(true),
       /** Auto-place supplier orders as soon as they become AWAITING_ORDER. */
       autoPlaceOrders: z.boolean().default(false),
+      /**
+       * Hold a Shopify "Request fulfillment" for the merchant to approve.
+       *
+       * On by default. Pressing that button in Shopify used to send the order
+       * straight to the supplier, so the merchant's money was committed by a
+       * click made somewhere else; with this on they are shown the item and
+       * shipping cost first and approve the spend in the app.
+       */
+      requireApprovalOnFulfillmentRequest: z.boolean().default(true),
       /** Delay auto placement, so a customer can still cancel. */
       autoPlaceDelayMinutes: z.number().int().min(0).max(1440).default(60),
       /** Default note sent to every supplier. */

@@ -32,15 +32,59 @@ import { useMessage, useT } from "~/lib/use-t";
 import { addManualTracking, cancelPurchaseOrder, markPurchaseOrderManual, placeSupplierOrders, retryPurchaseOrder, syncPendingTracking, syncPurchaseOrder } from "~/services/fulfillment.server";
 import { evaluateAndStoreOrder, getOrderDetail, refreshOrderFromShopify, setLineItemIgnored, updateOrderAddress } from "~/services/orders.server";
 import { listActivity } from "~/services/activity.server";
+import { getComparison } from "~/services/supplier-comparison.server";
+import { approveFulfillmentRequest, declineFulfillmentRequest, pendingApproval } from "~/services/fulfillment-service.server";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
   const order = await getOrderDetail(shop.id, params.id!);
   if (!order) throw new Response("Not found", { status: 404 });
   const activity = await listActivity(shop.id, { entity: "Order", entityId: order.id, limit: 20 });
+
+  // A better supplier is only useful where the decision is actually taken, and
+  // that is here — looking at an order that has not been placed yet. Read from
+  // the stored comparison only; nothing goes upstream while a merchant is
+  // merely looking at an order.
+  const managedProductIds = [
+    ...new Set(order.lineItems.filter((li) => !li.isCanceled && !li.isFulfilled).map((li) => li.productVariant?.product.id).filter(Boolean)),
+  ].slice(0, 10) as string[];
+  const alternatives: Record<string, {
+    supplierProductId: string;
+    title: string;
+    platform: string;
+    url: string | null;
+    landedCost: string;
+    currency: string;
+    deliveryDays: number | null;
+    savings: string | null;
+    savingsPercent: number | null;
+    coverage: string;
+  }> = {};
+  for (const productId of managedProductIds) {
+    const comparison = await getComparison(shop, productId).catch(() => null);
+    const better = comparison?.betterOption;
+    if (!better) continue;
+    alternatives[productId] = {
+      supplierProductId: better.supplierProductId,
+      title: better.title,
+      platform: better.platform,
+      url: better.url,
+      landedCost: better.landedCost,
+      currency: better.currency,
+      deliveryDays: better.deliveryDays,
+      savings: better.savingsVsCurrent,
+      savingsPercent: better.savingsPercent,
+      coverage: `${better.matchedVariants}/${better.totalVariants}`,
+    };
+  }
+
+  const approval = await pendingApproval(shop.id, order.id);
+
   return {
     shopDomain: shop.domain,
     currency: shop.currency,
+    alternatives,
+    approval,
     order: {
       id: order.id,
       name: order.name,
@@ -109,6 +153,16 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         const outcome = await placeSupplierOrders(shop, id, { actor, force: get("force") === "true" });
         return outcome.ok ? { ok: true, messageKey: "msg.supplierOrdersPlaced", messageVars: { n: outcome.purchaseOrderIds.length } } : { ok: false, error: outcome.error, issues: outcome.issues };
       }
+      case "approve-fulfillment": {
+        const outcome = await approveFulfillmentRequest(shop, get("requestId"), actor);
+        return outcome.ok
+          ? { ok: true, messageKey: "msg.fulfillmentApproved" }
+          : { ok: false, error: outcome.error, issues: outcome.issues };
+      }
+      case "decline-fulfillment": {
+        const outcome = await declineFulfillmentRequest(shop, get("requestId"), get("reason"), actor);
+        return outcome.ok ? { ok: true, messageKey: "msg.fulfillmentDeclined" } : { ok: false, error: outcome.error };
+      }
       case "re-evaluate":
         await evaluateAndStoreOrder(shop, id);
         return { ok: true, messageKey: "msg.orderRechecked" };
@@ -171,7 +225,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 
 export default function OrderDetailPage() {
   const t = useT();
-  const { order, activity, currency, shopDomain } = useLoaderData<typeof loader>();
+  const { order, activity, currency, shopDomain, alternatives, approval } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const result = fetcher.data as { ok?: boolean; message?: string; error?: string; issues?: string[] } | undefined;
   const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
@@ -183,6 +237,7 @@ export default function OrderDetailPage() {
   const [pushToShopify, setPushToShopify] = useState(false);
   const [manual, setManual] = useState<Record<string, string>>({});
   const [tracking, setTracking] = useState<Record<string, { number: string; carrier: string }>>({});
+  const [declineReason, setDeclineReason] = useState("");
 
   const errors = order.issues.filter((i) => i.severity === "error");
   const warnings = order.issues.filter((i) => i.severity === "warning");
@@ -241,6 +296,96 @@ export default function OrderDetailPage() {
           )}
         </Layout.Section>
 
+        {approval && (
+          <Layout.Section>
+            <Card>
+              <BlockStack gap="300">
+                <InlineStack gap="200" blockAlign="center">
+                  <Badge tone="attention">{t("orders.detail.awaitingApproval")}</Badge>
+                  <Text as="h2" variant="headingMd">
+                    {t("orders.detail.approvalTitle")}
+                  </Text>
+                </InlineStack>
+                <Text as="p" tone="subdued">
+                  {t("orders.detail.approvalHelp")}
+                </Text>
+                {approval.requestMessage && (
+                  <Text as="p" variant="bodySm">
+                    “{approval.requestMessage}”
+                  </Text>
+                )}
+
+                {approval.quote ? (
+                  <BlockStack gap="200">
+                    {approval.quote.lines.map((line, idx) => (
+                      <InlineStack key={idx} align="space-between" blockAlign="center" wrap={false}>
+                        <Text as="span" variant="bodySm">
+                          {line.quantity} × {line.title.slice(0, 60)}{" "}
+                          <PlatformBadge platform={line.platform} />
+                          {line.carrierName ? (
+                            <Text as="span" tone="subdued" variant="bodySm">
+                              {" "}
+                              · {line.carrierName}
+                              {line.estimatedDeliveryDays ? ` ~${line.estimatedDeliveryDays} ${t("common.days")}` : ""}
+                            </Text>
+                          ) : null}
+                        </Text>
+                        <Text as="span" variant="bodySm" numeric>
+                          {formatMoney(line.lineCost, approval.quote!.currency)}
+                          {Number(line.shippingCost) > 0 ? ` + ${formatMoney(line.shippingCost, approval.quote!.currency)}` : ""}
+                        </Text>
+                      </InlineStack>
+                    ))}
+                    <Divider />
+                    <InlineGrid columns={{ xs: 1, md: 3 }} gap="200">
+                      <Stat label={t("orders.detail.supplierItems")} value={formatMoney(approval.quote.itemsCost, approval.quote.currency)} />
+                      <Stat label={t("orders.detail.supplierShipping")} value={formatMoney(approval.quote.shippingCost, approval.quote.currency)} />
+                      <Stat label={t("orders.detail.youWillPay")} value={formatMoney(approval.quote.totalCost, approval.quote.currency)} />
+                    </InlineGrid>
+                    {approval.quote.unpriced.length > 0 && (
+                      <Banner tone="warning" title={t("orders.detail.partialQuote")}>
+                        <List>
+                          {approval.quote.unpriced.map((u, idx) => (
+                            <List.Item key={idx}>{u}</List.Item>
+                          ))}
+                        </List>
+                      </Banner>
+                    )}
+                  </BlockStack>
+                ) : (
+                  <Banner tone="warning" title={t("orders.detail.noQuote")}>
+                    <p>{approval.quoteError ?? t("orders.detail.noQuoteReason")}</p>
+                  </Banner>
+                )}
+
+                <InlineStack gap="200">
+                  <Button
+                    variant="primary"
+                    loading={fetcher.state !== "idle"}
+                    onClick={() => submit({ intent: "approve-fulfillment", requestId: approval.id })}
+                  >
+                    {t("orders.detail.approveAndSend")}
+                  </Button>
+                  <Button
+                    tone="critical"
+                    onClick={() => submit({ intent: "decline-fulfillment", requestId: approval.id, reason: declineReason })}
+                  >
+                    {t("orders.detail.decline")}
+                  </Button>
+                </InlineStack>
+                <TextField
+                  label={t("orders.detail.declineReason")}
+                  labelHidden
+                  autoComplete="off"
+                  placeholder={t("orders.detail.declineReason")}
+                  value={declineReason}
+                  onChange={setDeclineReason}
+                />
+              </BlockStack>
+            </Card>
+          </Layout.Section>
+        )}
+
         <Layout.Section>
           <Card>
             <BlockStack gap="300">
@@ -287,6 +432,39 @@ export default function OrderDetailPage() {
                             ) : null}
                           </Text>
                         )
+                      )}
+                      {li.productId && alternatives[li.productId] && (
+                        <Box padding="200" background="bg-surface-info" borderRadius="200">
+                          <BlockStack gap="050">
+                            <Text as="p" variant="bodySm" fontWeight="semibold">
+                              {t("orders.detail.betterSupplier")}
+                            </Text>
+                            <Text as="p" variant="bodySm">
+                              {alternatives[li.productId].title.slice(0, 70)}{" "}
+                              <PlatformBadge platform={alternatives[li.productId].platform as never} />
+                            </Text>
+                            <Text as="p" variant="bodySm" tone="subdued">
+                              {t("orders.detail.landedEach")} {formatMoney(alternatives[li.productId].landedCost, alternatives[li.productId].currency)}
+                              {alternatives[li.productId].savings
+                                ? ` · ${t("orders.detail.saves")} ${formatMoney(alternatives[li.productId].savings!, alternatives[li.productId].currency)}${
+                                    alternatives[li.productId].savingsPercent !== null ? ` (${alternatives[li.productId].savingsPercent}%)` : ""
+                                  }`
+                                : ""}
+                              {alternatives[li.productId].deliveryDays !== null ? ` · ~${alternatives[li.productId].deliveryDays} ${t("common.days")}` : ""}
+                              {` · ${t("orders.detail.covers")} ${alternatives[li.productId].coverage}`}
+                            </Text>
+                            <InlineStack gap="200">
+                              <Button variant="plain" url={`/app/products/${li.productId}#suppliers`}>
+                                {t("orders.detail.compareSuppliers")}
+                              </Button>
+                              {alternatives[li.productId].url && (
+                                <Button variant="plain" url={alternatives[li.productId].url!} target="_blank">
+                                  {t("common.viewOnSupplier")}
+                                </Button>
+                              )}
+                            </InlineStack>
+                          </BlockStack>
+                        </Box>
                       )}
                       <InlineStack gap="200">
                         {li.managed && !li.isFulfilled && (

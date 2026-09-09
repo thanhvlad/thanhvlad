@@ -65,9 +65,19 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       case "assign-all": {
         const products = await prisma.product.findMany({ where: { shopId: shop.id }, select: { id: true } });
         const result = await assignProductsToService(shop, graphql, products.map((p) => p.id), actor);
+        // The banner used to read "success" even when nothing was stocked, which
+        // told a merchant their orders would route here when none of them would.
+        const nothingToDo = result.total === 0;
+        const tone = nothingToDo ? "info" : result.assigned === 0 ? "critical" : result.errors.length ? "warning" : "success";
         return {
           ok: true,
-          messageKey: "msg.variantsStocked", messageVars: { n: result.assigned, total: result.total },
+          tone,
+          messageKey: nothingToDo
+            ? "msg.noManagedVariants"
+            : result.assigned === 0
+              ? "msg.noVariantsStocked"
+              : "msg.variantsStocked",
+          messageVars: { n: result.assigned, total: result.total },
           errors: result.errors.slice(0, 8),
         };
       }
@@ -82,7 +92,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 export default function FulfillmentServiceSettings() {
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
-  const result = fetcher.data as { message?: string; error?: string; errors?: string[] } | undefined;
+  const result = fetcher.data as
+    | { message?: string; error?: string; errors?: string[]; tone?: "success" | "info" | "warning" | "critical" }
+    | undefined;
   const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
   const { state } = data;
   const t = useT();
@@ -92,7 +104,7 @@ export default function FulfillmentServiceSettings() {
     <Layout>
       <Layout.Section>
         {actionMessage && (
-          <Banner tone="success">
+          <Banner tone={result?.tone ?? "success"}>
             <p>{actionMessage}</p>
             {result?.errors?.length ? (
               <List>

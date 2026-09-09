@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { Prisma, PurchaseOrder, PurchaseOrderStatus, SupplierPlatform } from "@prisma/client";
+import type { OrderLineItem, Prisma, PurchaseOrder, PurchaseOrderStatus, SupplierPlatform } from "@prisma/client";
 import prisma from "~/db.server";
 import type { ResolveResult, ResolvedSupplierLine } from "~/domain/mapping/types";
 import { evaluateOrder as evaluatePipeline } from "~/domain/orders/pipeline";
@@ -90,6 +90,136 @@ function idempotencyKeyFor(orderId: string, platform: string, lines: GroupLine[]
 }
 
 /**
+ * Group an order's still-outstanding lines by supplier platform.
+ *
+ * Shared by placement and by pricing, so the merchant is quoted for exactly the
+ * lines that would be ordered. Two readers of one grouping rule is the point:
+ * a quote derived from a second, similar loop would drift away from what
+ * placement actually does, and the merchant would approve the wrong number.
+ */
+async function groupOutstandingLines(
+  orderId: string,
+  lineItems: OrderLineItem[],
+  shopifyLineItemIds?: string[],
+): Promise<Map<string, Group>> {
+  const covered = await coveredSupplierLines(orderId);
+  const scope = shopifyLineItemIds?.length ? new Set(shopifyLineItemIds) : null;
+
+  const groups = new Map<string, Group>();
+  for (const li of lineItems) {
+    if (scope && !scope.has(li.shopifyLineItemId)) continue;
+    if (!li.productVariantId || li.isCanceled || li.isFulfilled) continue;
+    const resolution = lineResolution(li);
+    if (!resolution?.ok) continue;
+    for (const resolved of resolution.lines) {
+      if (covered.has(coverageKey(li.id, resolved.supplierVariantId))) continue;
+      const sv = await prisma.supplierVariant.findUnique({ where: { id: resolved.supplierVariantId }, select: { supplierProductId: true } });
+      const key = resolved.platform;
+      const group = groups.get(key) ?? { platform: resolved.platform as SupplierPlatform, lines: [] };
+      group.lines.push({ lineItemId: li.id, lineItemTitle: li.title, resolved, supplierProductId: sv?.supplierProductId ?? "" });
+      groups.set(key, group);
+    }
+  }
+  return groups;
+}
+
+export interface SupplierQuoteLine {
+  title: string;
+  quantity: number;
+  unitCost: string;
+  lineCost: string;
+  platform: SupplierPlatform;
+  carrierName: string | null;
+  estimatedDeliveryDays: number | null;
+  shippingCost: string;
+}
+
+export interface SupplierQuote {
+  currency: string;
+  itemsCost: string;
+  shippingCost: string;
+  totalCost: string;
+  lines: SupplierQuoteLine[];
+  /** Lines that cannot be priced yet, with the reason, so nothing is hidden. */
+  unpriced: string[];
+  quotedAt: string;
+}
+
+/**
+ * Price what placing this order would cost, without placing anything.
+ *
+ * This exists so "Request fulfillment" in Shopify can become a decision the
+ * merchant makes on a number rather than a button that quietly spends their
+ * money. Shipping is quoted from the supplier exactly as placement would quote
+ * it, so the figure the merchant approves is the figure that gets ordered,
+ * barring a genuine upstream price change between the two.
+ */
+export async function quoteSupplierOrders(
+  shop: ShopWithSettings,
+  orderId: string,
+  options: { shopifyLineItemIds?: string[] } = {},
+): Promise<SupplierQuote> {
+  const full = await prisma.order.findUnique({ where: { id: orderId }, include: { lineItems: true } });
+  if (!full || full.shopId !== shop.id) throw new Error("Order not found");
+
+  const groups = await groupOutstandingLines(orderId, full.lineItems, options.shopifyLineItemIds);
+  const address = supplierAddressFor(full, shop.parsedSettings.orders);
+  const country = (address.countryCode ?? full.countryCode ?? "US").toUpperCase();
+
+  const lines: SupplierQuoteLine[] = [];
+  const unpriced: string[] = [];
+  let items = d(0);
+  let shippingTotal = d(0);
+
+  for (const group of groups.values()) {
+    let shipping: Map<string, ShippingChoice> | null = null;
+    try {
+      shipping = await quoteShippingPerProduct(shop, group, country);
+    } catch (error) {
+      // A missing shipping quote is worth showing rather than throwing: the
+      // merchant still learns the item cost and why the total is incomplete.
+      unpriced.push(errorMessage(error));
+    }
+
+    // Shipping is quoted per supplier product, so it is charged once per
+    // product and not once per line of that product.
+    const shippingCharged = new Set<string>();
+    for (const line of group.lines) {
+      const choice = shipping?.get(line.supplierProductId) ?? NO_SHIPPING_CHOICE;
+      const unit = d(line.resolved.unitCost ?? 0);
+      const lineCost = unit.times(line.resolved.quantity);
+      let lineShipping = d(0);
+      if (choice.cost !== null && !shippingCharged.has(line.supplierProductId)) {
+        lineShipping = d(choice.cost);
+        shippingCharged.add(line.supplierProductId);
+      }
+      items = items.plus(lineCost);
+      shippingTotal = shippingTotal.plus(lineShipping);
+      lines.push({
+        title: line.resolved.title || line.lineItemTitle,
+        quantity: line.resolved.quantity,
+        unitCost: money(unit),
+        lineCost: money(lineCost),
+        platform: group.platform,
+        carrierName: choice.carrierName,
+        estimatedDeliveryDays: choice.estimatedDeliveryDays,
+        shippingCost: money(lineShipping),
+      });
+    }
+  }
+
+  return {
+    currency: shop.currency,
+    itemsCost: money(items),
+    shippingCost: money(shippingTotal),
+    totalCost: money(items.plus(shippingTotal)),
+    lines,
+    unpriced,
+    quotedAt: new Date().toISOString(),
+  };
+}
+
+/**
  * Turn one Shopify order into supplier purchase orders and submit them.
  *
  * Lines are grouped per platform (one upstream order per supplier account) and
@@ -127,25 +257,7 @@ export async function placeSupplierOrders(
     return { orderId, ok: false, purchaseOrderIds: [], error: "Order is not ready", issues: issues.map((i) => i.message) };
   }
 
-  const covered = await coveredSupplierLines(orderId);
-
-  const scope = options.shopifyLineItemIds?.length ? new Set(options.shopifyLineItemIds) : null;
-
-  const groups = new Map<string, Group>();
-  for (const li of full.lineItems) {
-    if (scope && !scope.has(li.shopifyLineItemId)) continue;
-    if (!li.productVariantId || li.isCanceled || li.isFulfilled) continue;
-    const resolution = lineResolution(li);
-    if (!resolution?.ok) continue;
-    for (const resolved of resolution.lines) {
-      if (covered.has(coverageKey(li.id, resolved.supplierVariantId))) continue;
-      const sv = await prisma.supplierVariant.findUnique({ where: { id: resolved.supplierVariantId }, select: { supplierProductId: true } });
-      const key = resolved.platform;
-      const group = groups.get(key) ?? { platform: resolved.platform as SupplierPlatform, lines: [] };
-      group.lines.push({ lineItemId: li.id, lineItemTitle: li.title, resolved, supplierProductId: sv?.supplierProductId ?? "" });
-      groups.set(key, group);
-    }
-  }
+  const groups = await groupOutstandingLines(orderId, full.lineItems, options.shopifyLineItemIds);
 
   if (groups.size === 0) {
     // Placing an order that is already placed is a safe no-op, not an error:
