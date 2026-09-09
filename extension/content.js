@@ -1,78 +1,22 @@
 /* global chrome */
 
 /**
- * Injects an "Add to DropshipHub" button onto the supplier's own product page,
- * next to the buy box, so the merchant never has to open the toolbar popup.
+ * Puts an "Add to DropshipHub" control on the supplier's own product page, so
+ * the merchant never has to open the toolbar popup.
  *
- * AliExpress rewrites its markup often and renders the buy box asynchronously,
- * so this deliberately does not depend on one selector: it tries a list of
- * anchors, re-tries on DOM mutations, and falls back to a floating button
- * pinned to the viewport. A changed class name costs the button its position,
- * never its existence.
+ * It is deliberately a fixed panel in the bottom-left corner rather than a
+ * button spliced into the buy box. Anchoring into AliExpress markup meant
+ * hunting class names that carry a per-build hash, and it put this button in
+ * the same container DSers injects into, where the two compete for the same
+ * spot and one of them loses. A corner of the viewport belongs to nobody.
  */
 
 const ENDPOINT = "/api/extension/capture";
 const HOST_ID = "dropshiphub-capture-host";
 
-/**
- * Anchors in priority order, verified against a live AliExpress product page.
- * Its class names carry a per-build hash (`action--stickyWrap--RtlPq66`), so
- * match the stable prefix and never the whole name. `append` puts the button
- * under Buy now / Add to cart, where a merchant expects it.
- */
-const ANCHORS = [
-  // AliExpress. stickyWrap holds Buy now and Add to cart directly.
-  { selector: '[class*="action--stickyWrap"]', place: "append" },
-  { selector: '[class*="action--wrap"]', place: "append" },
-  { selector: '[class*="action--container"]', place: "append" },
-  // Right-hand column: correct page, wrong neighbourhood. Last resort.
-  { selector: ".pdp-body-top-right", place: "prepend" },
-  // CJ Dropshipping
-  { selector: '[class*="detail-buy"]', place: "append" },
-  { selector: ".product-detail-buy", place: "append" },
-];
-
 function isProductPage() {
   const url = location.href;
   return /aliexpress\.[a-z.]+\/(item|i)\/\d+/i.test(url) || /cjdropshipping\.com\/product\//i.test(url);
-}
-
-function buildButton() {
-  const host = document.createElement("div");
-  host.id = HOST_ID;
-  // Shadow DOM so the supplier's stylesheet cannot reach in and restyle this.
-  const root = host.attachShadow({ mode: "open" });
-
-  const style = document.createElement("style");
-  style.textContent = `
-    .wrap { font: 500 14px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif; margin: 10px 0; }
-    button {
-      display: block; width: 100%; box-sizing: border-box;
-      padding: 11px 16px; border: 0; border-radius: 8px; cursor: pointer;
-      background: #1f6feb; color: #fff; font: inherit; font-weight: 600;
-    }
-    button:hover:not(:disabled) { background: #1a5fd0; }
-    button:disabled { opacity: .55; cursor: default; }
-    .msg { margin-top: 6px; font-size: 12.5px; min-height: 1.2em; }
-    .ok { color: #1a7f37; }
-    .err { color: #b3261e; }
-    .msg a { color: inherit; }
-    :host(.floating) { position: fixed; right: 18px; bottom: 18px; z-index: 2147483647; width: 232px;
-      background: #fff; padding: 10px 12px; border-radius: 10px;
-      box-shadow: 0 6px 24px rgba(0,0,0,.22); }
-  `;
-
-  const wrap = document.createElement("div");
-  wrap.className = "wrap";
-  const button = document.createElement("button");
-  button.textContent = "Add to DropshipHub";
-  const msg = document.createElement("div");
-  msg.className = "msg";
-  wrap.append(button, msg);
-  root.append(style, wrap);
-
-  button.addEventListener("click", () => send(button, msg));
-  return host;
 }
 
 function appOrigin(raw) {
@@ -85,6 +29,74 @@ function appOrigin(raw) {
   } catch {
     return null;
   }
+}
+
+function build() {
+  const host = document.createElement("div");
+  host.id = HOST_ID;
+  // Shadow DOM so the supplier's stylesheet cannot reach in and restyle this.
+  const root = host.attachShadow({ mode: "open" });
+
+  const style = document.createElement("style");
+  style.textContent = `
+    :host {
+      position: fixed; left: 20px; bottom: 20px; z-index: 2147483647;
+      width: 250px;
+    }
+    .card {
+      background: #fff; border-radius: 12px; padding: 12px;
+      box-shadow: 0 6px 28px rgba(0,0,0,.24);
+      font: 500 14px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif;
+      color: #1a1a1a;
+    }
+    .head {
+      display: flex; align-items: center; justify-content: space-between;
+      font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase;
+      color: #6b7280; margin-bottom: 8px;
+    }
+    .close {
+      border: 0; background: none; cursor: pointer; color: #6b7280;
+      font-size: 16px; line-height: 1; padding: 0 2px;
+    }
+    button.go {
+      display: block; width: 100%; box-sizing: border-box;
+      padding: 11px 14px; border: 0; border-radius: 8px; cursor: pointer;
+      background: #1f6feb; color: #fff; font: inherit; font-weight: 600;
+    }
+    button.go:hover:not(:disabled) { background: #1a5fd0; }
+    button.go:disabled { opacity: .55; cursor: default; }
+    .msg { margin-top: 8px; font-size: 12.5px; word-break: break-word; }
+    .ok { color: #1a7f37; }
+    .err { color: #b3261e; }
+    .msg a { color: inherit; }
+  `;
+
+  const card = document.createElement("div");
+  card.className = "card";
+
+  const head = document.createElement("div");
+  head.className = "head";
+  const label = document.createElement("span");
+  label.textContent = "DropshipHub";
+  const close = document.createElement("button");
+  close.className = "close";
+  close.title = "Hide until the next page load";
+  close.textContent = "×";
+  close.addEventListener("click", () => host.remove());
+  head.append(label, close);
+
+  const button = document.createElement("button");
+  button.className = "go";
+  button.textContent = "Add to import list";
+
+  const msg = document.createElement("div");
+  msg.className = "msg";
+
+  card.append(head, button, msg);
+  root.append(style, card);
+
+  button.addEventListener("click", () => send(button, msg));
+  return host;
 }
 
 async function send(button, msg) {
@@ -103,7 +115,7 @@ async function send(button, msg) {
   const base = appOrigin(appUrl);
   if (!base) {
     msg.className = "msg err";
-    msg.textContent = `"${appUrl}" is not a valid app URL. Set it in the extension options.`;
+    msg.textContent = `"${appUrl}" is not a valid app URL. Fix it in the extension options.`;
     button.disabled = false;
     return;
   }
@@ -135,62 +147,34 @@ async function send(button, msg) {
     }
   } catch (error) {
     msg.className = "msg err";
-    msg.textContent = `${error.message} — called ${endpoint}. Check the app URL in the extension options.`;
+    msg.textContent = `${error.message} — called ${endpoint}`;
     button.disabled = false;
   }
 }
 
-/** Returns true once the button sits on a real anchor. */
-function place() {
-  if (!isProductPage()) return true;
-
-  const existing = document.getElementById(HOST_ID);
-  // Already anchored: nothing to do. Still floating: keep looking for an anchor
-  // so the button moves to the buy box the moment it renders.
-  if (existing && !existing.classList.contains("floating")) return true;
-
-  for (const { selector, place: how } of ANCHORS) {
-    const anchor = document.querySelector(selector);
-    if (!anchor) continue;
-    const host = existing ?? buildButton();
-    host.classList.remove("floating");
-    if (how === "prepend") anchor.prepend(host);
-    else anchor.append(host);
-    return true;
+function mount() {
+  if (!isProductPage()) {
+    document.getElementById(HOST_ID)?.remove();
+    return;
   }
-
-  // No anchor matched — the markup changed, or it has not rendered yet. Pin the
-  // button to the viewport so the merchant still has it either way.
-  if (!existing) {
-    const host = buildButton();
-    host.classList.add("floating");
-    document.body.appendChild(host);
-  }
-  return false;
+  if (document.getElementById(HOST_ID)) return;
+  document.body.appendChild(build());
 }
 
 /**
- * The buy box arrives after first paint, and AliExpress swaps product pages
- * client-side without a reload. Watch for both, and stop observing once the
- * button has a real anchor.
+ * AliExpress swaps product pages client-side without a reload, so re-mount on
+ * url changes. Poll rather than observe the DOM: this page mutates constantly,
+ * and a MutationObserver on it fires thousands of times for no benefit here.
  */
 function start() {
-  if (place()) return;
-
+  mount();
   let lastUrl = location.href;
-  const observer = new MutationObserver(() => {
-    if (location.href !== lastUrl) {
-      lastUrl = location.href;
-      document.getElementById(HOST_ID)?.remove();
-    }
-    // place() moves a floating button onto the buy box as soon as it renders.
-    if (place()) observer.disconnect();
-  });
-  observer.observe(document.documentElement, { childList: true, subtree: true });
-
-  // Stop watching after 30s either way; an endless observer on a page this
-  // busy is a real CPU cost, and the floating fallback is already in place.
-  setTimeout(() => observer.disconnect(), 30000);
+  setInterval(() => {
+    if (location.href === lastUrl) return;
+    lastUrl = location.href;
+    document.getElementById(HOST_ID)?.remove();
+    mount();
+  }, 1000);
 }
 
 if (document.readyState === "loading") {
