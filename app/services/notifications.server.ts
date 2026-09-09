@@ -70,7 +70,7 @@ export async function notify(shopId: string, input: NotifyInput) {
 
 export async function listNotifications(
   shopId: string,
-  options: { unreadOnly?: boolean; limit?: number } = {},
+  options: { unreadOnly?: boolean; limit?: number; skip?: number } = {},
 ) {
   return prisma.notification.findMany({
     where: {
@@ -78,8 +78,18 @@ export async function listNotifications(
       archivedAt: null,
       ...(options.unreadOnly ? { readAt: null } : {}),
     },
-    orderBy: { createdAt: "desc" },
+    // `id` breaks the tie so a page boundary cannot show the same notification
+    // twice, or hide one, when two arrive in the same millisecond.
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    skip: options.skip ?? 0,
     take: options.limit ?? 50,
+  });
+}
+
+/** How many the list would return, so a screen can page through them honestly. */
+export async function countNotifications(shopId: string, options: { unreadOnly?: boolean } = {}) {
+  return prisma.notification.count({
+    where: { shopId, archivedAt: null, ...(options.unreadOnly ? { readAt: null } : {}) },
   });
 }
 

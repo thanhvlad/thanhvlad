@@ -291,6 +291,11 @@ export default function SearchPage() {
                   <List>
                     {bulkResults.map((r) => (
                       <List.Item key={r.reference}>
+                        {/* Without the status word a failed row was
+                            indistinguishable from an imported one. */}
+                        <Text as="span" tone={r.ok ? "success" : "critical"} fontWeight="semibold">
+                          {r.ok ? t("search.bulk.added") : t("search.bulk.failed")}
+                        </Text>{" "}
                         {r.reference} — {r.ok ? r.title : r.error}
                       </List.Item>
                     ))}
@@ -345,16 +350,16 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
 
   return (
     <Card padding="0">
-      <Box background="bg-surface-secondary">
-        {item.image ? (
-          <Image source={item.image} alt={item.title} width="100%" />
-        ) : (
-          <Box paddingBlock="1600">
-            <InlineStack align="center">
+      <Box background="bg-surface-secondary" minHeight="220px" overflowY="hidden">
+        <InlineStack align="center" blockAlign="center">
+          {item.image ? (
+            <Image source={item.image} alt={item.title} width="100%" />
+          ) : (
+            <Box paddingBlock="1600">
               <Thumb src={null} alt={t("search.card.noImage")} size="large" />
-            </InlineStack>
-          </Box>
-        )}
+            </Box>
+          )}
+        </InlineStack>
       </Box>
       <Box padding="300">
         <BlockStack gap="300">

@@ -38,6 +38,8 @@ export const en = {
   // ---- Import by link -----------------------------------------------------
   "search.bulk.placeholder": "https://www.aliexpress.com/item/1005006001.html\n1005006002",
   "search.bulk.summary": "{ok} of {total} added to the import list",
+  "search.bulk.added": "Added",
+  "search.bulk.failed": "Failed",
 } as const;
 
 export const vi: Partial<Record<keyof typeof en, string>> = {
@@ -69,4 +71,6 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
 
   "search.bulk.placeholder": "https://www.aliexpress.com/item/1005006001.html\n1005006002",
   "search.bulk.summary": "Đã thêm {ok}/{total} vào danh sách nhập",
+  "search.bulk.added": "Đã thêm",
+  "search.bulk.failed": "Lỗi",
 };

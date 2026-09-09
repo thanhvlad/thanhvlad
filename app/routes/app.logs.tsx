@@ -24,7 +24,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const level = url.searchParams.get("level") ?? "";
   const q = url.searchParams.get("q") ?? "";
   const entity = url.searchParams.get("entity") ?? "";
-  const page = pageParam(url.searchParams.get("page"));
+  const requestedPage = pageParam(url.searchParams.get("page"));
   // The level tabs count within the entity and search filters, so a tab's
   // number is what the merchant will see when they click it.
   const baseWhere = {
@@ -33,9 +33,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     ...(q ? { message: { contains: q, mode: "insensitive" as const } } : {}),
   };
   const where = { ...baseWhere, ...(level ? { level } : {}) };
-  const [logs, total, byLevel, jobs, queue] = await Promise.all([
-    prisma.activityLog.findMany({ where, orderBy: { createdAt: "desc" }, skip: (page - 1) * PAGE_SIZE, take: PAGE_SIZE }),
-    prisma.activityLog.count({ where }),
+  const total = await prisma.activityLog.count({ where });
+  // Clamp against the real end, so a page number past it shows the last page
+  // rather than an empty table under an "everything is recorded here" message.
+  const page = Math.min(requestedPage, Math.max(1, Math.ceil(total / PAGE_SIZE)));
+  const [logs, byLevel, jobs, queue] = await Promise.all([
+    // `id` breaks the tie: createdAt is not unique, and without it two rows
+    // written in the same millisecond can straddle a page boundary and be
+    // shown twice or skipped entirely.
+    prisma.activityLog.findMany({ where, orderBy: [{ createdAt: "desc" }, { id: "desc" }], skip: (page - 1) * PAGE_SIZE, take: PAGE_SIZE }),
     prisma.activityLog.groupBy({ by: ["level"], where: baseWhere, _count: { _all: true } }),
     listJobRuns(shop.id, { limit: JOB_LIMIT }),
     queueStats(),
@@ -79,7 +85,10 @@ export default function LogsPage() {
   const jobLabel = (type: string) => t(`job.${type}` as I18nKey) ?? type;
 
   const allCount = Object.values(levelCounts).reduce((a, b) => a + b, 0);
-  const tabs = LEVEL_TABS.filter((id) => id !== "debug" || (levelCounts.debug ?? 0) > 0).map((id) => ({
+  // Every level always gets a tab. Hiding the empty one made the selected tab
+  // fall back to "All" while the URL stayed filtered, so the tab bar and the
+  // rows below it disagreed.
+  const tabs = LEVEL_TABS.map((id) => ({
     id,
     content:
       id === ""
@@ -210,9 +219,9 @@ export default function LogsPage() {
             </Box>
             {logs.length === 0 ? (
               filtered ? (
-                <EmptyScreen heading={t("logs.emptyFiltered")} body={t("logs.emptyFilteredBody")} action={{ content: t("logs.clearFilters"), url: "/app/logs" }} />
+                <EmptyScreen compact heading={t("logs.emptyFiltered")} body={t("logs.emptyFilteredBody")} action={{ content: t("logs.clearFilters"), url: "/app/logs" }} />
               ) : (
-                <EmptyScreen heading={t("logs.empty")} body={t("logs.emptyBody")} />
+                <EmptyScreen compact heading={t("logs.empty")} body={t("logs.emptyBody")} />
               )
             ) : (
               <IndexTable

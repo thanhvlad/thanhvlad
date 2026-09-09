@@ -44,6 +44,7 @@ export const en = {
   "notifications.done.archiveAll": "All notifications archived.",
   "notifications.done.readMany": "{n} notification(s) marked as read.",
   "notifications.done.archiveMany": "{n} notification(s) archived.",
+  "notifications.done.nothing": "Nothing to change — those were already done.",
 } as const;
 
 export const vi: Partial<Record<keyof typeof en, string>> = {
@@ -87,4 +88,5 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   "notifications.done.archiveAll": "Đã lưu trữ toàn bộ thông báo.",
   "notifications.done.readMany": "Đã đánh dấu đã đọc {n} thông báo.",
   "notifications.done.archiveMany": "Đã lưu trữ {n} thông báo.",
+  "notifications.done.nothing": "Không có gì để đổi — những mục đó đã xong rồi.",
 };

@@ -2,16 +2,18 @@ import { useEffect, useRef, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { Link, useFetcher, useLoaderData, useNavigate, useSearchParams } from "@remix-run/react";
 import { Badge, Banner, BlockStack, Box, Button, ButtonGroup, Card, IndexTable, InlineStack, Layout, Page, Tabs, Text, useIndexResourceState } from "@shopify/polaris";
-import prisma from "~/db.server";
 import { EmptyScreen } from "~/components/EmptyScreen";
 import { readForm, requireShop } from "~/lib/auth.server";
-import { formatDay } from "~/lib/format";
+import { formatDay, pageParam } from "~/lib/format";
 import type { I18nKey, Translator } from "~/lib/i18n";
 import { useT } from "~/lib/use-t";
 import { downloadAuthed } from "~/lib/download.client";
-import { archiveNotifications, countUnread, listNotifications, markRead } from "~/services/notifications.server";
+import { Paginator } from "~/components/Paginator";
+import { archiveNotifications, countNotifications, countUnread, listNotifications, markRead } from "~/services/notifications.server";
 
 type Tab = "all" | "unread";
+
+const PAGE_SIZE = 50;
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
@@ -19,12 +21,19 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const tab: Tab = url.searchParams.get("tab") === "unread" ? "unread" : "all";
   // The two tab counts are the only figures this screen leads with; the
   // unread one is what the merchant came here to clear.
-  const [notifications, unread, all] = await Promise.all([
-    listNotifications(shop.id, { limit: 100, unreadOnly: tab === "unread" }),
-    countUnread(shop.id),
-    prisma.notification.count({ where: { shopId: shop.id, archivedAt: null } }),
-  ]);
-  return { notifications, tab, counts: { all, unread } };
+  const requestedPage = pageParam(url.searchParams.get("page"));
+  const [unread, all] = await Promise.all([countUnread(shop.id), countNotifications(shop.id)]);
+  // The tab label promised a number the table could not reach: it counted every
+  // notification while the list stopped at 100, so a busy store read
+  // "All (612)" above exactly 100 rows with no way to the rest.
+  const total = tab === "unread" ? unread : all;
+  const page = Math.min(requestedPage, Math.max(1, Math.ceil(total / PAGE_SIZE)));
+  const notifications = await listNotifications(shop.id, {
+    limit: PAGE_SIZE,
+    skip: (page - 1) * PAGE_SIZE,
+    unreadOnly: tab === "unread",
+  });
+  return { notifications, tab, counts: { all, unread }, page, pageSize: PAGE_SIZE, total };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -36,11 +45,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  if (intent === "read-all") await markRead(shop.id, "all");
-  if (intent === "read") await markRead(shop.id, ids);
-  if (intent === "archive") await archiveNotifications(shop.id, ids);
-  if (intent === "archive-all") await archiveNotifications(shop.id, "all");
-  return { ok: true };
+  let changed = 0;
+  if (intent === "read-all") changed = (await markRead(shop.id, "all")).count;
+  if (intent === "read") changed = (await markRead(shop.id, ids)).count;
+  if (intent === "archive") changed = (await archiveNotifications(shop.id, ids)).count;
+  if (intent === "archive-all") changed = (await archiveNotifications(shop.id, "all")).count;
+  // The count is what the database actually touched: marking ten selected rows
+  // read when only three were unread changes three, and saying "10" is a lie.
+  return { ok: true, changed };
 };
 
 const TONES: Record<string, "info" | "warning" | "critical" | "success" | undefined> = { info: "info", warning: "warning", critical: "critical" };
@@ -64,6 +76,9 @@ function relativeLabel(value: string | Date, t: Translator): string {
 type Outcome = { intent: string; count: number };
 
 function outcomeText(outcome: Outcome, t: Translator): string {
+  // Nothing changed is its own outcome: every row picked was already read, or
+  // already archived. Saying "Marked as read." there would be a small lie.
+  if (outcome.count === 0) return t("notifications.done.nothing");
   switch (outcome.intent) {
     case "read-all":
       return t("notifications.done.readAll");
@@ -78,7 +93,7 @@ function outcomeText(outcome: Outcome, t: Translator): string {
 
 export default function NotificationsPage() {
   const t = useT();
-  const { notifications, tab, counts } = useLoaderData<typeof loader>();
+  const { notifications, tab, counts, page, pageSize, total } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const navigate = useNavigate();
   const [params] = useSearchParams();
@@ -88,13 +103,13 @@ export default function NotificationsPage() {
   const busyIntent = busy ? String(fetcher.formData?.get("intent") ?? "") : "";
   const busyId = busy ? String(fetcher.formData?.get("id") ?? "") : "";
 
-  // The action only answers `{ ok }`, so the banner text comes from what was
-  // asked, remembered across the submit → idle transition.
+  // Which action ran is remembered across the submit → idle transition; how
+  // many rows it changed comes back from the action itself.
   const pending = useRef<Outcome | null>(null);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   useEffect(() => {
     if (fetcher.state === "idle" && pending.current && fetcher.data?.ok) {
-      setOutcome(pending.current);
+      setOutcome({ ...pending.current, count: fetcher.data.changed ?? pending.current.count });
       pending.current = null;
       clearSelection();
     }
@@ -138,7 +153,7 @@ export default function NotificationsPage() {
       <Layout>
         {outcome && (
           <Layout.Section>
-            <Banner tone="success" onDismiss={() => setOutcome(null)}>
+            <Banner tone={outcome.count === 0 ? "info" : "success"} onDismiss={() => setOutcome(null)}>
               <p>{outcomeText(outcome, t)}</p>
             </Banner>
           </Layout.Section>
@@ -158,12 +173,14 @@ export default function NotificationsPage() {
             {notifications.length === 0 ? (
               tab === "unread" ? (
                 <EmptyScreen
+                  compact
                   heading={t("notifications.emptyUnread")}
                   body={t("notifications.emptyUnreadBody")}
                   action={{ content: t("notifications.viewAll"), url: "/app/notifications?tab=all" }}
                 />
               ) : (
                 <EmptyScreen
+                  compact
                   heading={t("notifications.empty")}
                   body={t("notifications.emptyBody")}
                   action={{ content: t("notifications.settings"), url: "/app/settings" }}
@@ -255,6 +272,9 @@ export default function NotificationsPage() {
               </IndexTable>
             )}
           </Card>
+          <Box paddingBlockStart="400">
+            <Paginator page={page} pageSize={pageSize} total={total} />
+          </Box>
         </Layout.Section>
       </Layout>
     </Page>
