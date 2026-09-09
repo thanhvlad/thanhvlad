@@ -13,21 +13,42 @@ export function withSettings(shop: Shop): ShopWithSettings {
   return { ...shop, parsedSettings: parseShopSettings(shop.settings) };
 }
 
-/** Load (or lazily create) the Shop row for a Shopify session. */
+/**
+ * Load (or lazily create) the Shop row for a Shopify session.
+ *
+ * A store's very first request runs the parent `/app` loader and the child
+ * page loader concurrently, and afterAuth calls this again on top. Each of
+ * them misses the read and races to create; the losers used to get a unique
+ * violation on `domain` — a 500 on the merchant's first screen — and each had
+ * already created an Account nobody would ever reference. The Account and the
+ * Shop are now created together, so a loser leaves nothing behind, and a loser
+ * simply reads the row the winner made.
+ */
 export async function getOrCreateShop(domain: string): Promise<ShopWithSettings> {
   const existing = await prisma.shop.findUnique({ where: { domain } });
   if (existing) return withSettings(existing);
 
-  const account = await prisma.account.create({
-    data: { name: domain.replace(".myshopify.com", "") },
-  });
-  const shop = await prisma.shop.create({
-    data: {
-      domain,
-      accountId: account.id,
-      inventoryPolicy: { create: {} },
-    },
-  });
+  let shop: Shop;
+  try {
+    shop = await prisma.$transaction(async (tx) => {
+      const account = await tx.account.create({
+        data: { name: domain.replace(".myshopify.com", "") },
+      });
+      return tx.shop.create({
+        data: {
+          domain,
+          accountId: account.id,
+          inventoryPolicy: { create: {} },
+        },
+      });
+    });
+  } catch (error) {
+    if ((error as { code?: string } | null)?.code !== "P2002") throw error;
+    const won = await prisma.shop.findUnique({ where: { domain } });
+    if (!won) throw error;
+    return withSettings(won);
+  }
+
   await logActivity(shop.id, {
     action: "shop.created",
     message: `Shop ${domain} registered.`,
