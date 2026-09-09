@@ -1,11 +1,15 @@
-import { useState } from "react";
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
+import { useEffect, useRef, useState } from "react";
+import type { ActionFunctionArgs, LoaderFunctionArgs, SerializeFrom } from "@remix-run/node";
 import { useFetcher, useLoaderData } from "@remix-run/react";
-import { Badge, Banner, BlockStack, Box, Button, Card, Checkbox, FormLayout, InlineGrid, InlineStack, Layout, Page, Select, Text, TextField } from "@shopify/polaris";
+import { Badge, Banner, BlockStack, Button, Card, Checkbox, FormLayout, IndexTable, InlineGrid, Layout, Modal, Page, Select, Text, TextField, useIndexResourceState } from "@shopify/polaris";
+import { EmptyScreen } from "~/components/EmptyScreen";
+import { SectionHeader } from "~/components/SectionHeader";
+import { Stat } from "~/components/Stat";
+import { StatusBadge } from "~/components/StatusBadge";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatMoney } from "~/lib/format";
-import { useMessage, useT } from "~/lib/use-t";
+import { useErrorMessage, useLocale, useMessage, useT } from "~/lib/use-t";
 import { mergeShopSettings } from "~/domain/settings/shop-settings";
 import { KNOWN_CARRIERS, deleteShippingPreference, listShippingPreferences, setShippingPreferenceEnabled, upsertShippingPreference } from "~/services/shipping.server";
 import { updateShopSettings } from "~/services/shop.server";
@@ -58,134 +62,271 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 };
 
+type Preference = SerializeFrom<typeof loader>["preferences"][number];
+type PrefForm = { editing: boolean; countryCode: string; carrierCode: string; priority: string; maxCost: string; maxDeliveryDays: string; requireTracking: boolean };
+
 export default function ShippingPage() {
   const t = useT();
+  const locale = useLocale();
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
-  const result = fetcher.data as { message?: string; error?: string } | undefined;
+  const result = fetcher.data as { ok?: boolean; message?: string; error?: string } | undefined;
   const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
-  const [form, setForm] = useState({ countryCode: "*", carrierCode: data.carriers[0]?.code ?? "", priority: "0", maxCost: "", maxDeliveryDays: "", requireTracking: true });
+  const errorText = useErrorMessage(result);
+  const busy = fetcher.state !== "idle";
+  const pending = (intent: string, id?: string) => busy && fetcher.formData?.get("intent") === intent && (id === undefined || fetcher.formData?.get("id") === id);
+
   const [settings, setSettings] = useState({ fallback: data.settings.fallback, requireTracking: data.settings.requireTracking, maxShippingCost: String(data.settings.maxShippingCost || "") });
 
-  const byCountry = new Map<string, typeof data.preferences>();
-  for (const p of data.preferences) byCountry.set(p.countryCode, [...(byCountry.get(p.countryCode) ?? []), p]);
+  // Add/edit modal. "Edit" reuses the add intent: the service upserts on
+  // destination + carrier, so those two fields are locked while editing and the
+  // submit lands on the same row.
+  const [form, setForm] = useState<PrefForm | null>(null);
+  const [removing, setRemoving] = useState<Preference | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+  // A modal stays open while its submit is in flight, so its button can show
+  // progress and a failure lands inside the modal rather than behind it.
+  // `wasBusy` makes the effect wait for the fetcher to have actually started:
+  // the state update and the submit do not always land in the same render.
+  const [submitting, setSubmitting] = useState<"add" | "delete" | null>(null);
+  const wasBusy = useRef(false);
+  useEffect(() => {
+    if (busy) {
+      wasBusy.current = true;
+      return;
+    }
+    if (!wasBusy.current || !submitting) return;
+    wasBusy.current = false;
+    const intent = submitting;
+    setSubmitting(null);
+    if (intent === "add") {
+      if (result?.error) setFormError(result.error);
+      else setForm(null);
+    } else {
+      setRemoving(null);
+    }
+  }, [busy, submitting, result?.error]);
+
+  const openAdd = () => {
+    setFormError(null);
+    setForm({ editing: false, countryCode: "*", carrierCode: data.carriers[0]?.code ?? "", priority: "0", maxCost: "", maxDeliveryDays: "", requireTracking: true });
+  };
+  const openEdit = (p: Preference) => {
+    setFormError(null);
+    setForm({ editing: true, countryCode: p.countryCode, carrierCode: p.carrierCode, priority: String(p.priority), maxCost: p.maxCost, maxDeliveryDays: p.maxDeliveryDays === null ? "" : String(p.maxDeliveryDays), requireTracking: p.requireTracking });
+  };
+  const closeForm = () => {
+    setForm(null);
+    setFormError(null);
+  };
+  const saveForm = () => {
+    if (!form) return;
+    setFormError(null);
+    setSubmitting("add");
+    fetcher.submit({ intent: "add", countryCode: form.countryCode, carrierCode: form.carrierCode, priority: form.priority, maxCost: form.maxCost, maxDeliveryDays: form.maxDeliveryDays, requireTracking: String(form.requireTracking) }, { method: "post" });
+  };
+
+  const toggle = (p: Preference) => {
+    fetcher.submit({ intent: "toggle", id: p.id, countryCode: p.countryCode, carrierCode: p.carrierCode, priority: String(p.priority), requireTracking: String(p.requireTracking), enabled: String(!p.isEnabled) }, { method: "post" });
+    clearSelection();
+  };
+  const confirmRemove = () => {
+    if (!removing) return;
+    setSubmitting("delete");
+    fetcher.submit({ intent: "delete", id: removing.id }, { method: "post" });
+    clearSelection();
+  };
+
+  // Rows grouped by destination, most-preferred first; "everywhere else" last.
+  const rows = [...data.preferences]
+    .sort((a, b) => (a.countryCode === "*" ? 1 : b.countryCode === "*" ? -1 : a.countryCode.localeCompare(b.countryCode)) || a.priority - b.priority)
+    .map((p, i, all) => ({ ...p, rank: all.slice(0, i).filter((q) => q.countryCode === p.countryCode).length }));
+  const { selectedResources, allResourcesSelected, handleSelectionChange, clearSelection } = useIndexResourceState(rows);
+  const selectedPref = selectedResources.length === 1 ? rows.find((r) => r.id === selectedResources[0]) : undefined;
+
+  const countryName = (code: string) => {
+    if (code === "*") return t("shipping.allOtherCountries");
+    try {
+      return new Intl.DisplayNames([locale], { type: "region" }).of(code) ?? code;
+    } catch {
+      return code;
+    }
+  };
+  const fallbackLabel = { CHEAPEST: t("shipping.stat.fallback.CHEAPEST"), FASTEST: t("shipping.stat.fallback.FASTEST"), NONE: t("shipping.stat.fallback.NONE") }[data.settings.fallback] ?? data.settings.fallback;
+  const destinations = new Set(data.preferences.map((p) => p.countryCode)).size;
+  const enabledCount = data.preferences.filter((p) => p.isEnabled).length;
 
   return (
-    <Page title={t("page.shipping.title")} subtitle={t("page.shipping.subtitle")}>
+    <Page fullWidth title={t("page.shipping.title")} subtitle={t("page.shipping.subtitle")} primaryAction={{ content: t("shipping.addPreference"), onAction: openAdd }}>
       <Layout>
         <Layout.Section>
-          {actionMessage && (
-            <Banner tone="success">
-              <p>{actionMessage}</p>
-            </Banner>
-          )}
-          {result?.error && (
-            <Banner tone="critical">
-              <p>{result.error}</p>
-            </Banner>
-          )}
-        </Layout.Section>
-
-        <Layout.Section variant="oneThird">
-          <BlockStack gap="400">
-            <Card>
-              <BlockStack gap="300">
-                <Text as="h2" variant="headingMd">
-                  {t("shipping.globalRules")}
-                </Text>
-                <FormLayout>
-                  <Select
-                    label={t("shipping.fallback.label")}
-                    value={settings.fallback}
-                    onChange={(v) => setSettings({ ...settings, fallback: v as typeof settings.fallback })}
-                    options={[
-                      { label: t("shipping.fallback.cheapest"), value: "CHEAPEST" },
-                      { label: t("shipping.fallback.fastest"), value: "FASTEST" },
-                      { label: t("shipping.fallback.none"), value: "NONE" },
-                    ]}
-                  />
-                  <Checkbox label={t("shipping.requireTrackingGlobal")} checked={settings.requireTracking} onChange={(v) => setSettings({ ...settings, requireTracking: v })} />
-                  <TextField label={t("shipping.maxCostPerOrder")} type="number" value={settings.maxShippingCost} onChange={(v) => setSettings({ ...settings, maxShippingCost: v })} autoComplete="off" prefix={data.currency} helpText={t("shipping.maxCostHelp")} />
-                  <Button variant="primary" onClick={() => fetcher.submit({ intent: "settings", ...settings, requireTracking: String(settings.requireTracking) }, { method: "post" })}>
-                    {t("action.save")}
-                  </Button>
-                </FormLayout>
-              </BlockStack>
-            </Card>
-
-            <Card>
-              <BlockStack gap="300">
-                <Text as="h2" variant="headingMd">
-                  {t("shipping.addCarrier.title")}
-                </Text>
-                <FormLayout>
-                  <TextField label={t("shipping.addCarrier.country")} value={form.countryCode} onChange={(v) => setForm({ ...form, countryCode: v.toUpperCase() })} autoComplete="off" />
-                  <Select label={t("shipping.addCarrier.carrier")} options={data.carriers.map((c) => ({ label: `${c.name} (${c.code})`, value: c.code }))} value={form.carrierCode} onChange={(v) => setForm({ ...form, carrierCode: v })} />
-                  <FormLayout.Group>
-                    <TextField label={t("shipping.addCarrier.priority")} type="number" value={form.priority} onChange={(v) => setForm({ ...form, priority: v })} autoComplete="off" />
-                    <TextField label={t("shipping.addCarrier.maxCost")} type="number" value={form.maxCost} onChange={(v) => setForm({ ...form, maxCost: v })} autoComplete="off" prefix={data.currency} />
-                    <TextField label={t("shipping.addCarrier.maxDays")} type="number" value={form.maxDeliveryDays} onChange={(v) => setForm({ ...form, maxDeliveryDays: v })} autoComplete="off" />
-                  </FormLayout.Group>
-                  <Checkbox label={t("shipping.addCarrier.requireTracking")} checked={form.requireTracking} onChange={(v) => setForm({ ...form, requireTracking: v })} />
-                  <Button onClick={() => fetcher.submit({ intent: "add", ...form, requireTracking: String(form.requireTracking) }, { method: "post" })} loading={fetcher.state !== "idle"}>
-                    {t("action.add")}
-                  </Button>
-                </FormLayout>
-              </BlockStack>
-            </Card>
+          <BlockStack gap="300">
+            {actionMessage && (
+              <Banner tone="success">
+                <p>{actionMessage}</p>
+              </Banner>
+            )}
+            {errorText && !form && (
+              <Banner tone="critical">
+                <p>{errorText}</p>
+              </Banner>
+            )}
           </BlockStack>
         </Layout.Section>
 
         <Layout.Section>
+          <InlineGrid columns={{ xs: 2, md: 4 }} gap="400">
+            <Stat label={t("shipping.stat.destinations")} value={String(destinations)} hint={data.preferences.some((p) => p.countryCode === "*") ? t("shipping.stat.destinationsHint") : undefined} />
+            <Stat label={t("shipping.stat.carriers")} value={String(data.preferences.length)} hint={t("shipping.stat.carriersHint", { enabled: enabledCount })} />
+            <Stat label={t("shipping.stat.fallback")} value={fallbackLabel} tone={data.settings.fallback === "NONE" ? "warning" : "default"} />
+            <Stat label={t("shipping.stat.maxCost")} value={data.settings.maxShippingCost ? formatMoney(data.settings.maxShippingCost, data.currency) : t("shipping.stat.noLimit")} />
+          </InlineGrid>
+        </Layout.Section>
+
+        <Layout.Section>
+          {data.preferences.length === 0 ? (
+            <EmptyScreen heading={t("shipping.emptyState.heading")} body={t("shipping.empty")} action={{ content: t("shipping.addPreference"), onAction: openAdd }} />
+          ) : (
+            <Card padding="0">
+              <IndexTable
+                resourceName={{ singular: t("shipping.resource.singular"), plural: t("shipping.resource.plural") }}
+                itemCount={rows.length}
+                selectedItemsCount={allResourcesSelected ? "All" : selectedResources.length}
+                onSelectionChange={handleSelectionChange}
+                promotedBulkActions={[
+                  { content: t("action.edit"), disabled: !selectedPref, onAction: () => selectedPref && openEdit(selectedPref) },
+                  { content: selectedPref && !selectedPref.isEnabled ? t("action.enable") : t("action.disable"), disabled: !selectedPref || busy, onAction: () => selectedPref && toggle(selectedPref) },
+                  { content: t("action.remove"), disabled: !selectedPref || busy, onAction: () => selectedPref && setRemoving(selectedPref) },
+                ]}
+                headings={[
+                  { title: t("shipping.table.destination") },
+                  { title: t("shipping.table.carrier") },
+                  { title: t("shipping.table.order") },
+                  { title: t("shipping.table.maxCost"), alignment: "end" },
+                  { title: t("shipping.table.maxDays"), alignment: "end" },
+                  { title: t("shipping.table.tracking") },
+                  { title: t("common.status") },
+                ]}
+              >
+                {/* The row itself opens the preference, the way a row opens an
+                    order in the Shopify admin. Buttons inside a row would also
+                    toggle its checkbox — Polaris puts the click handler on the
+                    <tr> — so the row's actions live in the bulk action bar. */}
+                {rows.map((p, index) => (
+                  <IndexTable.Row id={p.id} key={p.id} position={index} selected={selectedResources.includes(p.id)} onClick={() => openEdit(p)}>
+                    <IndexTable.Cell>
+                      <BlockStack gap="050">
+                        <Text as="span" fontWeight="semibold">
+                          {countryName(p.countryCode)}
+                        </Text>
+                        {p.countryCode !== "*" && (
+                          <Text as="span" tone="subdued" variant="bodySm">
+                            {p.countryCode}
+                          </Text>
+                        )}
+                      </BlockStack>
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <BlockStack gap="050">
+                        <Text as="span">{p.carrierName ?? p.carrierCode}</Text>
+                        {p.carrierName && (
+                          <Text as="span" tone="subdued" variant="bodySm">
+                            {p.carrierCode}
+                          </Text>
+                        )}
+                      </BlockStack>
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <Badge tone={p.rank === 0 ? "info" : undefined}>{p.rank === 0 ? t("shipping.table.preferred") : t("shipping.table.fallback", { n: p.rank })}</Badge>
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <Text as="span" alignment="end" numeric>
+                        {p.maxCost ? formatMoney(p.maxCost, data.currency) : "—"}
+                      </Text>
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <Text as="span" alignment="end" numeric>
+                        {p.maxDeliveryDays ? `${p.maxDeliveryDays} ${t("common.days")}` : "—"}
+                      </Text>
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <Badge tone={p.requireTracking ? "success" : undefined}>{p.requireTracking ? t("shipping.table.trackingRequired") : t("shipping.table.trackingOptional")}</Badge>
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <StatusBadge status={p.isEnabled ? "ENABLED" : "DISABLED"} />
+                    </IndexTable.Cell>
+                  </IndexTable.Row>
+                ))}
+              </IndexTable>
+            </Card>
+          )}
+        </Layout.Section>
+
+        <Layout.Section variant="oneThird">
           <Card>
             <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                {t("shipping.byDestination")}
-              </Text>
-              {data.preferences.length === 0 && (
-                <Text as="p" tone="subdued">
-                  {t("shipping.empty")}
-                </Text>
-              )}
-              {[...byCountry.entries()].map(([country, prefs]) => (
-                <Box key={country} padding="300" borderColor="border" borderWidth="025" borderRadius="200">
-                  <BlockStack gap="200">
-                    <Text as="h3" variant="headingSm">
-                      {country === "*" ? t("shipping.allOtherCountries") : country}
-                    </Text>
-                    {prefs
-                      .sort((a, b) => a.priority - b.priority)
-                      .map((p) => (
-                        <InlineGrid key={p.id} columns={{ xs: 1, md: ["twoThirds", "oneThird"] }} gap="200">
-                          <InlineStack gap="200" blockAlign="center" wrap>
-                            <Badge>{`#${p.priority + 1}`}</Badge>
-                            <Text as="span" fontWeight="semibold">
-                              {p.carrierName ?? p.carrierCode}
-                            </Text>
-                            <Text as="span" tone="subdued" variant="bodySm">
-                              {p.maxCost ? `≤ ${formatMoney(p.maxCost, data.currency)} · ` : ""}
-                              {p.maxDeliveryDays ? `≤ ${p.maxDeliveryDays} ${t("common.days")} · ` : ""}
-                              {p.requireTracking ? t("shipping.trackingRequired") : t("shipping.trackingOptional")}
-                            </Text>
-                            {!p.isEnabled && <Badge>{t("common.disabled")}</Badge>}
-                          </InlineStack>
-                          <InlineStack gap="100" align="end">
-                            <Button size="slim" onClick={() => fetcher.submit({ intent: "toggle", id: p.id, countryCode: p.countryCode, carrierCode: p.carrierCode, priority: String(p.priority), requireTracking: String(p.requireTracking), enabled: String(!p.isEnabled) }, { method: "post" })}>
-                              {p.isEnabled ? t("action.disable") : t("action.enable")}
-                            </Button>
-                            <Button size="slim" tone="critical" onClick={() => fetcher.submit({ intent: "delete", id: p.id }, { method: "post" })}>
-                              {t("action.remove")}
-                            </Button>
-                          </InlineStack>
-                        </InlineGrid>
-                      ))}
-                  </BlockStack>
-                </Box>
-              ))}
+              <SectionHeader title={t("shipping.globalRules")} />
+              <FormLayout>
+                <Select
+                  label={t("shipping.fallback.label")}
+                  value={settings.fallback}
+                  onChange={(v) => setSettings({ ...settings, fallback: v as typeof settings.fallback })}
+                  options={[
+                    { label: t("shipping.fallback.cheapest"), value: "CHEAPEST" },
+                    { label: t("shipping.fallback.fastest"), value: "FASTEST" },
+                    { label: t("shipping.fallback.none"), value: "NONE" },
+                  ]}
+                />
+                <Checkbox label={t("shipping.requireTrackingGlobal")} checked={settings.requireTracking} onChange={(v) => setSettings({ ...settings, requireTracking: v })} />
+                <TextField label={t("shipping.maxCostPerOrder")} type="number" value={settings.maxShippingCost} onChange={(v) => setSettings({ ...settings, maxShippingCost: v })} autoComplete="off" prefix={data.currency} helpText={t("shipping.maxCostHelp")} />
+                <Button variant="primary" loading={pending("settings")} onClick={() => fetcher.submit({ intent: "settings", ...settings, requireTracking: String(settings.requireTracking) }, { method: "post" })}>
+                  {t("action.save")}
+                </Button>
+              </FormLayout>
             </BlockStack>
           </Card>
         </Layout.Section>
       </Layout>
+
+      <Modal
+        open={form !== null}
+        onClose={closeForm}
+        title={form?.editing ? t("shipping.editPreference") : t("shipping.addCarrier.title")}
+        primaryAction={{ content: form?.editing ? t("action.save") : t("action.add"), onAction: saveForm, disabled: !form?.carrierCode, loading: pending("add") }}
+        secondaryActions={[{ content: t("action.cancel"), onAction: closeForm }]}
+      >
+        {form && (
+          <Modal.Section>
+            <FormLayout>
+              {formError && (
+                <Banner tone="critical">
+                  <p>{formError}</p>
+                </Banner>
+              )}
+              <TextField label={t("shipping.addCarrier.country")} value={form.countryCode} onChange={(v) => setForm({ ...form, countryCode: v.toUpperCase() })} autoComplete="off" disabled={form.editing} helpText={t("shipping.form.countryHelp")} />
+              <Select label={t("shipping.addCarrier.carrier")} options={data.carriers.map((c) => ({ label: `${c.name} (${c.code})`, value: c.code }))} value={form.carrierCode} onChange={(v) => setForm({ ...form, carrierCode: v })} disabled={form.editing} />
+              <TextField label={t("shipping.addCarrier.priority")} type="number" value={form.priority} onChange={(v) => setForm({ ...form, priority: v })} autoComplete="off" helpText={t("shipping.form.priorityHelp")} />
+              <FormLayout.Group>
+                <TextField label={t("shipping.addCarrier.maxCost")} type="number" value={form.maxCost} onChange={(v) => setForm({ ...form, maxCost: v })} autoComplete="off" prefix={data.currency} helpText={t("shipping.form.maxCostHelp")} />
+                <TextField label={t("shipping.addCarrier.maxDays")} type="number" value={form.maxDeliveryDays} onChange={(v) => setForm({ ...form, maxDeliveryDays: v })} autoComplete="off" helpText={t("shipping.form.maxDaysHelp")} />
+              </FormLayout.Group>
+              <Checkbox label={t("shipping.addCarrier.requireTracking")} checked={form.requireTracking} onChange={(v) => setForm({ ...form, requireTracking: v })} />
+            </FormLayout>
+          </Modal.Section>
+        )}
+      </Modal>
+
+      <Modal
+        open={Boolean(removing)}
+        onClose={() => setRemoving(null)}
+        title={t("shipping.remove.title", { carrier: removing?.carrierName ?? removing?.carrierCode ?? "", destination: removing ? countryName(removing.countryCode) : "" })}
+        primaryAction={{ content: t("action.remove"), destructive: true, loading: pending("delete", removing?.id), onAction: confirmRemove }}
+        secondaryActions={[{ content: t("action.cancel"), onAction: () => setRemoving(null) }]}
+      >
+        <Modal.Section>
+          <Text as="p">{t("shipping.remove.body")}</Text>
+        </Modal.Section>
+      </Modal>
     </Page>
   );
 }
