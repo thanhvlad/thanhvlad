@@ -8,20 +8,27 @@ import {
   Box,
   Button,
   Card,
-  Divider,
-  EmptyState,
+  FormLayout,
+  Image,
   InlineGrid,
   InlineStack,
   Layout,
+  Link,
+  List,
   Page,
+  Pagination,
   Select,
   Text,
   TextField,
 } from "@shopify/polaris";
+import { CheckIcon } from "@shopify/polaris-icons";
+import { EmptyScreen } from "~/components/EmptyScreen";
+import { SectionHeader } from "~/components/SectionHeader";
 import { PlatformBadge } from "~/components/StatusBadge";
+import { Thumb } from "~/components/Thumb";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
-import { formatMoney, pageParam } from "~/lib/format";
+import { formatMoney, formatNumber, pageParam, truncate } from "~/lib/format";
 import { useErrorMessage, useT } from "~/lib/use-t";
 import { addToImportList, pushImportedProduct } from "~/services/import.server";
 import { adapterForShop, listPlatforms } from "~/services/suppliers/index.server";
@@ -108,13 +115,15 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<SearchAct
   return { ok: false, error: "Unknown action" };
 };
 
+type SortKey = "default" | "orders" | "price_asc" | "price_desc" | "newest" | "rating";
+
 export default function SearchPage() {
   const data = useLoaderData<typeof loader>();
   const navigation = useNavigation();
   const [params] = useSearchParams();
   const [q, setQ] = useState(data.q);
   const [platform, setPlatform] = useState(data.platform);
-  const [sort, setSort] = useState(data.sort);
+  const [sort, setSort] = useState<SortKey>(data.sort);
   const [image, setImage] = useState(data.imageUrl);
   const [bulk, setBulk] = useState("");
   const bulkFetcher = useFetcher<typeof action>();
@@ -125,62 +134,146 @@ export default function SearchPage() {
     label: `${p.displayName}${p.configured ? "" : ` (${t("search.notConfigured")})`}`,
     value: p.platform,
   }));
+  const sortOptions: Array<{ label: string; value: SortKey }> = [
+    { label: t("search.sort.default"), value: "default" },
+    { label: t("search.sort.orders"), value: "orders" },
+    { label: t("search.sort.rating"), value: "rating" },
+    { label: t("search.sort.priceAsc"), value: "price_asc" },
+    { label: t("search.sort.priceDesc"), value: "price_desc" },
+    { label: t("search.sort.newest"), value: "newest" },
+  ];
+
+  // What the merchant searched for, for the results line: the keyword, or
+  // "image" when they searched by picture alone.
+  const queryLabel = data.q || t("search.image");
+  const hasResults = Boolean(data.results && data.results.items.length > 0);
+  const bulkResults = bulkFetcher.data?.bulk;
+  const bulkOk = bulkResults ? bulkResults.filter((r) => r.ok).length : 0;
 
   return (
-    <Page title={t("page.search.title")} subtitle={t("page.search.subtitle")}>
+    <Page
+      title={t("page.search.title")}
+      subtitle={t("page.search.subtitle")}
+      primaryAction={{ content: t("search.page.viewImportList"), url: "/app/import" }}
+      secondaryActions={[{ content: t("search.page.extension"), url: "/app/settings/advanced" }]}
+    >
       <Layout>
         <Layout.Section>
           <Card>
             <Form method="get">
-              <BlockStack gap="300">
-                <InlineGrid columns={{ xs: 1, md: ["twoThirds", "oneThird"] }} gap="300">
+              <FormLayout>
+                <FormLayout.Group>
                   <TextField
-                    label={t("action.search")}
+                    label={t("search.form.query")}
                     name="q"
                     value={q}
                     onChange={setQ}
                     autoComplete="off"
                     placeholder={t("search.queryPlaceholder")}
+                    connectedRight={
+                      <Button submit variant="primary" loading={searching}>
+                        {t("action.search")}
+                      </Button>
+                    }
                   />
                   <Select label={t("common.supplier")} name="platform" options={platformOptions} value={platform} onChange={(v) => setPlatform(v as SupplierPlatform)} />
-                </InlineGrid>
-                <InlineGrid columns={{ xs: 1, md: ["twoThirds", "oneThird"] }} gap="300">
-                  <TextField label={t("search.imageUrl.label")} name="image" value={image} onChange={setImage} autoComplete="off" placeholder="https://…/photo.jpg" />
-                  <Select
-                    label={t("search.sort.label")}
-                    name="sort"
-                    value={sort}
-                    onChange={(v) => setSort(v as typeof sort)}
-                    options={[
-                      { label: t("search.sort.default"), value: "default" },
-                      { label: t("search.sort.orders"), value: "orders" },
-                      { label: t("search.sort.rating"), value: "rating" },
-                      { label: t("search.sort.priceAsc"), value: "price_asc" },
-                      { label: t("search.sort.priceDesc"), value: "price_desc" },
-                      { label: t("search.sort.newest"), value: "newest" },
-                    ]}
+                </FormLayout.Group>
+                <FormLayout.Group condensed>
+                  <TextField
+                    label={t("search.imageUrl.label")}
+                    name="image"
+                    value={image}
+                    onChange={setImage}
+                    autoComplete="off"
+                    placeholder={t("search.form.imagePlaceholder")}
                   />
-                </InlineGrid>
-                <InlineStack gap="200">
-                  <Button submit variant="primary" loading={searching}>
-                    {t("action.search")}
-                  </Button>
-                </InlineStack>
-              </BlockStack>
+                  <Select label={t("search.sort.label")} name="sort" value={sort} onChange={(v) => setSort(v as SortKey)} options={sortOptions} />
+                </FormLayout.Group>
+              </FormLayout>
             </Form>
           </Card>
+        </Layout.Section>
+
+        {(data.error || data.results?.notice) && (
+          <Layout.Section>
+            <BlockStack gap="300">
+              {data.error && (
+                <Banner tone="critical" title={t("search.failed")}>
+                  <p>{data.error}</p>
+                </Banner>
+              )}
+              {data.results?.notice && (
+                <Banner tone="warning">
+                  <p>{data.results.notice}</p>
+                </Banner>
+              )}
+            </BlockStack>
+          </Layout.Section>
+        )}
+
+        <Layout.Section>
+          {!data.results && !data.error && (
+            <EmptyScreen
+              heading={t("search.start.heading")}
+              body={t("search.start.body")}
+              action={{ content: t("search.start.action"), url: "/app/settings/advanced" }}
+            />
+          )}
+          {data.results && !hasResults && (
+            <EmptyScreen
+              heading={t("search.results.empty.heading", { query: queryLabel })}
+              body={t("search.results.empty.body")}
+              action={{ content: t("search.results.empty.action"), url: "/app/search" }}
+            />
+          )}
+          {data.results && hasResults && (
+            <BlockStack gap="400">
+              <InlineStack align="space-between" blockAlign="center" gap="200">
+                <Text as="p" tone="subdued" numeric>
+                  {data.results.total !== null
+                    ? t("search.results.count", { count: formatNumber(data.results.total), query: queryLabel })
+                    : t("search.results.countUnknown", { query: queryLabel })}
+                </Text>
+                <Text as="p" tone="subdued" numeric>
+                  {t("search.results.page", { page: data.page })}
+                </Text>
+              </InlineStack>
+              <InlineGrid columns={{ xs: 1, sm: 2, md: 3, lg: 4 }} gap="400">
+                {data.results.items.map((item) => (
+                  <ResultCard key={item.externalId} item={item} platform={data.platform} currency={item.currency} />
+                ))}
+              </InlineGrid>
+              {(data.page > 1 || data.results.hasMore) && (
+                <InlineStack align="center">
+                  <Pagination
+                    hasPrevious={data.page > 1}
+                    previousURL={`?${withPage(params, data.page - 1)}`}
+                    hasNext={data.results.hasMore}
+                    nextURL={`?${withPage(params, data.page + 1)}`}
+                    label={t("search.results.page", { page: data.page })}
+                  />
+                </InlineStack>
+              )}
+            </BlockStack>
+          )}
         </Layout.Section>
 
         <Layout.Section>
           <Card>
             <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                {t("search.importByLink.title")}
-              </Text>
+              <SectionHeader title={t("search.importByLink.title")} />
               <Text as="p" tone="subdued">
                 {t("search.importByLink.help")}
               </Text>
-              <TextField label={t("search.productLinks.label")} labelHidden multiline={4} value={bulk} onChange={setBulk} autoComplete="off" placeholder={"https://www.aliexpress.com/item/1005006001.html\n1005006002"} />
+              <TextField
+                label={t("search.productLinks.label")}
+                labelHidden
+                multiline={4}
+                value={bulk}
+                onChange={setBulk}
+                autoComplete="off"
+                placeholder={t("search.bulk.placeholder")}
+              />
               <InlineStack gap="200">
                 <Button
                   onClick={() => bulkFetcher.submit({ intent: "add-bulk", references: bulk, platform }, { method: "post" })}
@@ -190,59 +283,22 @@ export default function SearchPage() {
                   {t("action.addToImport")}
                 </Button>
               </InlineStack>
-              {bulkFetcher.data?.bulk && (
-                <Banner tone={bulkFetcher.data.bulk.every((r) => r.ok) ? "success" : "warning"}>
-                  <BlockStack gap="100">
-                    {bulkFetcher.data.bulk.map((r) => (
-                      <Text as="p" key={r.reference}>
-                        {r.ok ? "✓" : "✕"} {r.reference} {r.ok ? `— ${r.title}` : `— ${r.error}`}
-                      </Text>
+              {bulkResults && (
+                <Banner
+                  tone={bulkOk === bulkResults.length ? "success" : bulkOk === 0 ? "critical" : "warning"}
+                  title={t("search.bulk.summary", { ok: bulkOk, total: bulkResults.length })}
+                >
+                  <List>
+                    {bulkResults.map((r) => (
+                      <List.Item key={r.reference}>
+                        {r.reference} — {r.ok ? r.title : r.error}
+                      </List.Item>
                     ))}
-                  </BlockStack>
+                  </List>
                 </Banner>
               )}
             </BlockStack>
           </Card>
-        </Layout.Section>
-
-        <Layout.Section>
-          {data.error && (
-            <Banner tone="critical" title={t("search.failed")}>
-              <p>{data.error}</p>
-            </Banner>
-          )}
-          {data.results?.notice && (
-            <Banner tone="warning">
-              <p>{data.results.notice}</p>
-            </Banner>
-          )}
-          {!data.results && !data.error && (
-            <Card>
-              <EmptyState heading={t("search.empty.heading")} image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png">
-                <p>{t("search.empty.body")}</p>
-              </EmptyState>
-            </Card>
-          )}
-          {data.results && (
-            <BlockStack gap="300">
-              <InlineStack align="space-between">
-                <Text as="p" tone="subdued">
-                  {`${data.results.total !== null ? data.results.total : data.results.items.length} ${t("search.resultsFor")} “${
-                    data.q || t("search.image")
-                  }”`}
-                </Text>
-                <InlineStack gap="200">
-                  {data.page > 1 && <Button url={`?${withPage(params, data.page - 1)}`}>{t("common.previous")}</Button>}
-                  {data.results.hasMore && <Button url={`?${withPage(params, data.page + 1)}`}>{t("common.next")}</Button>}
-                </InlineStack>
-              </InlineStack>
-              <InlineGrid columns={{ xs: 1, sm: 2, md: 3, lg: 4 }} gap="300">
-                {data.results.items.map((item) => (
-                  <ResultCard key={item.externalId} item={item} platform={data.platform} currency={item.currency} />
-                ))}
-              </InlineGrid>
-            </BlockStack>
-          )}
         </Layout.Section>
       </Layout>
     </Page>
@@ -255,95 +311,134 @@ function withPage(params: URLSearchParams, page: number) {
   return sp.toString();
 }
 
+/**
+ * One search hit.
+ *
+ * The card is built so the merchant can decide from three lines — picture,
+ * price, proof (rating and orders) — and act with one full-width button. The
+ * "add to shop" shortcut and the supplier link stay, but below the fold of the
+ * decision, in the same row.
+ */
 function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["items"][number]; platform: SupplierPlatform; currency: string }) {
   const fetcher = useFetcher<typeof action>();
   const [pushing, setPushing] = useState(false);
   const t = useT();
   const result = fetcher.data as SearchActionData | undefined;
   const failureMessage = useErrorMessage(result);
-  const added = result?.ok && result.reference === item.url;
-  const failed = result && !result.ok && result.reference === item.url;
+  const added = Boolean(result?.ok && result.reference === item.url);
+  const failed = Boolean(result && !result.ok && result.reference === item.url);
+  const busy = fetcher.state !== "idle";
+  const pushedId = added ? result?.productId : undefined;
+  const importId = added ? result?.id : undefined;
+
+  const proof: string[] = [];
+  if (item.rating) proof.push(`★ ${item.rating.toFixed(1)}`);
+  if (item.orderCount) proof.push(t("search.card.orders", { count: formatNumber(item.orderCount) }));
+
+  const shippingParts: string[] = [];
+  if (item.shippingFrom !== null && item.shippingFrom !== undefined) {
+    shippingParts.push(Number(item.shippingFrom) === 0 ? t("search.freeShipping") : t("search.card.shipping", { amount: formatMoney(item.shippingFrom, currency) }));
+  } else {
+    shippingParts.push(t("search.shippingAtImport"));
+  }
+  if (item.shipToDays) shippingParts.push(t("search.card.eta", { days: item.shipToDays }));
+
   return (
     <Card padding="0">
-      <Box>
-        <div style={{ aspectRatio: "1 / 1", background: "#f6f6f7", overflow: "hidden" }}>
-          {item.image && <img src={item.image} alt={item.title} style={{ width: "100%", height: "100%", objectFit: "cover" }} loading="lazy" />}
-        </div>
+      <Box background="bg-surface-secondary">
+        {item.image ? (
+          <Image source={item.image} alt={item.title} width="100%" />
+        ) : (
+          <Box paddingBlock="1600">
+            <InlineStack align="center">
+              <Thumb src={null} alt={t("search.card.noImage")} size="large" />
+            </InlineStack>
+          </Box>
+        )}
       </Box>
       <Box padding="300">
-        <BlockStack gap="200">
-          <Text as="p" variant="bodyMd" fontWeight="semibold" truncate>
-            {item.title}
-          </Text>
-          <InlineStack gap="200" blockAlign="center">
-            <Text as="span" variant="headingMd">
-              {formatMoney(item.price, currency)}
+        <BlockStack gap="300">
+          <BlockStack gap="100">
+            <Text as="h3" variant="bodyMd" fontWeight="semibold" breakWord>
+              {truncate(item.title, 72)}
             </Text>
-            {item.originalPrice && (
-              <Text as="span" tone="subdued" textDecorationLine="line-through">
-                {formatMoney(item.originalPrice, currency)}
+            <InlineStack gap="150" blockAlign="baseline">
+              <Text as="span" variant="headingLg" numeric>
+                {formatMoney(item.price, currency)}
+              </Text>
+              {item.originalPrice && (
+                <Text as="span" variant="bodySm" tone="subdued" numeric textDecorationLine="line-through">
+                  {formatMoney(item.originalPrice, currency)}
+                </Text>
+              )}
+            </InlineStack>
+            <Text as="p" variant="bodySm" tone="subdued" numeric>
+              {proof.length > 0 ? proof.join(" · ") : t("search.card.noStats")}
+            </Text>
+            <Text as="p" variant="bodySm" tone="subdued" numeric>
+              {shippingParts.join(" · ")}
+            </Text>
+          </BlockStack>
+
+          <InlineStack gap="200" blockAlign="center">
+            <PlatformBadge platform={platform} />
+            {item.storeName && (
+              <Text as="span" variant="bodySm" tone="subdued">
+                {truncate(item.storeName, 28)}
               </Text>
             )}
           </InlineStack>
-          <InlineStack gap="100" wrap>
-            <PlatformBadge platform={platform} />
-            {item.rating ? <Badge>{`★ ${item.rating.toFixed(1)}`}</Badge> : null}
-            {item.orderCount ? <Badge>{`${item.orderCount.toLocaleString()} ${t("search.orders")}`}</Badge> : null}
-          </InlineStack>
-          <Text as="p" variant="bodySm" tone="subdued">
-            {item.shippingFrom !== null && item.shippingFrom !== undefined
-              ? Number(item.shippingFrom) === 0
-                ? t("search.freeShipping")
-                : `+ ${formatMoney(item.shippingFrom, currency)} ${t("search.shippingSuffix")}`
-              : t("search.shippingAtImport")}
-            {item.shipToDays ? ` · ~${item.shipToDays} ${t("search.days")}` : ""}
-          </Text>
-          {item.storeName && (
-            <Text as="p" tone="subdued" variant="bodySm" truncate>
-              {item.storeName}
-            </Text>
-          )}
-          <Divider />
-          <InlineStack gap="100" align="space-between" blockAlign="center" wrap>
-            <Button size="slim" url={item.url} target="_blank" external>
-              {t("common.view")}
-            </Button>
-            <InlineStack gap="100">
+
+          <BlockStack gap="200">
+            {added && importId ? (
+              <Button fullWidth variant="primary" tone="success" icon={CheckIcon} url={`/app/import/${importId}`}>
+                {t("search.card.added")}
+              </Button>
+            ) : (
               <Button
-                size="slim"
-                disabled={Boolean(added)}
-                loading={fetcher.state !== "idle" && !pushing}
+                fullWidth
+                variant="primary"
+                loading={busy && !pushing}
+                disabled={busy && pushing}
                 onClick={() => {
                   setPushing(false);
                   fetcher.submit({ intent: "add", reference: item.url, platform }, { method: "post" });
                 }}
               >
-                {added && !result?.productId ? t("search.inList") : t("action.import")}
+                {t("action.addToImport")}
               </Button>
-              <Button
-                size="slim"
-                variant="primary"
-                disabled={Boolean(result?.productId)}
-                loading={fetcher.state !== "idle" && pushing}
-                onClick={() => {
-                  setPushing(true);
-                  fetcher.submit({ intent: "add-and-push", reference: item.url, platform }, { method: "post" });
-                }}
-              >
-                {result?.productId ? t("search.inShop") : t("action.addToShop")}
-              </Button>
+            )}
+            <InlineStack align="space-between" blockAlign="center" gap="200">
+              <Link url={item.url} external target="_blank" removeUnderline>
+                {t("search.card.viewSource")}
+              </Link>
+              {pushedId ? (
+                <InlineStack gap="200" blockAlign="center">
+                  <Badge tone="success">{t("search.inShop")}</Badge>
+                  <Link url={`/app/products/${pushedId}`} removeUnderline>
+                    {t("search.openInApp")}
+                  </Link>
+                </InlineStack>
+              ) : (
+                <Button
+                  variant="tertiary"
+                  loading={busy && pushing}
+                  disabled={busy && !pushing}
+                  onClick={() => {
+                    setPushing(true);
+                    fetcher.submit({ intent: "add-and-push", reference: item.url, platform }, { method: "post" });
+                  }}
+                >
+                  {t("action.addToShop")}
+                </Button>
+              )}
             </InlineStack>
-          </InlineStack>
-          {result?.productId && (
-            <Button size="micro" variant="plain" url={`/app/products/${result.productId}`}>
-              {t("search.openInApp")}
-            </Button>
-          )}
-          {failed && (
-            <Text as="p" tone="critical" variant="bodySm">
-              {failureMessage}
-            </Text>
-          )}
+            {failed && failureMessage && (
+              <Text as="p" tone="critical" variant="bodySm">
+                {failureMessage}
+              </Text>
+            )}
+          </BlockStack>
         </BlockStack>
       </Box>
     </Card>
