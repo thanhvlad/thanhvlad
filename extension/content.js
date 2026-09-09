@@ -14,16 +14,22 @@
 const ENDPOINT = "/api/extension/capture";
 const HOST_ID = "dropshiphub-capture-host";
 
+/**
+ * Anchors in priority order, verified against a live AliExpress product page.
+ * Its class names carry a per-build hash (`action--stickyWrap--RtlPq66`), so
+ * match the stable prefix and never the whole name. `append` puts the button
+ * under Buy now / Add to cart, where a merchant expects it.
+ */
 const ANCHORS = [
-  // AliExpress, newest first
-  '[class*="ProductAction"]',
-  '[class*="product-action"]',
-  ".pdp-body-top-right",
-  '[class*="BuyNow"]',
-  '[class*="addToCart"]',
+  // AliExpress. stickyWrap holds Buy now and Add to cart directly.
+  { selector: '[class*="action--stickyWrap"]', place: "append" },
+  { selector: '[class*="action--wrap"]', place: "append" },
+  { selector: '[class*="action--container"]', place: "append" },
+  // Right-hand column: correct page, wrong neighbourhood. Last resort.
+  { selector: ".pdp-body-top-right", place: "prepend" },
   // CJ Dropshipping
-  ".product-detail-buy",
-  '[class*="detail-buy"]',
+  { selector: '[class*="detail-buy"]', place: "append" },
+  { selector: ".product-detail-buy", place: "append" },
 ];
 
 function isProductPage() {
@@ -134,22 +140,32 @@ async function send(button, msg) {
   }
 }
 
+/** Returns true once the button sits on a real anchor. */
 function place() {
   if (!isProductPage()) return true;
-  if (document.getElementById(HOST_ID)) return true;
 
-  const host = buildButton();
-  for (const selector of ANCHORS) {
+  const existing = document.getElementById(HOST_ID);
+  // Already anchored: nothing to do. Still floating: keep looking for an anchor
+  // so the button moves to the buy box the moment it renders.
+  if (existing && !existing.classList.contains("floating")) return true;
+
+  for (const { selector, place: how } of ANCHORS) {
     const anchor = document.querySelector(selector);
-    if (anchor) {
-      anchor.prepend(host);
-      return true;
-    }
+    if (!anchor) continue;
+    const host = existing ?? buildButton();
+    host.classList.remove("floating");
+    if (how === "prepend") anchor.prepend(host);
+    else anchor.append(host);
+    return true;
   }
-  // No anchor matched — the page markup changed, or it has not rendered yet.
-  // Pin it to the viewport so the merchant still has the button.
-  host.classList.add("floating");
-  document.body.appendChild(host);
+
+  // No anchor matched — the markup changed, or it has not rendered yet. Pin the
+  // button to the viewport so the merchant still has it either way.
+  if (!existing) {
+    const host = buildButton();
+    host.classList.add("floating");
+    document.body.appendChild(host);
+  }
   return false;
 }
 
@@ -167,17 +183,7 @@ function start() {
       lastUrl = location.href;
       document.getElementById(HOST_ID)?.remove();
     }
-    // Re-place if the anchor has appeared, replacing the floating fallback.
-    const existing = document.getElementById(HOST_ID);
-    if (existing?.classList.contains("floating")) {
-      for (const selector of ANCHORS) {
-        const anchor = document.querySelector(selector);
-        if (anchor) {
-          existing.remove();
-          break;
-        }
-      }
-    }
+    // place() moves a floating button onto the buy box as soon as it renders.
     if (place()) observer.disconnect();
   });
   observer.observe(document.documentElement, { childList: true, subtree: true });
