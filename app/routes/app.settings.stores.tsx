@@ -1,11 +1,14 @@
 import { useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { useFetcher, useLoaderData } from "@remix-run/react";
-import { Badge, Banner, BlockStack, Box, Button, Card, FormLayout, InlineStack, Layout, Text, TextField } from "@shopify/polaris";
+import { useAppBridge } from "@shopify/app-bridge-react";
+import { Badge, Banner, BlockStack, Box, Button, Card, FormLayout, InlineGrid, InlineStack, Layout, Modal, Text, TextField } from "@shopify/polaris";
+import { ClipboardIcon } from "@shopify/polaris-icons";
+import { SectionHeader } from "~/components/SectionHeader";
+import { useSettingsPageAction } from "~/components/settings-page-action";
 import prisma from "~/db.server";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { actionFailure } from "~/lib/errors";
-import { formatDate } from "~/lib/format";
 import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
 import { logActivity } from "~/services/activity.server";
 import { assertWithinPlan } from "~/services/billing.server";
@@ -64,102 +67,155 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 export default function StoresSettings() {
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
+  const shopify = useAppBridge();
   const result = fetcher.data as { ok?: boolean; message?: string; error?: string } | undefined;
   const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
   const failureMessage = useErrorMessage(result as Parameters<typeof useErrorMessage>[0]);
   const [name, setName] = useState(data.account?.name ?? "");
   const [code, setCode] = useState("");
+  const [confirm, setConfirm] = useState<"join" | "leave" | null>(null);
   const t = useT();
+  const busy = fetcher.state !== "idle";
+  const busyIntent = busy ? String(fetcher.formData?.get("intent") ?? "") : "";
+  const nameDirty = name.trim() !== (data.account?.name ?? "").trim();
+  const planName = data.account?.plan ?? "FREE";
+
+  const copyCode = async () => {
+    try {
+      await navigator.clipboard.writeText(data.joinCode);
+      shopify.toast.show(t("settings.stores.codeCopied"));
+    } catch {
+      shopify.toast.show(t("settings.stores.copyFailed"), { isError: true });
+    }
+  };
+
+  useSettingsPageAction({
+    content: t("settings.actions.save"),
+    onAction: () => fetcher.submit({ intent: "rename", name }, { method: "post" }),
+    loading: busyIntent === "rename",
+    disabled: !data.account || !nameDirty || (busy && busyIntent !== "rename"),
+  });
 
   return (
     <Layout>
-      <Layout.Section>
-        {actionMessage && (
-          <Banner tone="success">
-            <p>{actionMessage}</p>
-          </Banner>
-        )}
-        {failureMessage && (
-          <Banner tone="critical">
-            <p>{failureMessage}</p>
-          </Banner>
-        )}
-      </Layout.Section>
-      <Layout.Section variant="oneThird">
-        <BlockStack gap="400">
-          <Card>
-            <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                {t("settings.stores.account")}
-              </Text>
-              <Text as="p" tone="subdued" variant="bodySm">
-                {t("settings.stores.accountHelp")}
-              </Text>
-              <FormLayout>
-                <TextField label={t("settings.stores.accountName")} value={name} onChange={setName} autoComplete="off" />
-                <Button onClick={() => fetcher.submit({ intent: "rename", name }, { method: "post" })}>{t("action.rename")}</Button>
-                <TextField label={t("settings.stores.accountCodeShare")} value={data.joinCode} readOnly autoComplete="off" />
-              </FormLayout>
-            </BlockStack>
-          </Card>
-          <Card>
-            <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                {t("settings.stores.linkTitle")}
-              </Text>
-              <FormLayout>
-                <TextField label={t("settings.stores.accountCode")} value={code} onChange={setCode} autoComplete="off" />
-                <InlineStack gap="200">
-                  <Button variant="primary" disabled={!code.trim()} onClick={() => fetcher.submit({ intent: "join", code }, { method: "post" })}>
-                    {t("settings.stores.joinAccount")}
-                  </Button>
-                  {data.shops.length > 1 && (
-                    <Button tone="critical" onClick={() => fetcher.submit({ intent: "leave" }, { method: "post" })}>
-                      {t("settings.stores.leaveAccount")}
-                    </Button>
-                  )}
-                </InlineStack>
-              </FormLayout>
-            </BlockStack>
-          </Card>
-        </BlockStack>
-      </Layout.Section>
-      <Layout.Section>
+      {(actionMessage || failureMessage) && (
+        <Layout.Section>
+          {actionMessage && result?.ok && (
+            <Banner tone="success">
+              <p>{actionMessage}</p>
+            </Banner>
+          )}
+          {failureMessage && (
+            <Banner tone="critical" title={t("settings.stores.failed")}>
+              <p>{failureMessage}</p>
+            </Banner>
+          )}
+        </Layout.Section>
+      )}
+
+      <Layout.AnnotatedSection title={t("settings.stores.account")} description={t("settings.stores.accountHelp")}>
         <Card>
-          <BlockStack gap="300">
-            <Text as="h2" variant="headingMd">
-              {t("settings.stores.listTitle")} ({data.shops.length})
-            </Text>
+          <FormLayout>
+            <TextField label={t("settings.stores.accountName")} value={name} onChange={setName} autoComplete="off" disabled={!data.account} helpText={t("settings.stores.accountName.help")} />
+            <TextField
+              label={t("settings.stores.accountCodeShare")}
+              value={data.joinCode}
+              readOnly
+              autoComplete="off"
+              monospaced
+              connectedRight={<Button icon={ClipboardIcon} onClick={copyCode} accessibilityLabel={t("settings.stores.copyCode")} disabled={!data.joinCode} />}
+              helpText={t("settings.stores.accountCode.help")}
+            />
+            <InlineStack gap="200" blockAlign="center">
+              <Text as="span" tone="subdued" variant="bodySm">
+                {t("settings.stores.plan")}
+              </Text>
+              <Badge tone={planName === "FREE" ? undefined : "success"}>{planName}</Badge>
+            </InlineStack>
+          </FormLayout>
+        </Card>
+      </Layout.AnnotatedSection>
+
+      <Layout.AnnotatedSection title={t("settings.stores.linkTitle")} description={t("settings.stores.linkDescription")}>
+        <Card>
+          <FormLayout>
+            <TextField label={t("settings.stores.accountCode")} value={code} onChange={setCode} autoComplete="off" monospaced placeholder={t("settings.stores.accountCode.placeholder")} />
+            <InlineStack gap="200">
+              <Button variant="primary" disabled={!code.trim() || (busy && busyIntent !== "join")} loading={busyIntent === "join"} onClick={() => setConfirm("join")}>
+                {t("settings.stores.joinAccount")}
+              </Button>
+              {data.shops.length > 1 && (
+                <Button tone="critical" disabled={busy && busyIntent !== "leave"} loading={busyIntent === "leave"} onClick={() => setConfirm("leave")}>
+                  {t("settings.stores.leaveAccount")}
+                </Button>
+              )}
+            </InlineStack>
+          </FormLayout>
+        </Card>
+      </Layout.AnnotatedSection>
+
+      <Layout.Section>
+        <BlockStack gap="300">
+          <SectionHeader title={t("settings.stores.listTitle")} count={data.shops.length} />
+          <InlineGrid columns={{ xs: 1, sm: 2, lg: 3 }} gap="400">
             {data.shops.map((s) => (
-              <Box key={s.id} padding="300" borderColor="border" borderWidth="025" borderRadius="200">
-                <InlineStack align="space-between" blockAlign="center">
-                  <BlockStack gap="050">
-                    <InlineStack gap="200" blockAlign="center">
-                      <Text as="span" fontWeight="semibold">
+              <Card key={s.id} background={s.isCurrent ? "bg-surface-secondary" : undefined}>
+                <BlockStack gap="300">
+                  <BlockStack gap="100">
+                    <InlineStack align="space-between" blockAlign="center" gap="200" wrap={false}>
+                      <Text as="h3" variant="headingSm" truncate>
                         {s.name ?? s.domain}
                       </Text>
-                      {s.isCurrent && <Badge tone="success">{t("settings.stores.current")}</Badge>}
-                      {!s.isActive && <Badge tone="critical">{t("settings.stores.uninstalled")}</Badge>}
-                      <Badge>{s.currency}</Badge>
+                      {s.isCurrent ? <Badge tone="success">{t("settings.stores.current")}</Badge> : !s.isActive ? <Badge tone="critical">{t("settings.stores.uninstalled")}</Badge> : <Badge tone="info">{t("settings.stores.connected")}</Badge>}
                     </InlineStack>
-                    <Text as="p" tone="subdued" variant="bodySm">
+                    <Text as="p" tone="subdued" variant="bodySm" breakWord>
                       {s.domain}
                     </Text>
                   </BlockStack>
-                  {!s.isCurrent && s.isActive && (
-                    <Button size="slim" url={`https://${s.domain}/admin/apps`} external>
-                      {t("settings.stores.openStore")}
-                    </Button>
-                  )}
-                </InlineStack>
-              </Box>
+                  <InlineStack align="space-between" blockAlign="center">
+                    <InlineStack gap="100" blockAlign="center">
+                      <Text as="span" tone="subdued" variant="bodySm">
+                        {t("settings.stores.currency")}
+                      </Text>
+                      <Badge>{s.currency}</Badge>
+                    </InlineStack>
+                    {!s.isCurrent && s.isActive && (
+                      <Button size="slim" url={`https://${s.domain}/admin/apps`} external>
+                        {t("settings.stores.openStore")}
+                      </Button>
+                    )}
+                  </InlineStack>
+                </BlockStack>
+              </Card>
             ))}
+          </InlineGrid>
+          <Box>
             <Text as="p" tone="subdued" variant="bodySm">
-              {t("settings.stores.plan")}: {data.account?.plan ?? "FREE"} · {t("settings.stores.createdOn")} {formatDate(new Date())}
+              {t("settings.stores.listHelp")}
             </Text>
-          </BlockStack>
-        </Card>
+          </Box>
+        </BlockStack>
       </Layout.Section>
+
+      <Modal
+        open={confirm !== null}
+        onClose={() => setConfirm(null)}
+        title={confirm === "leave" ? t("settings.stores.leaveConfirm.title") : t("settings.stores.joinConfirm.title")}
+        primaryAction={{
+          content: confirm === "leave" ? t("settings.stores.leaveAccount") : t("settings.stores.joinAccount"),
+          destructive: confirm === "leave",
+          onAction: () => {
+            if (confirm === "leave") fetcher.submit({ intent: "leave" }, { method: "post" });
+            if (confirm === "join") fetcher.submit({ intent: "join", code }, { method: "post" });
+            setConfirm(null);
+          },
+        }}
+        secondaryActions={[{ content: t("action.cancel"), onAction: () => setConfirm(null) }]}
+      >
+        <Modal.Section>
+          <Text as="p">{confirm === "leave" ? t("settings.stores.leaveConfirm.body") : t("settings.stores.joinConfirm.body", { code: code.trim() })}</Text>
+        </Modal.Section>
+      </Modal>
     </Layout>
   );
 }

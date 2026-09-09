@@ -1,6 +1,7 @@
 import type { LoaderFunctionArgs } from "@remix-run/node";
 import { useLoaderData } from "@remix-run/react";
-import { Badge, BlockStack, Button, Card, InlineStack, Layout, List, Text } from "@shopify/polaris";
+import { Badge, BlockStack, Button, Card, DescriptionList, InlineStack, Layout, List, Text } from "@shopify/polaris";
+import { useSettingsPageAction } from "~/components/settings-page-action";
 import { requireShop } from "~/lib/auth.server";
 import { env } from "~/lib/env.server";
 import { useT } from "~/lib/use-t";
@@ -25,6 +26,10 @@ export default function SupportSettings() {
   const data = useLoaderData<typeof loader>();
   const t = useT();
   const subject = encodeURIComponent(`[DropshipHub] ${data.shopDomain}`);
+  const mailto = data.supportEmail ? `mailto:${data.supportEmail}?subject=${subject}` : null;
+
+  useSettingsPageAction(mailto ? { content: t("settings.support.emailUs"), url: mailto, external: true } : null);
+
   return (
     <Layout>
       <Layout.AnnotatedSection title={t("settings.support.title")} description={t("settings.support.description")}>
@@ -32,8 +37,8 @@ export default function SupportSettings() {
           <BlockStack gap="300">
             <Text as="p">{t("settings.support.body")}</Text>
             <InlineStack gap="200" wrap>
-              {data.supportEmail && (
-                <Button variant="primary" url={`mailto:${data.supportEmail}?subject=${subject}`} external>
+              {mailto && (
+                <Button variant="primary" url={mailto} external>
                   {t("settings.support.emailUs")}
                 </Button>
               )}
@@ -53,21 +58,40 @@ export default function SupportSettings() {
 
       <Layout.AnnotatedSection title={t("settings.support.include.title")} description={t("settings.support.include.description")}>
         <Card>
-          <BlockStack gap="300">
-            <List>
-              <List.Item>{t("settings.support.include.store", { store: data.shopDomain })}</List.Item>
-              <List.Item>{t("settings.support.include.order")}</List.Item>
-              <List.Item>{t("settings.support.include.screenshot")}</List.Item>
-            </List>
-            <InlineStack gap="200">
-              <Text as="span">{t("settings.advanced.supplierDriver")}</Text>
-              <Badge tone={data.supplierDriver === "live" ? "success" : "attention"}>{data.supplierDriver}</Badge>
-              <Text as="span">{t("settings.advanced.jobQueue")}</Text>
-              <Badge tone={data.queueMode === "redis" ? "success" : "attention"}>{data.queueMode}</Badge>
-              <Text as="span">{t("settings.advanced.email")}</Text>
-              <Badge tone={data.email === "none" ? "attention" : "success"}>{data.email === "none" ? t("common.disabled") : data.email}</Badge>
-            </InlineStack>
-          </BlockStack>
+          <List type="number">
+            <List.Item>{t("settings.support.include.store", { store: data.shopDomain })}</List.Item>
+            <List.Item>{t("settings.support.include.order")}</List.Item>
+            <List.Item>{t("settings.support.include.screenshot")}</List.Item>
+          </List>
+        </Card>
+      </Layout.AnnotatedSection>
+
+      <Layout.AnnotatedSection title={t("settings.support.environment.title")} description={t("settings.support.environment.description")}>
+        <Card>
+          <DescriptionList
+            items={[
+              {
+                term: t("settings.support.environment.store"),
+                description: (
+                  <Text as="span" fontWeight="semibold">
+                    {data.shopDomain}
+                  </Text>
+                ),
+              },
+              {
+                term: t("settings.advanced.supplierDriver"),
+                description: <Badge tone={data.supplierDriver === "live" ? "success" : "attention"}>{data.supplierDriver}</Badge>,
+              },
+              {
+                term: t("settings.advanced.jobQueue"),
+                description: <Badge tone={data.queueMode === "redis" ? "success" : "attention"}>{data.queueMode}</Badge>,
+              },
+              {
+                term: t("settings.advanced.email"),
+                description: <Badge tone={data.email === "none" ? "attention" : "success"}>{data.email === "none" ? t("common.disabled") : data.email}</Badge>,
+              },
+            ]}
+          />
         </Card>
       </Layout.AnnotatedSection>
     </Layout>
