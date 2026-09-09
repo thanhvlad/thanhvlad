@@ -13,6 +13,8 @@ import prisma from "./db.server";
 import { PAID_PLANS, PLANS } from "./domain/billing/plans";
 import { env } from "./lib/env.server";
 import { logger } from "./lib/logger.server";
+import { ensureWebhooks } from "./services/shopify/webhooks.server";
+import type { GraphqlClient } from "./services/shopify/graphql.server";
 import { onShopInstalled } from "./services/shop.server";
 
 const config = env();
@@ -89,6 +91,13 @@ const shopify = shopifyApp({
         await onShopInstalled({ session, admin });
       } catch (error) {
         logger.error("onShopInstalled failed", { shop: session.shop, error });
+      }
+      // See ensureWebhooks for why this exists despite the comment above: the
+      // toml was never deployed, so a new store has no subscriptions at all.
+      try {
+        await ensureWebhooks(session, admin.graphql as unknown as GraphqlClient, (options) => shopify.registerWebhooks(options));
+      } catch (error) {
+        logger.error("ensureWebhooks failed", { shop: session.shop, error });
       }
     },
   },

@@ -21,6 +21,15 @@ const schema = z.object({
     .string()
     .default("false")
     .transform((v) => v === "true" || v === "1"),
+  /**
+   * True once `shopify app deploy` has published the [webhooks] block of
+   * shopify.app.toml as app-level subscriptions. Until then each install
+   * registers its own shop-level ones; after, those are removed as duplicates.
+   */
+  WEBHOOKS_FROM_APP_CONFIG: z
+    .string()
+    .default("false")
+    .transform((v) => v === "true" || v === "1"),
 
   SUPPLIER_DRIVER: z.enum(["mock", "live"]).default("mock"),
 
