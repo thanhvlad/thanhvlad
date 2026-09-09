@@ -236,6 +236,17 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
  */
 const TOAST_KEYS = new Set(["msg.addressSaved", "msg.lineItemUpdated", "msg.trackingAdded", "msg.supplierOrderLinked", "msg.orderRechecked", "msg.refreshedFromShopify", "msg.retried"]);
 
+/**
+ * The banner's tone, from the outcome rather than from the fact that something
+ * happened. "12 synced, 3 failed" is not a success, and a declined fulfilment
+ * is not one either; both used to render green.
+ */
+function toneFor(messageKey: string | undefined): "success" | "info" | "warning" {
+  if (messageKey === "msg.trackingSyncedWithFailures") return "warning";
+  if (messageKey === "msg.fulfillmentDeclined") return "info";
+  return "success";
+}
+
 type ActionResult = { ok?: boolean; message?: string; messageKey?: string; messageVars?: Record<string, string | number>; error?: string; issues?: string[] };
 
 export default function OrderDetailPage() {
@@ -270,7 +281,11 @@ export default function OrderDetailPage() {
   const submit = (payload: Record<string, string>) => fetcher.submit(payload, { method: "post" });
 
   useEffect(() => {
-    if (fetcher.state === "idle" && quiet && actionMessage) shopify.toast.show(actionMessage);
+    // No `fetcher.state === "idle"` guard: the data lands while the fetcher is
+    // still revalidating, so the guard was never true when this ran and the
+    // quiet outcomes - saved address, ignored line, added tracking - gave the
+    // merchant no feedback at all.
+    if (quiet && actionMessage) shopify.toast.show(actionMessage);
     // Fire once per action result; `fetcher.data` is a new object per submission.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fetcher.data]);
@@ -305,7 +320,7 @@ export default function OrderDetailPage() {
         <Layout.Section>
           <BlockStack gap="400">
             {actionMessage && !quiet && (
-              <Banner tone="success">
+              <Banner tone={toneFor(result?.messageKey)}>
                 <p>{actionMessage}</p>
               </Banner>
             )}

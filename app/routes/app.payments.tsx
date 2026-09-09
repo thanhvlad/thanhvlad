@@ -195,7 +195,15 @@ export default function PaymentsPage() {
                   key={total.currency}
                   label={t("payments.stat.unpaidTotal", { currency: total.currency })}
                   value={formatMoney(total.amount, total.currency)}
-                  hint={queue.totals.length > 1 ? queue.totals.slice(1).map((extra) => formatMoney(extra.amount, extra.currency)).join(" · ") : t("payments.stat.orders", { n: total.count })}
+                  hint={
+                    queue.totals.length > 1
+                      ? // Every currency keeps its own order count; showing the
+                        // amounts alone lost the counts the old cards carried.
+                        queue.totals
+                          .map((each) => `${formatMoney(each.amount, each.currency)} (${t("payments.stat.orders", { n: each.count })})`)
+                          .join(" · ")
+                      : t("payments.stat.orders", { n: total.count })
+                  }
                 />
               ))}
               <Stat
@@ -216,6 +224,29 @@ export default function PaymentsPage() {
                 tone={queue.overdue > 0 ? "critical" : queue.overdue === 0 && hasDeadlines ? "success" : "subdued"}
               />
             </InlineGrid>
+          </Layout.Section>
+        )}
+
+        {queue.byPlatform.length > 0 && (
+          <Layout.Section>
+            {/* How much is waiting on each supplier, which the stat strip cannot
+                say. The old screen carried this beside each platform badge; a
+                merchant paying two platforms needs to know which one is behind. */}
+            <Card>
+              <InlineStack gap="400" wrap blockAlign="center">
+                {queue.byPlatform.map((p) => (
+                  <InlineStack key={p.platform} gap="150" blockAlign="center">
+                    <PlatformBadge platform={p.platform} />
+                    <Text as="span" variant="bodySm" numeric>
+                      {p.count}
+                    </Text>
+                    <Text as="span" variant="bodySm" tone="subdued">
+                      {t("payments.unpaid")}
+                    </Text>
+                  </InlineStack>
+                ))}
+              </InlineStack>
+            </Card>
           </Layout.Section>
         )}
 
