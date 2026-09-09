@@ -1,12 +1,12 @@
-import type { LoaderFunctionArgs } from "@remix-run/node";
+import { json, type LoaderFunctionArgs } from "@remix-run/node";
 import { requireShop } from "~/lib/auth.server";
 import { getJobRun } from "~/services/jobs.server";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
   const job = await getJobRun(shop.id, params.id!);
-  if (!job) return Response.json({ error: "not found" }, { status: 404 });
-  return Response.json({
+  if (!job) return json({ error: "not found" }, { status: 404 });
+  return json({
     id: job.id,
     type: job.type,
     status: job.status,

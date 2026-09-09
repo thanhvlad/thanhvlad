@@ -1,4 +1,4 @@
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
+import { json, type ActionFunctionArgs, type LoaderFunctionArgs } from "@remix-run/node";
 import { logger } from "~/lib/logger.server";
 
 /**
@@ -14,9 +14,9 @@ import { logger } from "~/lib/logger.server";
 function respond(request: Request) {
   const path = new URL(request.url).pathname;
   logger.debug("Fulfilment service callback", { path, method: request.method });
-  if (path.endsWith("/fetch_stock")) return Response.json({});
-  if (path.endsWith("/fetch_tracking_numbers")) return Response.json({ message: "Tracking is pushed by the app", tracking_numbers: {} });
-  return Response.json({ ok: true });
+  if (path.endsWith("/fetch_stock")) return json({});
+  if (path.endsWith("/fetch_tracking_numbers")) return json({ message: "Tracking is pushed by the app", tracking_numbers: {} });
+  return json({ ok: true });
 }
 
 export const loader = ({ request }: LoaderFunctionArgs) => respond(request);

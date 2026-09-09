@@ -83,9 +83,18 @@ function drift(seed: string, amplitude: number): number {
   return ((h / 1000) * 2 - 1) * amplitude;
 }
 
+/**
+ * Placeholder swatches as plain hex. The previous form interpolated an
+ * `hsl(h,55%,55%)` string straight into the path, so every url carried raw
+ * parentheses, commas and - worst - `%` characters that are not valid percent
+ * escapes. Shopify's productSet rejected all of them with "File URL is
+ * invalid", which meant no mock product could ever be published.
+ */
+const SWATCHES = ["4f7cac", "c1666b", "48a9a6", "d4b483", "8a6fbf", "5b8c5a", "c9784e", "3e6680"];
+
 function image(productId: string, index: number): string {
-  const hue = hash(`${productId}:${index}`) % 360;
-  return `https://placehold.co/800x800/hsl(${hue},55%,55%)/white.png?text=${encodeURIComponent(`${productId}-${index + 1}`)}`;
+  const swatch = SWATCHES[hash(`${productId}:${index}`) % SWATCHES.length];
+  return `https://placehold.co/800x800/${swatch}/white.png?text=${encodeURIComponent(`${productId}-${index + 1}`)}`;
 }
 
 function cartesian(options: Array<{ name: string; values: string[] }>): string[][] {
