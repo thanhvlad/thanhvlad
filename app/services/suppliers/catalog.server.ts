@@ -183,6 +183,18 @@ export async function fetchAndCacheByReference(
   return { product, detail };
 }
 
+/**
+ * True when the mock adapter invented this product rather than serving one from
+ * its catalogue. The mock answers ANY numeric id so that pasting a URL "works"
+ * in development, which means a refresh under SUPPLIER_DRIVER=mock will happily
+ * replace a real product - one the extension read off the supplier's own page -
+ * with `Sample product <id>`, a hash-derived price and Black/White options.
+ * That is silent data loss on a live catalogue, so it is refused below.
+ */
+function isMockSynthetic(raw: unknown): boolean {
+  return Boolean(raw && typeof raw === "object" && (raw as { mockSynthetic?: unknown }).mockSynthetic === true);
+}
+
 /** Re-read a cached supplier product from upstream. Returns null if it vanished. */
 export async function refreshSupplierProduct(
   shopId: string,
@@ -198,6 +210,24 @@ export async function refreshSupplierProduct(
       await prisma.supplierVariant.updateMany({ where: { supplierProductId: existing.id }, data: { isAvailable: false, stock: 0 } });
       return null;
     }
+    // A product the mock invented must never overwrite one stored under a real
+    // platform. Note the write below deliberately restores `existing.platform`,
+    // so without this guard the substitution leaves no trace: an ALIEXPRESS row
+    // silently becomes mock data still labelled ALIEXPRESS.
+    if (isMockSynthetic(detail.raw) && existing.platform !== "MOCK") {
+      logger.warn("Refusing to overwrite a real supplier product with mock data", {
+        supplierProductId,
+        platform: existing.platform,
+        externalId: existing.externalId,
+      });
+      const unchanged = await prisma.supplierProduct.update({
+        where: { id: existing.id },
+        data: { lastFetchedAt: new Date() },
+        include: { variants: true },
+      });
+      return { product: unchanged, detail: { ...detail, title: existing.title } };
+    }
+
     const product = await cacheSupplierProduct({ ...detail, platform: existing.platform }, account?.id ?? existing.supplierAccountId);
     return { product, detail };
   } catch (error) {

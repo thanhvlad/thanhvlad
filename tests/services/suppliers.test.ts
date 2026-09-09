@@ -70,6 +70,22 @@ describe("MockSupplierAdapter", () => {
 });
 
 describe("supplier registry", () => {
+  it("marks a product it invented, so a refresh can refuse to store it", async () => {
+    const mock = getAdapter("MOCK");
+    // A seeded catalogue product is legitimate mock data.
+    const seeded = await mock.getProduct("1005006001");
+    expect(seeded).not.toBeNull();
+    expect((seeded!.raw as { mockSynthetic?: boolean } | undefined)?.mockSynthetic).toBeUndefined();
+
+    // An id the catalogue does not know is invented on the spot. Unmarked, this
+    // is what silently replaced real extension-captured products with
+    // "Sample product <id>" on every inventory sync.
+    const invented = await mock.getProduct("1005012312204978");
+    expect(invented).not.toBeNull();
+    expect(invented!.title).toContain("Sample product");
+    expect((invented!.raw as { mockSynthetic?: boolean } | undefined)?.mockSynthetic).toBe(true);
+  });
+
   it("serves the mock adapter for every platform in mock mode", () => {
     expect(getAdapter("ALIEXPRESS").platform).toBe("MOCK");
     expect(getAdapter("CJ_DROPSHIPPING").platform).toBe("MOCK");

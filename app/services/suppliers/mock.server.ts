@@ -247,7 +247,10 @@ export class MockSupplierAdapter implements SupplierAdapter {
         rating: 4.3,
         orders: hash(externalId) % 5000,
       };
-      return buildProduct(synthetic);
+      // Tagged so a refresh can tell an invented product from a catalogue one.
+      // Without this marker the 60-minute inventory sync overwrites a real,
+      // extension-captured product with `Sample product <id>` and never says so.
+      return { ...buildProduct(synthetic), raw: { mockSynthetic: true } };
     }
     return null;
   }
