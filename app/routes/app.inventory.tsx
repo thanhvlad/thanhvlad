@@ -1,15 +1,20 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { useFetcher, useLoaderData } from "@remix-run/react";
+import { useAppBridge } from "@shopify/app-bridge-react";
 import type { PriceChangeAction, StockChangeAction } from "@prisma/client";
-import { Badge, Banner, BlockStack, Box, Button, Card, Checkbox, DataTable, FormLayout, InlineStack, Layout, Page, Select, Text, TextField } from "@shopify/polaris";
+import { Banner, BlockStack, Button, Card, Checkbox, DataTable, FormLayout, InlineGrid, InlineStack, Layout, List, Page, Select, Text, TextField } from "@shopify/polaris";
+import { EmptyScreen } from "~/components/EmptyScreen";
 import { JobProgress } from "~/components/JobProgress";
-import { useJobRun } from "~/lib/use-job-run";
+import { SectionHeader } from "~/components/SectionHeader";
+import { Stat } from "~/components/Stat";
 import { StatusBadge } from "~/components/StatusBadge";
+import { useJobRun } from "~/lib/use-job-run";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
-import { formatDate, relativeTime } from "~/lib/format";
-import { useMessage, useT } from "~/lib/use-t";
+import type { I18nKey } from "~/lib/i18n";
+import { formatDate, formatMoney, relativeTime, truncate } from "~/lib/format";
+import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
 import { getInventoryPolicy, runInventorySync, updateInventoryPolicy } from "~/services/inventory-sync.server";
 import { createJobRun, listJobRuns } from "~/services/jobs.server";
 import { enqueue } from "~/services/jobs/index.server";
@@ -19,6 +24,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
   const [policy, runs, counts] = await Promise.all([getInventoryPolicy(shop.id), listJobRuns(shop.id, { type: "inventory-sync", limit: 10 }), countProducts(shop.id)]);
   return {
+    currency: shop.currency,
     policy: {
       isEnabled: policy.isEnabled,
       priceAction: policy.priceAction,
@@ -70,63 +76,112 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 };
 
+type ActionResult = { ok?: boolean; error?: string; messageKey?: string; jobRunId?: string; dryRun?: DryRun };
+type DryRun = { summary: { productsChecked: number; suppliersRefreshed: number; suppliersFailed: number; errors: string[] }; actions: DryRunAction[] };
+type DryRunAction = { type: string; variant: string; reason: string; price: string | null; quantity: number | null };
+
+/** A job's stored result is untyped JSON; only numbers that are really there count. */
+function num(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** The dry run lists every planned change; the table shows this many before it stops. */
+const DRY_RUN_ROWS = 200;
+
 export default function InventoryPage() {
   const t = useT();
+  const shopify = useAppBridge();
   const data = useLoaderData<typeof loader>();
-  const fetcher = useFetcher<typeof action>();
-  const result = fetcher.data as { message?: string; error?: string; jobRunId?: string; dryRun?: { summary: Record<string, unknown>; actions: Array<{ type: string; variant: string; reason: string; price: string | null; quantity: number | null }> } } | undefined;
-  const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
-  const [form, setForm] = useState({ ...data.policy, priceThresholdPercent: data.policy.priceThresholdPercent, lowStockThreshold: String(data.policy.lowStockThreshold), maxInventoryPushed: String(data.policy.maxInventoryPushed), syncIntervalMinutes: String(data.policy.syncIntervalMinutes) });
-  const { jobRunId, clearJobRun } = useJobRun(result);
+
+  // One fetcher per action, so "Run now" does not spin while a policy saves and
+  // a dry run does not wipe the progress of a real run.
+  const saveFetcher = useFetcher<typeof action>();
+  const runFetcher = useFetcher<typeof action>();
+  const dryRunFetcher = useFetcher<typeof action>();
+  const saveResult = saveFetcher.data as ActionResult | undefined;
+  const runResult = runFetcher.data as ActionResult | undefined;
+  const dryRunResult = dryRunFetcher.data as ActionResult | undefined;
+
+  const saveMessage = useMessage(saveResult);
+  const saveError = useErrorMessage(saveResult);
+  const runError = useErrorMessage(runResult);
+  const dryRunError = useErrorMessage(dryRunResult);
+  const { jobRunId, clearJobRun } = useJobRun(runResult);
+
+  const initialForm = { ...data.policy, priceThresholdPercent: data.policy.priceThresholdPercent, lowStockThreshold: String(data.policy.lowStockThreshold), maxInventoryPushed: String(data.policy.maxInventoryPushed), syncIntervalMinutes: String(data.policy.syncIntervalMinutes) };
+  const [form, setForm] = useState(initialForm);
+  const dirty = JSON.stringify(form) !== JSON.stringify(initialForm);
+
+  // "Saved." is a toast, not a banner: it needs no reading. Keyed on the data
+  // object so a second save with the same wording still confirms.
+  useEffect(() => {
+    if (saveFetcher.state === "idle" && saveResult?.ok && saveMessage) shopify.toast.show(saveMessage);
+  }, [saveFetcher.state, saveResult, saveMessage, shopify]);
+
+  const runNow = () => runFetcher.submit({ intent: "run" }, { method: "post" });
+  const previewChanges = () => dryRunFetcher.submit({ intent: "dry-run" }, { method: "post" });
+  const savePolicy = () => saveFetcher.submit({ intent: "save", ...form, isEnabled: String(form.isEnabled) }, { method: "post" });
+
+  const lastRun = data.runs[0];
+  const checked = num(lastRun?.result?.productsChecked);
+  const priceUpdates = num(lastRun?.result?.priceUpdates);
+  const stockUpdates = num(lastRun?.result?.inventoryUpdates);
+  const unpublished = num(lastRun?.result?.unpublished);
+  const changes = checked === null ? null : (priceUpdates ?? 0) + (stockUpdates ?? 0) + (unpublished ?? 0);
+
+  const dryRun = dryRunResult?.dryRun;
+  const errors = [saveError, runError, dryRunError].filter((e): e is string => Boolean(e));
 
   return (
     <Page
       title={t("page.inventory.title")}
-      subtitle={`${data.counts.autoUpdate}/${data.counts.total} ${t("inventory.subtitle.onAutoUpdate")} · ${t("inventory.subtitle.lastRun")} ${relativeTime(data.policy.lastRunAt)}`}
-      primaryAction={{ content: t("inventory.runNow"), onAction: () => fetcher.submit({ intent: "run" }, { method: "post" }), loading: fetcher.state !== "idle" }}
-      secondaryActions={[{ content: t("inventory.previewChanges"), onAction: () => fetcher.submit({ intent: "dry-run" }, { method: "post" }) }]}
+      subtitle={t("inventory.subtitle")}
+      primaryAction={{ content: t("inventory.runNow"), onAction: runNow, loading: runFetcher.state !== "idle", disabled: Boolean(jobRunId) }}
+      secondaryActions={[{ content: t("inventory.previewChanges"), onAction: previewChanges, loading: dryRunFetcher.state !== "idle" }]}
     >
       <Layout>
         <Layout.Section>
-          <JobProgress jobRunId={jobRunId} onDone={clearJobRun} />
-          {actionMessage && (
-            <Banner tone="success">
-              <p>{actionMessage}</p>
-            </Banner>
-          )}
-          {result?.error && (
-            <Banner tone="critical">
-              <p>{result.error}</p>
-            </Banner>
-          )}
-          {result?.dryRun && (
-            <Card>
-              <BlockStack gap="200">
-                <Text as="h2" variant="headingMd">
-                  {`${t("inventory.dryRun.title")}: ${result.dryRun.actions.length} ${t("inventory.dryRun.changesApplied")}`}
-                </Text>
-                <Text as="p" tone="subdued" variant="bodySm">
-                  {`${String(result.dryRun.summary.productsChecked)} ${t("inventory.dryRun.productsChecked")} · ${String(result.dryRun.summary.suppliersRefreshed)} ${t("inventory.dryRun.suppliersRefreshed")} · ${String(result.dryRun.summary.suppliersFailed)} ${t("inventory.dryRun.failed")}`}
-                </Text>
-                {result.dryRun.actions.length > 0 && (
-                  <DataTable columnContentTypes={["text", "text", "text"]} headings={[t("inventory.table.action"), t("inventory.table.variant"), t("inventory.table.reason")]} rows={result.dryRun.actions.slice(0, 200).map((a) => [a.type, a.variant.split("/").pop() ?? a.variant, a.reason])} />
-                )}
-              </BlockStack>
-            </Card>
-          )}
+          <BlockStack gap="400">
+            <JobProgress jobRunId={jobRunId} onDone={clearJobRun} />
+            {errors.map((error) => (
+              <Banner key={error} tone="critical">
+                <p>{error}</p>
+              </Banner>
+            ))}
+
+            <InlineGrid columns={{ xs: 1, sm: 2, md: 4 }} gap="400">
+              <Stat
+                label={t("inventory.stat.lastRun")}
+                value={data.policy.lastRunAt ? relativeTime(data.policy.lastRunAt) : t("inventory.stat.never")}
+                hint={data.policy.isEnabled ? t("inventory.stat.checksEvery", { n: data.policy.syncIntervalMinutes }) : t("inventory.stat.autoOff")}
+                tone={data.policy.isEnabled ? "default" : "warning"}
+              />
+              <Stat label={t("inventory.stat.onAutoUpdate")} value={String(data.counts.autoUpdate)} hint={t("inventory.stat.ofTotal", { n: data.counts.total })} />
+              {checked !== null && <Stat label={t("inventory.stat.checked")} value={String(checked)} hint={t("inventory.stat.inLastRun")} />}
+              {changes !== null && (
+                <Stat
+                  label={t("inventory.stat.changes")}
+                  value={String(changes)}
+                  hint={t("inventory.stat.changesHint", { price: priceUpdates ?? 0, stock: stockUpdates ?? 0, unpublished: unpublished ?? 0 })}
+                  tone={changes > 0 ? "success" : "default"}
+                />
+              )}
+            </InlineGrid>
+
+            {dryRun && <DryRunCard dryRun={dryRun} currency={data.currency} />}
+          </BlockStack>
         </Layout.Section>
 
         <Layout.Section>
           <Card>
             <BlockStack gap="400">
-              <InlineStack align="space-between" blockAlign="center">
-                <Text as="h2" variant="headingMd">
-                  {t("inventory.policy")}
-                </Text>
-                <Checkbox label={t("inventory.autoSyncEnabled")} checked={form.isEnabled} onChange={(v) => setForm({ ...form, isEnabled: v })} />
-              </InlineStack>
+              <SectionHeader title={t("inventory.policy")} />
+              <Text as="p" tone="subdued">
+                {t("inventory.policy.help")}
+              </Text>
               <FormLayout>
-                <FormLayout.Group>
+                <Checkbox label={t("inventory.autoSyncEnabled")} helpText={t("inventory.enabledHelp")} checked={form.isEnabled} onChange={(v) => setForm({ ...form, isEnabled: v })} />
+                <FormLayout.Group title={t("inventory.form.priceRules")}>
                   <Select
                     label={t("inventory.priceAction.label")}
                     value={form.priceAction}
@@ -137,9 +192,9 @@ export default function InventoryPage() {
                       { label: t("inventory.action.doNothing"), value: "DO_NOTHING" },
                     ]}
                   />
-                  <TextField label={t("inventory.priceThreshold")} type="number" value={form.priceThresholdPercent} onChange={(v) => setForm({ ...form, priceThresholdPercent: v })} autoComplete="off" />
+                  <TextField label={t("inventory.priceThreshold")} type="number" min={0} suffix="%" value={form.priceThresholdPercent} onChange={(v) => setForm({ ...form, priceThresholdPercent: v })} autoComplete="off" />
                 </FormLayout.Group>
-                <FormLayout.Group>
+                <FormLayout.Group title={t("inventory.form.stockRules")}>
                   <Select
                     label={t("inventory.stockAction.label")}
                     value={form.stockAction}
@@ -152,10 +207,10 @@ export default function InventoryPage() {
                       { label: t("inventory.action.doNothing"), value: "DO_NOTHING" },
                     ]}
                   />
-                  <TextField label={t("inventory.lowStockThreshold")} type="number" value={form.lowStockThreshold} onChange={(v) => setForm({ ...form, lowStockThreshold: v })} autoComplete="off" />
-                  <TextField label={t("inventory.maxInventoryPushed")} type="number" value={form.maxInventoryPushed} onChange={(v) => setForm({ ...form, maxInventoryPushed: v })} autoComplete="off" />
+                  <TextField label={t("inventory.lowStockThreshold")} type="number" min={0} value={form.lowStockThreshold} onChange={(v) => setForm({ ...form, lowStockThreshold: v })} autoComplete="off" />
+                  <TextField label={t("inventory.maxInventoryPushed")} type="number" min={0} value={form.maxInventoryPushed} onChange={(v) => setForm({ ...form, maxInventoryPushed: v })} autoComplete="off" />
                 </FormLayout.Group>
-                <FormLayout.Group>
+                <FormLayout.Group title={t("inventory.form.schedule")}>
                   <Select
                     label={t("inventory.onRemoved.label")}
                     value={form.onProductRemoved}
@@ -167,11 +222,13 @@ export default function InventoryPage() {
                       { label: t("inventory.action.doNothing"), value: "DO_NOTHING" },
                     ]}
                   />
-                  <TextField label={t("inventory.syncInterval")} type="number" value={form.syncIntervalMinutes} onChange={(v) => setForm({ ...form, syncIntervalMinutes: v })} autoComplete="off" helpText={t("inventory.syncIntervalHelp")} />
+                  <TextField label={t("inventory.syncInterval")} type="number" min={30} value={form.syncIntervalMinutes} onChange={(v) => setForm({ ...form, syncIntervalMinutes: v })} autoComplete="off" helpText={t("inventory.syncIntervalHelp")} />
                 </FormLayout.Group>
-                <Button variant="primary" onClick={() => fetcher.submit({ intent: "save", ...form, isEnabled: String(form.isEnabled) }, { method: "post" })} loading={fetcher.state !== "idle"}>
-                  {t("inventory.savePolicy")}
-                </Button>
+                <InlineStack align="end">
+                  <Button variant="primary" onClick={savePolicy} loading={saveFetcher.state !== "idle"} disabled={!dirty}>
+                    {t("inventory.savePolicy")}
+                  </Button>
+                </InlineStack>
               </FormLayout>
             </BlockStack>
           </Card>
@@ -179,46 +236,108 @@ export default function InventoryPage() {
 
         <Layout.Section>
           <Card>
-            <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                {t("inventory.recentRuns")}
-              </Text>
-              {data.runs.length === 0 && (
-                <Text as="p" tone="subdued">
-                  {t("inventory.noRuns")}
-                </Text>
-              )}
-              {data.runs.map((run) => (
-                <Box key={run.id} padding="200" borderColor="border" borderWidth="025" borderRadius="200">
-                  <InlineStack align="space-between" blockAlign="center" wrap>
-                    <InlineStack gap="200" blockAlign="center">
-                      <StatusBadge status={run.status} />
-                      <Text as="span" variant="bodySm">
-                        {formatDate(run.startedAt ?? run.finishedAt)}
+            <BlockStack gap="400">
+              <SectionHeader title={t("inventory.recentRuns")} />
+              {data.runs.length === 0 ? (
+                <EmptyScreen compact heading={t("inventory.runs.empty.heading")} body={t("inventory.runs.empty.body")} action={{ content: t("inventory.runNow"), onAction: runNow }} />
+              ) : (
+                <DataTable
+                  columnContentTypes={["text", "text", "text", "numeric", "numeric", "numeric", "numeric", "numeric", "text"]}
+                  headings={[
+                    t("inventory.runs.started"),
+                    t("common.status"),
+                    t("inventory.runs.duration"),
+                    t("inventory.runs.checked"),
+                    t("inventory.runs.priceUpdates"),
+                    t("inventory.runs.stockUpdates"),
+                    t("inventory.runs.unpublished"),
+                    t("inventory.runs.suppliersFailed"),
+                    t("inventory.runs.notes"),
+                  ]}
+                  rows={data.runs.map((run) => [
+                    formatDate(run.startedAt ?? run.finishedAt),
+                    <StatusBadge key={`${run.id}-status`} status={run.status} />,
+                    formatDuration(run.startedAt, run.finishedAt, t),
+                    num(run.result?.productsChecked) ?? "—",
+                    num(run.result?.priceUpdates) ?? "—",
+                    num(run.result?.inventoryUpdates) ?? "—",
+                    num(run.result?.unpublished) ?? "—",
+                    num(run.result?.suppliersFailed) ?? "—",
+                    run.error ? (
+                      <Text key={`${run.id}-error`} as="span" tone="critical" variant="bodySm">
+                        {truncate(run.error, 80)}
                       </Text>
-                    </InlineStack>
-                    <InlineStack gap="100">
-                      {run.result && typeof run.result.productsChecked === "number" && (
-                        <>
-                          <Badge>{`${run.result.productsChecked} ${t("inventory.badge.checked")}`}</Badge>
-                          <Badge tone="info">{`${run.result.priceUpdates} ${t("inventory.badge.price")}`}</Badge>
-                          <Badge tone="warning">{`${run.result.inventoryUpdates} ${t("inventory.badge.stock")}`}</Badge>
-                          <Badge tone="critical">{`${run.result.unpublished} ${t("inventory.badge.unpublished")}`}</Badge>
-                        </>
-                      )}
-                      {run.error && (
-                        <Text as="span" tone="critical" variant="bodySm">
-                          {run.error}
-                        </Text>
-                      )}
-                    </InlineStack>
-                  </InlineStack>
-                </Box>
-              ))}
+                    ) : (
+                      ""
+                    ),
+                  ])}
+                />
+              )}
             </BlockStack>
           </Card>
         </Layout.Section>
       </Layout>
     </Page>
   );
+}
+
+/**
+ * What the next run would do, from a dry run. Nothing here has happened yet,
+ * and the card says so before it shows the figures.
+ */
+function DryRunCard({ dryRun, currency }: { dryRun: DryRun; currency: string }) {
+  const t = useT();
+  const { summary, actions } = dryRun;
+  return (
+    <Card>
+      <BlockStack gap="400">
+        <SectionHeader title={t("inventory.dryRun.title")} count={actions.length} />
+        <Text as="p" tone="subdued">
+          {t("inventory.dryRun.help")}
+        </Text>
+        <InlineGrid columns={{ xs: 1, sm: 3 }} gap="400">
+          <Stat plain size="medium" label={t("inventory.stat.checked")} value={String(summary.productsChecked)} />
+          <Stat plain size="medium" label={t("inventory.stat.suppliersRefreshed")} value={String(summary.suppliersRefreshed)} />
+          <Stat plain size="medium" label={t("inventory.runs.suppliersFailed")} value={String(summary.suppliersFailed)} tone={summary.suppliersFailed > 0 ? "critical" : "default"} />
+        </InlineGrid>
+        {summary.errors.length > 0 && (
+          <Banner tone="warning">
+            <List>
+              {summary.errors.map((error, i) => (
+                <List.Item key={i}>{error}</List.Item>
+              ))}
+            </List>
+          </Banner>
+        )}
+        {actions.length === 0 ? (
+          <EmptyScreen compact heading={t("inventory.dryRun.nothing")} body={t("inventory.dryRun.nothingBody")} />
+        ) : (
+          <DataTable
+            columnContentTypes={["text", "text", "numeric", "numeric", "text"]}
+            headings={[t("inventory.table.action"), t("inventory.table.variant"), t("inventory.table.newPrice"), t("inventory.table.newQuantity"), t("inventory.table.reason")]}
+            rows={actions.slice(0, DRY_RUN_ROWS).map((a) => [
+              t(`inventory.actionType.${a.type}` as I18nKey) ?? a.type,
+              a.variant.split("/").pop() ?? a.variant,
+              a.price === null ? "—" : formatMoney(a.price, currency),
+              a.quantity === null ? "—" : a.quantity,
+              a.reason,
+            ])}
+          />
+        )}
+        {actions.length > DRY_RUN_ROWS && (
+          <Text as="p" tone="subdued" variant="bodySm">
+            {t("inventory.dryRun.truncated", { n: DRY_RUN_ROWS, total: actions.length })}
+          </Text>
+        )}
+      </BlockStack>
+    </Card>
+  );
+}
+
+function formatDuration(startedAt: string | null, finishedAt: string | null, t: ReturnType<typeof useT>): string {
+  if (!startedAt || !finishedAt) return "—";
+  const ms = new Date(finishedAt).getTime() - new Date(startedAt).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return "—";
+  const seconds = Math.round(ms / 1000);
+  return seconds < 60 ? t("inventory.runs.seconds", { n: seconds }) : t("inventory.runs.minutes", { n: Math.round(seconds / 60) });
 }
