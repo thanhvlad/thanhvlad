@@ -51,7 +51,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { shop, graphql, actor } = await requireShop(request);
+  const { shop, graphql, actor } = await requireShop(request, { minRole: "ADMIN" });
   const { intent } = await readForm(request);
   try {
     switch (intent) {

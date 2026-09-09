@@ -39,7 +39,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { shop, billing, actor } = await requireShop(request);
+  const { shop, billing, actor } = await requireShop(request, { minRole: "OWNER" });
   const { intent, get } = await readForm(request);
   const account = await getAccountBilling(shop);
   try {

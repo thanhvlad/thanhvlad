@@ -45,6 +45,12 @@ const shopify = shopifyApp({
   authPathPrefix: "/auth",
   sessionStorage: new PrismaSessionStorage(prisma),
   distribution: AppDistribution.AppStore,
+  // Identify the Shopify staff member behind each request. Without this every
+  // action was attributed to "merchant", the activity log could not say who
+  // did what, and the roles on the Staff page were decoration - there was
+  // nobody to apply them to. Token exchange still stores the offline session
+  // first, so background jobs and webhooks are unaffected.
+  useOnlineTokens: true,
   billing,
   future: {
     unstable_newEmbeddedAuthStrategy: true,

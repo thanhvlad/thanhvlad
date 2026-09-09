@@ -16,7 +16,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { shop } = await requireShop(request);
+  const { shop } = await requireShop(request, { minRole: "OWNER" });
   const { intent, get } = await readForm(request);
   if (!shop.accountId) return { ok: false, error: "Shop has no account." };
   try {

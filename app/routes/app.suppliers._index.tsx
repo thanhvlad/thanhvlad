@@ -29,7 +29,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { shop } = await requireShop(request);
+  const { shop } = await requireShop(request, { minRole: "ADMIN" });
   const { intent, get } = await readForm(request);
   const platform = get("platform") as SupplierPlatform;
   try {
