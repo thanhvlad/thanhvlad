@@ -9,9 +9,11 @@
  * Add a key to `en`, then to `vi`. `npm run typecheck` will not let a key exist
  * in `vi` that is missing from `en`.
  */
+import * as M from "./i18n-modules";
+
 export type Locale = "en" | "vi";
 
-const en = {
+const coreEn = {
   // ---- Navigation ---------------------------------------------------------
   "nav.home": "Home",
   "nav.search": "Find products",
@@ -1039,9 +1041,7 @@ const en = {
   "email.footer": "You receive this because a notification email is set under Settings → General → Notifications for {shop}. Clear that field to stop these emails.",
 } as const;
 
-export type I18nKey = keyof typeof en;
-
-const vi: Partial<Record<I18nKey, string>> = {
+const coreVi: Partial<Record<keyof typeof coreEn, string>> = {
   "nav.home": "Trang chủ",
   "nav.search": "Tìm sản phẩm",
   "nav.import": "Danh sách nhập",
@@ -2062,6 +2062,15 @@ const vi: Partial<Record<I18nKey, string>> = {
   "email.openButton": "Mở thông báo",
   "email.footer": "Bạn nhận email này vì đã đặt email nhận thông báo trong Cài đặt → Chung → Thông báo cho {shop}. Xoá ô đó để ngừng nhận.",
 };
+
+// The core dictionaries above plus one module per screen group. Spreading
+// `as const` objects keeps every key literal, so I18nKey still covers all of
+// them and a typo in a call site is still a compile error.
+const en = { ...coreEn, ...M.dashboard.en, ...M.search.en, ...M.import.en, ...M.products.en, ...M.orders.en, ...M.payments.en, ...M.tracking.en, ...M.suppliers.en, ...M.pricing.en, ...M.shipping.en, ...M.inventory.en, ...M.reports.en, ...M.notifications.en, ...M.logs.en, ...M.settings.en, ...M.shared.en } as const;
+
+export type I18nKey = keyof typeof en;
+
+const vi: Partial<Record<I18nKey, string>> = { ...coreVi, ...M.dashboard.vi, ...M.search.vi, ...M.import.vi, ...M.products.vi, ...M.orders.vi, ...M.payments.vi, ...M.tracking.vi, ...M.suppliers.vi, ...M.pricing.vi, ...M.shipping.vi, ...M.inventory.vi, ...M.reports.vi, ...M.notifications.vi, ...M.logs.vi, ...M.settings.vi, ...M.shared.vi };
 
 const dictionaries: Record<Locale, Partial<Record<I18nKey, string>>> = { en, vi };
 
