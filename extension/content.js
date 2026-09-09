@@ -82,8 +82,14 @@ async function send(button, msg) {
     return;
   }
 
+  // Heal a value saved before options.js validated it: without a scheme the
+  // string is a RELATIVE url, so the browser looks inside the extension and
+  // the only symptom is a bare "Failed to fetch".
+  const base = (/^https?:\/\//i.test(appUrl) ? appUrl : `https://${appUrl}`).replace(/\/+$/, "");
+  const endpoint = `${base}${ENDPOINT}`;
+
   try {
-    const response = await fetch(`${appUrl.replace(/\/$/, "")}${ENDPOINT}`, {
+    const response = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
       body: JSON.stringify({ url: location.href }),
@@ -108,7 +114,7 @@ async function send(button, msg) {
     }
   } catch (error) {
     msg.className = "msg err";
-    msg.textContent = error.message;
+    msg.textContent = `${error.message} — called ${endpoint}. Check the app URL in the extension options.`;
     button.disabled = false;
   }
 }

@@ -29,12 +29,14 @@ function looksLikeProduct(url) {
     status.innerHTML = '<span class="err">Set the app URL and token in options.</span>';
     return;
   }
+  const base = (/^https?:\/\//i.test(appUrl) ? appUrl : `https://${appUrl}`).replace(/\/+$/, "");
+  const endpoint = `${base}/api/extension/capture`;
   button.disabled = false;
   button.addEventListener("click", async () => {
     button.disabled = true;
     status.textContent = "Sending…";
     try {
-      const response = await fetch(`${appUrl.replace(/\/$/, "")}/api/extension/capture`, {
+      const response = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({ url }),
@@ -47,7 +49,8 @@ function looksLikeProduct(url) {
         button.disabled = false;
       }
     } catch (error) {
-      status.innerHTML = `<span class="err">${error.message}</span>`;
+      // "Failed to fetch" alone hides which url was actually called; show it.
+      status.innerHTML = `<span class="err">${error.message}<br>Called: ${endpoint}<br>Check the app URL in options - it needs the https:// prefix.</span>`;
       button.disabled = false;
     }
   });
