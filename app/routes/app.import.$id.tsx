@@ -199,12 +199,21 @@ export default function ImportEditPage() {
   useEffect(() => {
     if (fetcher.state !== "idle" || !fetcher.data) return;
     if (savedToast && actionMessage) shopify.toast.show(actionMessage);
-    if (fetcher.data.ok) setModal(null);
+    if (fetcher.data.ok) {
+      setModal(null);
+      reloadRef.current = pendingReload.current;
+    }
+    pendingReload.current = null;
   }, [fetcher.state, fetcher.data, savedToast, actionMessage, shopify]);
 
   // Applying a pricing rule and saving both change what the server holds, so
   // the fields are reloaded from the loader once it revalidates — but only
   // then, or a background revalidation would wipe half-typed edits.
+  // `pendingReload` is what the click asked for; `reloadRef` is armed only once
+  // the server has confirmed it. Arming on the click meant a save that failed
+  // still reset the fields from the loader on the next revalidation, throwing
+  // away everything the merchant had just typed.
+  const pendingReload = useRef<"all" | "variants" | null>(null);
   const reloadRef = useRef<"all" | "variants" | null>(null);
   useEffect(() => {
     const mode = reloadRef.current;
@@ -220,7 +229,7 @@ export default function ImportEditPage() {
   }, [product]);
 
   const save = () => {
-    reloadRef.current = "all";
+    pendingReload.current = "all";
     fetcher.submit(
       {
         intent: "save",
@@ -234,7 +243,7 @@ export default function ImportEditPage() {
     );
   };
   const applyRule = () => {
-    reloadRef.current = "variants";
+    pendingReload.current = "variants";
     fetcher.submit({ intent: "apply-rule", ruleId }, { method: "post" });
   };
 

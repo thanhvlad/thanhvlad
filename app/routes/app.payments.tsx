@@ -190,20 +190,15 @@ export default function PaymentsPage() {
         {queue.items.length > 0 && (
           <Layout.Section>
             <InlineGrid columns={{ xs: 1, sm: 2, md: 4 }} gap="300">
-              {queue.totals.slice(0, 1).map((total) => (
+              {/* One tile per currency, each labelled and with its own count.
+                  Collapsing the rest into a hint left them unlabelled and
+                  dropped their counts entirely. */}
+              {queue.totals.map((total) => (
                 <Stat
                   key={total.currency}
                   label={t("payments.stat.unpaidTotal", { currency: total.currency })}
                   value={formatMoney(total.amount, total.currency)}
-                  hint={
-                    queue.totals.length > 1
-                      ? // Every currency keeps its own order count; showing the
-                        // amounts alone lost the counts the old cards carried.
-                        queue.totals
-                          .map((each) => `${formatMoney(each.amount, each.currency)} (${t("payments.stat.orders", { n: each.count })})`)
-                          .join(" · ")
-                      : t("payments.stat.orders", { n: total.count })
-                  }
+                  hint={t("payments.stat.orders", { n: total.count })}
                 />
               ))}
               <Stat

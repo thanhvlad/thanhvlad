@@ -117,7 +117,11 @@ export default function TrackingPage() {
   // A sync that finished with failures is a warning the merchant should read,
   // not a green "done".
   const failedCount = Number(result?.messageVars?.failed ?? 0);
-  const bannerTone = result?.messageKey === "msg.trackingSyncResult" && failedCount > 0 ? "warning" : "success";
+  // "Checked 100 supplier order(s); 0 updated." is not a success either, so the
+  // tone follows what actually changed rather than the fact that a job ran.
+  const changedCount = Number(result?.messageVars?.changed ?? result?.messageVars?.n ?? 0);
+  const bannerTone =
+    failedCount > 0 ? "warning" : changedCount === 0 ? "info" : "success";
 
   return (
     <Page

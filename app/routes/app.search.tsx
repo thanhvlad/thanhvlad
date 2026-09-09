@@ -9,7 +9,6 @@ import {
   Button,
   Card,
   FormLayout,
-  Image,
   InlineGrid,
   InlineStack,
   Layout,
@@ -353,7 +352,10 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
       <Box background="bg-surface-secondary" minHeight="220px" overflowY="hidden">
         <InlineStack align="center" blockAlign="center">
           {item.image ? (
-            <Image source={item.image} alt={item.title} width="100%" />
+            // A native img, not Polaris Image: `loading` is not on ImageProps in
+            // this version, and a page of 24 full-size supplier photos loading
+            // at once inside the admin iframe is worth the one exception.
+            <img src={item.image} alt={item.title} loading="lazy" style={{ width: "100%", display: "block" }} />
           ) : (
             <Box paddingBlock="1600">
               <Thumb src={null} alt={t("search.card.noImage")} size="large" />

@@ -3,7 +3,24 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { useFetcher, useLoaderData } from "@remix-run/react";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import type { PriceChangeAction, StockChangeAction } from "@prisma/client";
-import { Banner, BlockStack, Button, Card, Checkbox, DataTable, FormLayout, InlineGrid, InlineStack, Layout, List, Page, Select, Text, TextField } from "@shopify/polaris";
+import {
+  Banner,
+  BlockStack,
+  Button,
+  Card,
+  Checkbox,
+  DataTable,
+  FormLayout,
+  InlineGrid,
+  InlineStack,
+  Layout,
+  List,
+  Page,
+  Select,
+  Text,
+  TextField,
+  Tooltip,
+} from "@shopify/polaris";
 import { EmptyScreen } from "~/components/EmptyScreen";
 import { JobProgress } from "~/components/JobProgress";
 import { SectionHeader } from "~/components/SectionHeader";
@@ -108,7 +125,19 @@ export default function InventoryPage() {
   const dryRunError = useErrorMessage(dryRunResult);
   const { jobRunId, clearJobRun } = useJobRun(runResult);
 
-  const initialForm = { ...data.policy, priceThresholdPercent: data.policy.priceThresholdPercent, lowStockThreshold: String(data.policy.lowStockThreshold), maxInventoryPushed: String(data.policy.maxInventoryPushed), syncIntervalMinutes: String(data.policy.syncIntervalMinutes) };
+  // Only the fields the form owns and submits. Spreading all of data.policy
+  // pulled in lastRunAt, which a background run changes - and the screen then
+  // reported unsaved edits the merchant never made.
+  const initialForm = {
+    isEnabled: data.policy.isEnabled,
+    priceAction: data.policy.priceAction,
+    priceThresholdPercent: data.policy.priceThresholdPercent,
+    stockAction: data.policy.stockAction,
+    lowStockThreshold: String(data.policy.lowStockThreshold),
+    maxInventoryPushed: String(data.policy.maxInventoryPushed),
+    onProductRemoved: data.policy.onProductRemoved,
+    syncIntervalMinutes: String(data.policy.syncIntervalMinutes),
+  };
   const [form, setForm] = useState(initialForm);
   const dirty = JSON.stringify(form) !== JSON.stringify(initialForm);
 
@@ -122,7 +151,10 @@ export default function InventoryPage() {
   const previewChanges = () => dryRunFetcher.submit({ intent: "dry-run" }, { method: "post" });
   const savePolicy = () => saveFetcher.submit({ intent: "save", ...form, isEnabled: String(form.isEnabled) }, { method: "post" });
 
-  const lastRun = data.runs[0];
+  // The newest run can be the one still queued, whose result is null. The
+  // in-flight job already shows in JobProgress and the runs table; these
+  // figures want the most recent run that actually produced any.
+  const lastRun = data.runs.find((r) => num(r.result?.productsChecked) !== null) ?? data.runs[0];
   const checked = num(lastRun?.result?.productsChecked);
   const priceUpdates = num(lastRun?.result?.priceUpdates);
   const stockUpdates = num(lastRun?.result?.inventoryUpdates);
@@ -264,9 +296,13 @@ export default function InventoryPage() {
                     num(run.result?.unpublished) ?? "—",
                     num(run.result?.suppliersFailed) ?? "—",
                     run.error ? (
-                      <Text key={`${run.id}-error`} as="span" tone="critical" variant="bodySm">
-                        {truncate(run.error, 80)}
-                      </Text>
+                      // The full reason is what a merchant needs to act on; the
+                      // column shows the head of it and the rest on hover.
+                      <Tooltip key={`${run.id}-error`} content={run.error} preferredPosition="above">
+                        <Text as="span" tone="critical" variant="bodySm">
+                          {truncate(run.error, 80)}
+                        </Text>
+                      </Tooltip>
                     ) : (
                       ""
                     ),

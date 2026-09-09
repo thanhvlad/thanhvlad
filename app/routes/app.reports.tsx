@@ -114,6 +114,9 @@ export default function ReportsPage() {
             <Card>
               <BlockStack gap="400">
                 <SectionHeader title={t("reports.byDay.title")} count={report.series.length} />
+                <Text as="h3" variant="headingSm" tone="subdued">
+                  {t("reports.dailyChart.title")}
+                </Text>
                 <DailyChart series={report.series} currency={currency} />
                 <DataTable
                   columnContentTypes={["text", "numeric", "numeric", "numeric", "numeric"]}

@@ -250,16 +250,20 @@ export default function ImportListPage() {
                   </Text>
                 </Link>
                 <InlineStack gap="200" blockAlign="center">
-                  {item.storeName ? (
-                    <Text as="span" tone="subdued" variant="bodySm">
-                      {item.storeName}
-                    </Text>
-                  ) : item.platform === "MANUAL" ? (
+                  {/* The badge is not an alternative to the store name: a row
+                      with a store name was left with no way to tell which
+                      platform it came from without opening it. */}
+                  {item.platform === "MANUAL" ? (
                     <Text as="span" tone="subdued" variant="bodySm">
                       {t("import.list.notLinked")}
                     </Text>
                   ) : (
                     <PlatformBadge platform={item.platform} />
+                  )}
+                  {item.storeName && (
+                    <Text as="span" tone="subdued" variant="bodySm">
+                      {item.storeName}
+                    </Text>
                   )}
                   {!item.available && <Badge tone="critical">{t("import.unavailable")}</Badge>}
                 </InlineStack>
