@@ -1,14 +1,18 @@
-import { useState } from "react";
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
+import { useEffect, useRef, useState } from "react";
+import type { ActionFunctionArgs, LoaderFunctionArgs, SerializeFrom } from "@remix-run/node";
 import { useFetcher, useLoaderData } from "@remix-run/react";
-import { Badge, Banner, BlockStack, Box, Button, Card, Checkbox, DataTable, Divider, FormLayout, InlineGrid, InlineStack, Layout, Page, Select, Text, TextField } from "@shopify/polaris";
+import { Badge, Banner, BlockStack, Box, Button, Card, Checkbox, DataTable, FormLayout, IndexTable, InlineGrid, InlineStack, Layout, Modal, Page, Select, Text, TextField, useIndexResourceState } from "@shopify/polaris";
+import prisma from "~/db.server";
+import { EmptyScreen } from "~/components/EmptyScreen";
+import { Stat } from "~/components/Stat";
+import { StatusBadge } from "~/components/StatusBadge";
 import type { PriceOp, PricingRuleInput } from "~/domain/pricing/types";
 import { computePrice } from "~/domain/pricing/engine";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatMoney } from "~/lib/format";
 import type { Translator } from "~/lib/i18n";
-import { useMessage, useT } from "~/lib/use-t";
+import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
 import { createPricingRule, deletePricingRule, listPricingRules, setDefaultPricingRule, toRuleInput, updatePricingRule, type PricingRuleFormInput } from "~/services/pricing.server";
 
 const opOptions = (t: Translator): Array<{ label: string; value: PriceOp }> => [
@@ -21,10 +25,15 @@ const opOptions = (t: Translator): Array<{ label: string; value: PriceOp }> => [
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
-  const rules = await listPricingRules(shop.id);
+  // How many imported products each rule prices — the "applies to" column.
+  const [rules, usage] = await Promise.all([
+    listPricingRules(shop.id),
+    prisma.importedProduct.groupBy({ by: ["pricingRuleId"], where: { shopId: shop.id, pricingRuleId: { not: null } }, _count: { _all: true } }),
+  ]);
+  const productCounts = new Map(usage.map((u) => [u.pricingRuleId, u._count._all]));
   return {
     currency: shop.currency,
-    rules: rules.map((r) => ({ ...toRuleInput(r), id: r.id, name: r.name, description: r.description, isDefault: r.isDefault, isEnabled: r.isEnabled, syncCostOfGoods: r.syncCostOfGoods, productCount: 0 })),
+    rules: rules.map((r) => ({ ...toRuleInput(r), id: r.id, name: r.name, description: r.description, isDefault: r.isDefault, isEnabled: r.isEnabled, syncCostOfGoods: r.syncCostOfGoods, productCount: productCounts.get(r.id) ?? 0 })),
   };
 };
 
@@ -55,6 +64,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 };
 
+type Rule = SerializeFrom<typeof loader>["rules"][number];
 type TierForm = { minCost: string; maxCost: string; priceOp: PriceOp; priceValue: string; compareAtOp: PriceOp; compareAtValue: string };
 type RuleForm = {
   id: string;
@@ -80,7 +90,7 @@ const EMPTY: RuleForm = {
   centsEnding: "99", roundToMultiple: "", includeShipping: false, minPrice: "", maxPrice: "", syncCostOfGoods: true, tiers: [],
 };
 
-function toForm(rule: Awaited<ReturnType<typeof loader>>["rules"][number]): RuleForm {
+function toForm(rule: Rule): RuleForm {
   return {
     id: rule.id ?? "",
     name: rule.name ?? "",
@@ -120,12 +130,57 @@ export default function PricingPage() {
   const t = useT();
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
-  const result = fetcher.data as { message?: string; error?: string } | undefined;
+  const result = fetcher.data as { ok?: boolean; message?: string; error?: string } | undefined;
   const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
+  const errorText = useErrorMessage(result);
+  const busy = fetcher.state !== "idle";
+  const pending = (intent: string, id?: string) => busy && fetcher.formData?.get("intent") === intent && (id === undefined || fetcher.formData?.get("id") === id);
+
   const [form, setForm] = useState<RuleForm | null>(null);
+  const [deleting, setDeleting] = useState<Rule | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+  // A modal stays open while its submit is in flight, so its button can show
+  // progress and a failure lands inside the modal rather than behind it. The
+  // intent being awaited is remembered; `wasBusy` is what makes the effect wait
+  // for the fetcher to have actually started, since the state update and the
+  // submit do not always land in the same render.
+  const [submitting, setSubmitting] = useState<"save" | "delete" | null>(null);
+  const wasBusy = useRef(false);
+  useEffect(() => {
+    if (busy) {
+      wasBusy.current = true;
+      return;
+    }
+    if (!wasBusy.current || !submitting) return;
+    wasBusy.current = false;
+    const intent = submitting;
+    setSubmitting(null);
+    if (intent === "save") {
+      if (result?.error) setFormError(result.error);
+      else setForm(null);
+    } else {
+      setDeleting(null);
+    }
+  }, [busy, submitting, result?.error]);
+
+  const openForm = (next: RuleForm) => {
+    setFormError(null);
+    setForm(next);
+  };
+  const closeForm = () => {
+    setForm(null);
+    setFormError(null);
+  };
+
+  const { selectedResources, allResourcesSelected, handleSelectionChange, clearSelection } = useIndexResourceState(data.rules);
+  const selectedRule = selectedResources.length === 1 ? data.rules.find((r) => r.id === selectedResources[0]) : undefined;
+
   const opts = opOptions(t);
   const sampleCosts = [1, 2.5, 5, 10, 20, 50, 100];
   const preview = form ? sampleCosts.map((cost) => ({ cost, ...computePrice(toRuleInputFromForm(form), { cost, shippingCost: 2 }) })) : [];
+  const defaultRule = data.rules.find((r) => r.isDefault);
+  const enabledCount = data.rules.filter((r) => r.isEnabled).length;
+  const pricedCount = data.rules.reduce((sum, r) => sum + r.productCount, 0);
 
   const save = () => {
     if (!form) return;
@@ -146,158 +201,249 @@ export default function PricingPage() {
       syncCostOfGoods: form.syncCostOfGoods,
       tiers: form.tiers.map((t) => ({ minCost: t.minCost, maxCost: t.maxCost || null, priceOp: t.priceOp, priceValue: t.priceValue, compareAtOp: t.compareAtOp, compareAtValue: t.compareAtValue || null })),
     };
+    setFormError(null);
+    setSubmitting("save");
     fetcher.submit({ intent: "save", id: form.id, rule: JSON.stringify(payload) }, { method: "post" });
-    setForm(null);
+  };
+  const makeDefault = (id: string) => {
+    fetcher.submit({ intent: "default", id }, { method: "post" });
+    clearSelection();
+  };
+  const confirmDelete = () => {
+    if (!deleting?.id) return;
+    setSubmitting("delete");
+    fetcher.submit({ intent: "delete", id: deleting.id }, { method: "post" });
+    clearSelection();
   };
 
+  const newRule = () => openForm({ ...EMPTY, isDefault: data.rules.length === 0 });
+
   return (
-    <Page title={t("page.pricing.title")} subtitle={t("page.pricing.subtitle")} primaryAction={{ content: t("pricing.newRule"), onAction: () => setForm({ ...EMPTY, isDefault: data.rules.length === 0 }) }}>
+    <Page fullWidth title={t("page.pricing.title")} subtitle={t("page.pricing.subtitle")} primaryAction={{ content: t("pricing.addRule"), onAction: newRule }}>
       <Layout>
         <Layout.Section>
-          {actionMessage && (
-            <Banner tone="success">
-              <p>{actionMessage}</p>
-            </Banner>
-          )}
-          {result?.error && (
-            <Banner tone="critical">
-              <p>{result.error}</p>
-            </Banner>
-          )}
-        </Layout.Section>
-
-        {form && (
-          <Layout.Section>
-            <Card>
-              <BlockStack gap="400">
-                <Text as="h2" variant="headingMd">
-                  {form.id ? t("pricing.editRule") : t("pricing.newRule")}
-                </Text>
-                <FormLayout>
-                  <FormLayout.Group>
-                    <TextField label={t("pricing.form.name")} value={form.name} onChange={(v) => setForm({ ...form, name: v })} autoComplete="off" placeholder={t("pricing.form.namePlaceholder")} />
-                    <TextField label={t("pricing.form.description")} value={form.description} onChange={(v) => setForm({ ...form, description: v })} autoComplete="off" />
-                  </FormLayout.Group>
-                  <InlineStack gap="400">
-                    <Checkbox label={t("pricing.form.isDefault")} checked={form.isDefault} onChange={(v) => setForm({ ...form, isDefault: v })} />
-                    <Checkbox label={t("pricing.form.isEnabled")} checked={form.isEnabled} onChange={(v) => setForm({ ...form, isEnabled: v })} />
-                    <Checkbox label={t("pricing.form.includeShipping")} checked={form.includeShipping} onChange={(v) => setForm({ ...form, includeShipping: v })} />
-                    <Checkbox label={t("pricing.form.syncCostOfGoods")} checked={form.syncCostOfGoods} onChange={(v) => setForm({ ...form, syncCostOfGoods: v })} />
-                  </InlineStack>
-                  <Divider />
-                  <Text as="h3" variant="headingSm">
-                    {t("pricing.form.baseFormula")}
-                  </Text>
-                  <FormLayout.Group>
-                    <Select label={t("common.price")} options={opts} value={form.basePriceOp} onChange={(v) => setForm({ ...form, basePriceOp: v as PriceOp })} />
-                    <TextField label={t("pricing.form.value")} type="number" value={form.basePriceValue} onChange={(v) => setForm({ ...form, basePriceValue: v })} autoComplete="off" />
-                    <Select label={t("pricing.form.compareAtPrice")} options={opts} value={form.compareAtOp} onChange={(v) => setForm({ ...form, compareAtOp: v as PriceOp })} helpText={t("pricing.form.compareAtHelp")} />
-                    <TextField label={t("pricing.form.value")} type="number" value={form.compareAtValue} onChange={(v) => setForm({ ...form, compareAtValue: v })} autoComplete="off" disabled={form.compareAtOp === "NONE"} />
-                  </FormLayout.Group>
-                  <FormLayout.Group>
-                    <TextField label={t("pricing.form.centsEnding")} type="number" value={form.centsEnding} onChange={(v) => setForm({ ...form, centsEnding: v })} autoComplete="off" helpText={t("pricing.form.centsEndingHelp")} />
-                    <TextField label={t("pricing.form.roundToMultiple")} type="number" value={form.roundToMultiple} onChange={(v) => setForm({ ...form, roundToMultiple: v })} autoComplete="off" helpText={t("pricing.form.roundToMultipleHelp")} />
-                    <TextField label={t("pricing.form.minPrice")} type="number" value={form.minPrice} onChange={(v) => setForm({ ...form, minPrice: v })} autoComplete="off" prefix={data.currency} />
-                    <TextField label={t("pricing.form.maxPrice")} type="number" value={form.maxPrice} onChange={(v) => setForm({ ...form, maxPrice: v })} autoComplete="off" prefix={data.currency} />
-                  </FormLayout.Group>
-                  <Divider />
-                  <InlineStack align="space-between" blockAlign="center">
-                    <Text as="h3" variant="headingSm">
-                      {t("pricing.tiers.title")}
-                    </Text>
-                    <Button size="slim" onClick={() => setForm({ ...form, tiers: [...form.tiers, { minCost: form.tiers.length ? form.tiers[form.tiers.length - 1].maxCost || "0" : "0", maxCost: "", priceOp: "MULTIPLY", priceValue: "2", compareAtOp: "NONE", compareAtValue: "" }] })}>
-                      {t("pricing.tiers.add")}
-                    </Button>
-                  </InlineStack>
-                  {form.tiers.length === 0 && (
-                    <Text as="p" tone="subdued" variant="bodySm">
-                      {t("pricing.tiers.help")}
-                    </Text>
-                  )}
-                  {form.tiers.map((tier, i) => (
-                    <Box key={i} padding="200" background="bg-surface-secondary" borderRadius="200">
-                      <InlineGrid columns={{ xs: 2, md: 7 }} gap="200">
-                        <TextField label={t("pricing.tiers.fromCost")} type="number" value={tier.minCost} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, minCost: v } : tr)) })} autoComplete="off" />
-                        <TextField label={t("pricing.tiers.toCost")} type="number" value={tier.maxCost} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, maxCost: v } : tr)) })} autoComplete="off" placeholder="∞" />
-                        <Select label={t("common.price")} options={opts} value={tier.priceOp} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, priceOp: v as PriceOp } : tr)) })} />
-                        <TextField label={t("pricing.form.value")} type="number" value={tier.priceValue} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, priceValue: v } : tr)) })} autoComplete="off" />
-                        <Select label={t("pricing.tiers.compareAt")} options={opts} value={tier.compareAtOp} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, compareAtOp: v as PriceOp } : tr)) })} />
-                        <TextField label={t("pricing.form.value")} type="number" value={tier.compareAtValue} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, compareAtValue: v } : tr)) })} autoComplete="off" disabled={tier.compareAtOp === "NONE"} />
-                        <Box paddingBlockStart="600">
-                          <Button size="slim" tone="critical" onClick={() => setForm({ ...form, tiers: form.tiers.filter((_, j) => j !== i) })}>
-                            {t("action.remove")}
-                          </Button>
-                        </Box>
-                      </InlineGrid>
-                    </Box>
-                  ))}
-                  <Divider />
-                  <Text as="h3" variant="headingSm">
-                    {`${t("pricing.preview.title")} (${t("pricing.preview.shippingAssumed")} ${formatMoney(2, data.currency)})`}
-                  </Text>
-                  <DataTable
-                    columnContentTypes={["numeric", "numeric", "numeric", "numeric", "text"]}
-                    headings={[t("common.cost"), t("common.price"), t("pricing.tiers.compareAt"), t("pricing.table.margin"), t("pricing.table.tier")]}
-                    rows={preview.map((p) => [formatMoney(p.cost, data.currency), formatMoney(p.price, data.currency), p.compareAtPrice ? formatMoney(p.compareAtPrice, data.currency) : "—", `${p.marginPercent}%`, p.appliedTierId !== null ? `#${Number(p.appliedTierId) + 1}` : t("pricing.table.base")])}
-                  />
-                  <InlineStack gap="200">
-                    <Button variant="primary" onClick={save} disabled={!form.name.trim()} loading={fetcher.state !== "idle"}>
-                      {t("pricing.saveRule")}
-                    </Button>
-                    <Button onClick={() => setForm(null)}>{t("action.cancel")}</Button>
-                  </InlineStack>
-                </FormLayout>
-              </BlockStack>
-            </Card>
-          </Layout.Section>
-        )}
-
-        <Layout.Section>
           <BlockStack gap="300">
-            {data.rules.length === 0 && !form && (
-              <Card>
-                <BlockStack gap="200">
-                  <Text as="p">{t("pricing.empty")}</Text>
-                  <Button onClick={() => setForm({ ...EMPTY, isDefault: true })}>{t("pricing.createFirst")}</Button>
-                </BlockStack>
-              </Card>
+            {actionMessage && (
+              <Banner tone="success">
+                <p>{actionMessage}</p>
+              </Banner>
             )}
-            {data.rules.map((rule) => (
-              <Card key={rule.id}>
-                <InlineStack align="space-between" blockAlign="start" wrap>
-                  <BlockStack gap="100">
-                    <InlineStack gap="200" blockAlign="center">
-                      <Text as="h3" variant="headingMd">
-                        {rule.name}
-                      </Text>
-                      {rule.isDefault && <Badge tone="success">{t("pricing.badge.default")}</Badge>}
-                      {!rule.isEnabled && <Badge>{t("common.disabled")}</Badge>}
-                    </InlineStack>
-                    <Text as="p" tone="subdued" variant="bodySm">
-                      {describe(rule, t)}
-                    </Text>
-                    {rule.description && <Text as="p">{rule.description}</Text>}
-                  </BlockStack>
-                  <InlineStack gap="100">
-                    <Button size="slim" onClick={() => setForm(toForm(rule))}>
-                      {t("action.edit")}
-                    </Button>
-                    {!rule.isDefault && (
-                      <Button size="slim" onClick={() => fetcher.submit({ intent: "default", id: rule.id! }, { method: "post" })}>
-                        {t("pricing.makeDefault")}
-                      </Button>
-                    )}
-                    <Button size="slim" tone="critical" onClick={() => fetcher.submit({ intent: "delete", id: rule.id! }, { method: "post" })}>
-                      {t("action.delete")}
-                    </Button>
-                  </InlineStack>
-                </InlineStack>
-              </Card>
-            ))}
+            {errorText && !form && (
+              <Banner tone="critical">
+                <p>{errorText}</p>
+              </Banner>
+            )}
           </BlockStack>
         </Layout.Section>
+
+        <Layout.Section>
+          <InlineGrid columns={{ xs: 2, md: 4 }} gap="400">
+            <Stat label={t("pricing.stat.rules")} value={String(data.rules.length)} />
+            <Stat label={t("pricing.stat.enabled")} value={String(enabledCount)} tone={data.rules.length > 0 && enabledCount === 0 ? "warning" : "default"} />
+            <Stat label={t("pricing.stat.default")} value={defaultRule?.name ?? t("pricing.stat.builtIn")} hint={defaultRule ? describe(defaultRule, t) : t("pricing.stat.builtInHint")} />
+            <Stat label={t("pricing.stat.applied")} value={String(pricedCount)} />
+          </InlineGrid>
+        </Layout.Section>
+
+        <Layout.Section>
+          {data.rules.length === 0 ? (
+            <EmptyScreen heading={t("pricing.emptyState.heading")} body={t("pricing.empty")} action={{ content: t("pricing.createFirst"), onAction: () => openForm({ ...EMPTY, isDefault: true }) }} />
+          ) : (
+            <Card padding="0">
+              <IndexTable
+                resourceName={{ singular: t("pricing.resource.singular"), plural: t("pricing.resource.plural") }}
+                itemCount={data.rules.length}
+                selectedItemsCount={allResourcesSelected ? "All" : selectedResources.length}
+                onSelectionChange={handleSelectionChange}
+                promotedBulkActions={[
+                  { content: t("action.edit"), disabled: !selectedRule, onAction: () => selectedRule && openForm(toForm(selectedRule)) },
+                  { content: t("pricing.makeDefault"), disabled: !selectedRule || selectedRule.isDefault || busy, onAction: () => selectedRule?.id && makeDefault(selectedRule.id) },
+                  { content: t("action.delete"), disabled: !selectedRule || busy, onAction: () => selectedRule && setDeleting(selectedRule) },
+                ]}
+                headings={[{ title: t("pricing.table.name") }, { title: t("pricing.table.formula") }, { title: t("pricing.table.appliesTo") }, { title: t("common.status") }]}
+              >
+                {/* The row itself opens the rule, the way a row opens an order in
+                    the Shopify admin. Buttons inside a row would also toggle its
+                    checkbox — Polaris puts the row's click handler on the <tr>. */}
+                {data.rules.map((rule, index) => (
+                  <IndexTable.Row id={rule.id!} key={rule.id} position={index} selected={selectedResources.includes(rule.id!)} onClick={() => openForm(toForm(rule))}>
+                    <IndexTable.Cell>
+                      <BlockStack gap="050">
+                        <Text as="span" fontWeight="semibold">
+                          {rule.name}
+                        </Text>
+                        {rule.description && (
+                          <Text as="span" tone="subdued" variant="bodySm">
+                            {rule.description}
+                          </Text>
+                        )}
+                      </BlockStack>
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <Text as="span" variant="bodySm">
+                        {describe(rule, t)}
+                      </Text>
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <BlockStack gap="050">
+                        {rule.isDefault && (
+                          <Text as="span" variant="bodySm">
+                            {t("pricing.table.appliesTo.newImports")}
+                          </Text>
+                        )}
+                        <Text as="span" variant="bodySm" tone={rule.isDefault ? "subdued" : "base"} numeric>
+                          {rule.productCount === 1 ? t("pricing.table.appliesTo.product") : t("pricing.table.appliesTo.products", { n: rule.productCount })}
+                        </Text>
+                      </BlockStack>
+                    </IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <InlineStack gap="100" wrap>
+                        {rule.isDefault && <Badge tone="success">{t("pricing.badge.default")}</Badge>}
+                        <StatusBadge status={rule.isEnabled ? "ENABLED" : "DISABLED"} />
+                      </InlineStack>
+                    </IndexTable.Cell>
+                  </IndexTable.Row>
+                ))}
+              </IndexTable>
+            </Card>
+          )}
+        </Layout.Section>
       </Layout>
+
+      <Modal
+        open={form !== null}
+        onClose={closeForm}
+        size="large"
+        title={form?.id ? t("pricing.editRule") : t("pricing.newRule")}
+        primaryAction={{ content: t("pricing.saveRule"), onAction: save, disabled: !form?.name.trim(), loading: pending("save") }}
+        secondaryActions={[{ content: t("action.cancel"), onAction: closeForm }]}
+      >
+        {form && (
+          <>
+            <Modal.Section>
+              <FormLayout>
+                {formError && (
+                  <Banner tone="critical">
+                    <p>{formError}</p>
+                  </Banner>
+                )}
+                <FormLayout.Group>
+                  <TextField label={t("pricing.form.name")} value={form.name} onChange={(v) => setForm({ ...form, name: v })} autoComplete="off" placeholder={t("pricing.form.namePlaceholder")} requiredIndicator />
+                  <TextField label={t("pricing.form.description")} value={form.description} onChange={(v) => setForm({ ...form, description: v })} autoComplete="off" />
+                </FormLayout.Group>
+                <InlineStack gap="400" wrap>
+                  <Checkbox label={t("pricing.form.isDefault")} checked={form.isDefault} onChange={(v) => setForm({ ...form, isDefault: v })} />
+                  <Checkbox label={t("pricing.form.isEnabled")} checked={form.isEnabled} onChange={(v) => setForm({ ...form, isEnabled: v })} />
+                  <Checkbox label={t("pricing.form.includeShipping")} checked={form.includeShipping} onChange={(v) => setForm({ ...form, includeShipping: v })} />
+                  <Checkbox label={t("pricing.form.syncCostOfGoods")} checked={form.syncCostOfGoods} onChange={(v) => setForm({ ...form, syncCostOfGoods: v })} />
+                </InlineStack>
+              </FormLayout>
+            </Modal.Section>
+
+            <Modal.Section>
+              <FormLayout>
+                <Text as="h3" variant="headingSm">
+                  {t("pricing.form.baseFormula")}
+                </Text>
+                <FormLayout.Group>
+                  <Select label={t("common.price")} options={opts} value={form.basePriceOp} onChange={(v) => setForm({ ...form, basePriceOp: v as PriceOp })} />
+                  <TextField label={t("pricing.form.value")} type="number" value={form.basePriceValue} onChange={(v) => setForm({ ...form, basePriceValue: v })} autoComplete="off" />
+                  <Select label={t("pricing.form.compareAtPrice")} options={opts} value={form.compareAtOp} onChange={(v) => setForm({ ...form, compareAtOp: v as PriceOp })} helpText={t("pricing.form.compareAtHelp")} />
+                  <TextField label={t("pricing.form.value")} type="number" value={form.compareAtValue} onChange={(v) => setForm({ ...form, compareAtValue: v })} autoComplete="off" disabled={form.compareAtOp === "NONE"} />
+                </FormLayout.Group>
+                <Text as="h3" variant="headingSm">
+                  {t("pricing.form.guards")}
+                </Text>
+                <FormLayout.Group>
+                  <TextField label={t("pricing.form.centsEnding")} type="number" value={form.centsEnding} onChange={(v) => setForm({ ...form, centsEnding: v })} autoComplete="off" helpText={t("pricing.form.centsEndingHelp")} />
+                  <TextField label={t("pricing.form.roundToMultiple")} type="number" value={form.roundToMultiple} onChange={(v) => setForm({ ...form, roundToMultiple: v })} autoComplete="off" helpText={t("pricing.form.roundToMultipleHelp")} />
+                  <TextField label={t("pricing.form.minPrice")} type="number" value={form.minPrice} onChange={(v) => setForm({ ...form, minPrice: v })} autoComplete="off" prefix={data.currency} />
+                  <TextField label={t("pricing.form.maxPrice")} type="number" value={form.maxPrice} onChange={(v) => setForm({ ...form, maxPrice: v })} autoComplete="off" prefix={data.currency} />
+                </FormLayout.Group>
+              </FormLayout>
+            </Modal.Section>
+
+            <Modal.Section>
+              <BlockStack gap="300">
+                <InlineStack align="space-between" blockAlign="center">
+                  <Text as="h3" variant="headingSm">
+                    {t("pricing.tiers.title")}
+                  </Text>
+                  <Button size="slim" onClick={() => setForm({ ...form, tiers: [...form.tiers, { minCost: form.tiers.length ? form.tiers[form.tiers.length - 1].maxCost || "0" : "0", maxCost: "", priceOp: "MULTIPLY", priceValue: "2", compareAtOp: "NONE", compareAtValue: "" }] })}>
+                    {t("pricing.tiers.add")}
+                  </Button>
+                </InlineStack>
+                {form.tiers.length === 0 && (
+                  <Text as="p" tone="subdued" variant="bodySm">
+                    {t("pricing.tiers.help")}
+                  </Text>
+                )}
+                {form.tiers.map((tier, i) => (
+                  <Box key={i} padding="200" background="bg-surface-secondary" borderRadius="200">
+                    <InlineGrid columns={{ xs: 2, md: 7 }} gap="200">
+                      <TextField label={t("pricing.tiers.fromCost")} type="number" value={tier.minCost} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, minCost: v } : tr)) })} autoComplete="off" />
+                      <TextField label={t("pricing.tiers.toCost")} type="number" value={tier.maxCost} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, maxCost: v } : tr)) })} autoComplete="off" placeholder="∞" />
+                      <Select label={t("common.price")} options={opts} value={tier.priceOp} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, priceOp: v as PriceOp } : tr)) })} />
+                      <TextField label={t("pricing.form.value")} type="number" value={tier.priceValue} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, priceValue: v } : tr)) })} autoComplete="off" />
+                      <Select label={t("pricing.tiers.compareAt")} options={opts} value={tier.compareAtOp} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, compareAtOp: v as PriceOp } : tr)) })} />
+                      <TextField label={t("pricing.form.value")} type="number" value={tier.compareAtValue} onChange={(v) => setForm({ ...form, tiers: form.tiers.map((tr, j) => (j === i ? { ...tr, compareAtValue: v } : tr)) })} autoComplete="off" disabled={tier.compareAtOp === "NONE"} />
+                      <Box paddingBlockStart="600">
+                        <Button size="slim" tone="critical" onClick={() => setForm({ ...form, tiers: form.tiers.filter((_, j) => j !== i) })}>
+                          {t("action.remove")}
+                        </Button>
+                      </Box>
+                    </InlineGrid>
+                  </Box>
+                ))}
+              </BlockStack>
+            </Modal.Section>
+
+            <Modal.Section>
+              <BlockStack gap="200">
+                <Text as="h3" variant="headingSm">
+                  {t("pricing.preview.title")}
+                </Text>
+                <Text as="p" tone="subdued" variant="bodySm">
+                  {t("pricing.preview.help", { shipping: formatMoney(2, data.currency) })}
+                </Text>
+                <DataTable
+                  columnContentTypes={["numeric", "numeric", "numeric", "numeric", "text"]}
+                  headings={[t("common.cost"), t("common.price"), t("pricing.tiers.compareAt"), t("pricing.table.margin"), t("pricing.table.tier")]}
+                  rows={preview.map((p) => [
+                    <Money key="cost" value={formatMoney(p.cost, data.currency)} />,
+                    <Money key="price" value={formatMoney(p.price, data.currency)} />,
+                    <Money key="compare" value={p.compareAtPrice ? formatMoney(p.compareAtPrice, data.currency) : "—"} />,
+                    <Money key="margin" value={`${p.marginPercent}%`} />,
+                    p.appliedTierId !== null ? `#${Number(p.appliedTierId) + 1}` : t("pricing.table.base"),
+                  ])}
+                />
+              </BlockStack>
+            </Modal.Section>
+          </>
+        )}
+      </Modal>
+
+      <Modal
+        open={Boolean(deleting)}
+        onClose={() => setDeleting(null)}
+        title={t("pricing.delete.title", { name: deleting?.name ?? "" })}
+        primaryAction={{ content: t("action.delete"), destructive: true, loading: pending("delete", deleting?.id), onAction: confirmDelete }}
+        secondaryActions={[{ content: t("action.cancel"), onAction: () => setDeleting(null) }]}
+      >
+        <Modal.Section>
+          <Text as="p">{t("pricing.delete.body")}</Text>
+        </Modal.Section>
+      </Modal>
     </Page>
+  );
+}
+
+/** A figure in the preview table: tabular digits so the columns line up. */
+function Money({ value }: { value: string }) {
+  return (
+    <Text as="span" numeric>
+      {value}
+    </Text>
   );
 }
 
