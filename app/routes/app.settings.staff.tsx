@@ -2,11 +2,15 @@ import { useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { useFetcher, useLoaderData } from "@remix-run/react";
 import type { StaffRole } from "@prisma/client";
-import { Badge, Banner, BlockStack, Box, Button, Card, FormLayout, InlineStack, Layout, Select, Text, TextField } from "@shopify/polaris";
+import { Badge, Banner, BlockStack, Box, Button, Card, FormLayout, IndexTable, Layout, List, Modal, Select, Text, TextField } from "@shopify/polaris";
+import { EmptyScreen } from "~/components/EmptyScreen";
+import { SectionHeader } from "~/components/SectionHeader";
+import { useSettingsPageAction } from "~/components/settings-page-action";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { actionFailure } from "~/lib/errors";
 import { formatDate } from "~/lib/format";
-import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
+import type { I18nKey } from "~/lib/i18n";
+import { useErrorMessage, useLocale, useMessage, useT } from "~/lib/use-t";
 import { ROLE_PERMISSIONS, inviteStaff, listStaff, removeStaff, updateStaffRole } from "~/services/staff.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -38,93 +42,202 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 };
 
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 export default function StaffSettings() {
-  const { staff } = useLoaderData<typeof loader>();
+  const { staff, permissions } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
-  const result = fetcher.data as { message?: string; error?: string } | undefined;
+  const result = fetcher.data as { ok?: boolean; message?: string; error?: string } | undefined;
   const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
   const failureMessage = useErrorMessage(result as Parameters<typeof useErrorMessage>[0]);
   const [form, setForm] = useState({ email: "", name: "", role: "STAFF" as StaffRole });
+  const [removing, setRemoving] = useState<{ id: string; email: string } | null>(null);
   const t = useT();
+  const locale = useLocale();
+  const dateLocale = locale === "vi" ? "vi-VN" : "en-US";
+  const busy = fetcher.state !== "idle";
+  const busyIntent = busy ? String(fetcher.formData?.get("intent") ?? "") : "";
+  const busyId = busy ? String(fetcher.formData?.get("id") ?? "") : "";
+  const emailValid = EMAIL.test(form.email.trim());
 
   const roles: Array<{ label: string; value: StaffRole }> = [
     { label: t("settings.staff.role.admin"), value: "ADMIN" },
     { label: t("settings.staff.role.staff"), value: "STAFF" },
     { label: t("settings.staff.role.readOnly"), value: "READ_ONLY" },
   ];
+  const roleOptions: Array<{ label: string; value: StaffRole }> = [
+    { label: t("settings.staff.roleName.ADMIN"), value: "ADMIN" },
+    { label: t("settings.staff.roleName.STAFF"), value: "STAFF" },
+    { label: t("settings.staff.roleName.READ_ONLY"), value: "READ_ONLY" },
+  ];
+
+  const invite = () => {
+    if (!emailValid) return;
+    fetcher.submit({ intent: "invite", email: form.email.trim(), name: form.name.trim(), role: form.role }, { method: "post" });
+  };
+
+  useSettingsPageAction({ content: t("settings.staff.inviteAction"), onAction: invite, loading: busyIntent === "invite", disabled: !emailValid || (busy && busyIntent !== "invite") });
+
+  const permissionSummary = (role: StaffRole) => {
+    const p = permissions[role];
+    const granted = [
+      p.canEdit ? t("settings.staff.permission.edit") : null,
+      p.canOrder ? t("settings.staff.permission.order") : null,
+      p.canManageSettings ? t("settings.staff.permission.settings") : null,
+      p.canManageStaff ? t("settings.staff.permission.staff") : null,
+    ].filter(Boolean);
+    return granted.length ? granted.join(" · ") : t("settings.staff.permission.viewOnly");
+  };
 
   return (
     <Layout>
-      <Layout.Section>
-        {actionMessage && (
-          <Banner tone="success">
-            <p>{actionMessage}</p>
-          </Banner>
-        )}
-        {failureMessage && (
-          <Banner tone="critical">
-            <p>{failureMessage}</p>
-          </Banner>
-        )}
-        <Banner tone="info">
-          <p>{t("settings.staff.intro")}</p>
-        </Banner>
-      </Layout.Section>
-      <Layout.Section variant="oneThird">
+      {(actionMessage || failureMessage) && (
+        <Layout.Section>
+          {actionMessage && result?.ok && (
+            <Banner tone="success">
+              <p>{actionMessage}</p>
+            </Banner>
+          )}
+          {failureMessage && (
+            <Banner tone="critical" title={t("settings.staff.failed")}>
+              <p>{failureMessage}</p>
+            </Banner>
+          )}
+        </Layout.Section>
+      )}
+
+      <Layout.AnnotatedSection title={t("settings.staff.inviteTitle")} description={t("settings.staff.intro")}>
         <Card>
-          <BlockStack gap="300">
-            <Text as="h2" variant="headingMd">
-              {t("settings.staff.inviteTitle")}
-            </Text>
-            <FormLayout>
-              <TextField label={t("settings.staff.email")} type="email" value={form.email} onChange={(v) => setForm({ ...form, email: v })} autoComplete="off" />
+          <FormLayout>
+            <FormLayout.Group>
+              <TextField
+                label={t("settings.staff.email")}
+                type="email"
+                value={form.email}
+                onChange={(v) => setForm({ ...form, email: v })}
+                autoComplete="off"
+                requiredIndicator
+                error={form.email && !emailValid ? t("settings.staff.emailInvalid") : undefined}
+              />
               <TextField label={t("settings.staff.name")} value={form.name} onChange={(v) => setForm({ ...form, name: v })} autoComplete="off" />
-              <Select label={t("settings.staff.role.label")} options={roles} value={form.role} onChange={(v) => setForm({ ...form, role: v as StaffRole })} />
-              <Button variant="primary" disabled={!form.email} onClick={() => fetcher.submit({ intent: "invite", ...form }, { method: "post" })} loading={fetcher.state !== "idle"}>
-                {t("action.invite")}
-              </Button>
-            </FormLayout>
-          </BlockStack>
+            </FormLayout.Group>
+            <Select label={t("settings.staff.role.label")} options={roles} value={form.role} onChange={(v) => setForm({ ...form, role: v as StaffRole })} helpText={permissionSummary(form.role)} />
+          </FormLayout>
         </Card>
-      </Layout.Section>
-      <Layout.Section>
+      </Layout.AnnotatedSection>
+
+      <Layout.AnnotatedSection title={t("settings.staff.roles.title")} description={t("settings.staff.roles.description")}>
         <Card>
-          <BlockStack gap="300">
-            <Text as="h2" variant="headingMd">
-              {t("settings.staff.team")}
-            </Text>
-            {staff.length === 0 && (
-              <Text as="p" tone="subdued">
-                {t("settings.staff.empty")}
-              </Text>
-            )}
-            {staff.map((m) => (
-              <Box key={m.id} padding="300" borderColor="border" borderWidth="025" borderRadius="200">
-                <InlineStack align="space-between" blockAlign="center" wrap>
-                  <BlockStack gap="050">
-                    <InlineStack gap="200" blockAlign="center">
-                      <Text as="span" fontWeight="semibold">
-                        {m.name ?? m.email}
-                      </Text>
-                      <Badge tone={m.role === "OWNER" || m.role === "ADMIN" ? "success" : undefined}>{m.role}</Badge>
-                      {m.disabledAt && <Badge tone="critical">{t("settings.staff.disabled")}</Badge>}
-                    </InlineStack>
-                    <Text as="p" tone="subdued" variant="bodySm">
-                      {m.email} · {t("settings.staff.invitedOn")} {formatDate(m.invitedAt)}
-                    </Text>
-                  </BlockStack>
-                  <InlineStack gap="200" blockAlign="center">
-                    <Select label={t("settings.staff.role.label")} labelHidden options={roles} value={m.role === "OWNER" ? "ADMIN" : m.role} onChange={(v) => fetcher.submit({ intent: "role", id: m.id, role: v }, { method: "post" })} disabled={m.role === "OWNER"} />
-                    <Button size="slim" tone="critical" onClick={() => fetcher.submit({ intent: "remove", id: m.id }, { method: "post" })} disabled={m.role === "OWNER"}>
-                      {t("action.remove")}
-                    </Button>
-                  </InlineStack>
-                </InlineStack>
-              </Box>
+          <List>
+            {(["OWNER", "ADMIN", "STAFF", "READ_ONLY"] as StaffRole[]).map((role) => (
+              <List.Item key={role}>
+                <Text as="span" fontWeight="semibold">
+                  {t(`settings.staff.roleName.${role}` as I18nKey)}
+                </Text>{" "}
+                <Text as="span" tone="subdued">
+                  — {permissionSummary(role)}
+                </Text>
+              </List.Item>
             ))}
+          </List>
+        </Card>
+      </Layout.AnnotatedSection>
+
+      <Layout.Section>
+        <Card padding="0">
+          <BlockStack gap="0">
+            <Box padding="400">
+              <SectionHeader title={t("settings.staff.team")} count={staff.length} />
+            </Box>
+            {staff.length === 0 ? (
+              <EmptyScreen compact heading={t("settings.staff.empty")} body={t("settings.staff.emptyBody")} />
+            ) : (
+              <IndexTable
+                resourceName={{ singular: t("settings.staff.resource.singular"), plural: t("settings.staff.resource.plural") }}
+                itemCount={staff.length}
+                selectable={false}
+                headings={[
+                  { title: t("settings.staff.email") },
+                  { title: t("settings.staff.name") },
+                  { title: t("settings.staff.role.label") },
+                  { title: t("common.status") },
+                  { title: t("settings.staff.invited") },
+                  { title: t("settings.staff.actions"), alignment: "end" },
+                ]}
+              >
+                {staff.map((m, index) => {
+                  const isOwner = m.role === "OWNER";
+                  const rowBusy = busyId === m.id;
+                  return (
+                    <IndexTable.Row id={m.id} key={m.id} position={index}>
+                      <IndexTable.Cell>
+                        <Text as="span" fontWeight="semibold">
+                          {m.email}
+                        </Text>
+                      </IndexTable.Cell>
+                      <IndexTable.Cell>{m.name ?? <Text as="span" tone="subdued">—</Text>}</IndexTable.Cell>
+                      <IndexTable.Cell>
+                        {isOwner ? (
+                          <Badge tone="success">{t("settings.staff.roleName.OWNER")}</Badge>
+                        ) : (
+                          <Select
+                            label={t("settings.staff.role.label")}
+                            labelHidden
+                            options={roleOptions}
+                            value={m.role}
+                            onChange={(v) => fetcher.submit({ intent: "role", id: m.id, role: v }, { method: "post" })}
+                            disabled={busy}
+                          />
+                        )}
+                      </IndexTable.Cell>
+                      <IndexTable.Cell>
+                        {m.disabledAt ? <Badge tone="critical">{t("settings.staff.disabled")}</Badge> : <Badge tone="success">{t("settings.staff.active")}</Badge>}
+                      </IndexTable.Cell>
+                      <IndexTable.Cell>
+                        <Text as="span" tone="subdued" variant="bodySm">
+                          {formatDate(m.invitedAt, dateLocale)}
+                        </Text>
+                      </IndexTable.Cell>
+                      <IndexTable.Cell>
+                        <Box>
+                          <Button
+                            size="slim"
+                            tone="critical"
+                            onClick={() => setRemoving({ id: m.id, email: m.email })}
+                            disabled={isOwner || (busy && !rowBusy)}
+                            loading={rowBusy && busyIntent === "remove"}
+                          >
+                            {t("action.remove")}
+                          </Button>
+                        </Box>
+                      </IndexTable.Cell>
+                    </IndexTable.Row>
+                  );
+                })}
+              </IndexTable>
+            )}
           </BlockStack>
         </Card>
       </Layout.Section>
+
+      <Modal
+        open={removing !== null}
+        onClose={() => setRemoving(null)}
+        title={t("settings.staff.removeConfirm.title")}
+        primaryAction={{
+          content: t("action.remove"),
+          destructive: true,
+          onAction: () => {
+            if (removing) fetcher.submit({ intent: "remove", id: removing.id }, { method: "post" });
+            setRemoving(null);
+          },
+        }}
+        secondaryActions={[{ content: t("action.cancel"), onAction: () => setRemoving(null) }]}
+      >
+        <Modal.Section>
+          <Text as="p">{t("settings.staff.removeConfirm.body", { email: removing?.email ?? "" })}</Text>
+        </Modal.Section>
+      </Modal>
     </Layout>
   );
 }
