@@ -72,7 +72,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (!reused) {
       await enqueue("sync-orders", { shopId: shop.id, days: 30, jobRunId: job.id }, { dedupeKey: `sync-orders-${shop.id}` });
     }
-    return { ok: true, jobRunId: job.id, message: reused ? "A sync is already running." : undefined };
+    return { ok: true, jobRunId: job.id, message: reused ? "A sync is already running." : undefined, messageKey: reused ? "dashboard.sync.alreadyRunning" : undefined };
   }
   if (intent === "dismiss-welcome") {
     const tips = shop.parsedSettings.ui.dismissedTips;
@@ -86,7 +86,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (!reused) {
       await enqueue("sync-purchase-orders", { shopId: shop.id, jobRunId: job.id }, { dedupeKey: `sync-po-manual-${shop.id}` });
     }
-    return { ok: true, jobRunId: job.id, message: reused ? "A supplier check is already running." : undefined };
+    return { ok: true, jobRunId: job.id, message: reused ? "A supplier check is already running." : undefined, messageKey: reused ? "dashboard.sync.supplierAlreadyRunning" : undefined };
   }
   return { ok: false };
 };
@@ -224,7 +224,7 @@ export default function Dashboard() {
                       borderColor="border"
                     >
                       <InlineStack gap="300" blockAlign="start" wrap={false}>
-                        <Box minWidth="88px">
+                        <Box minWidth="116px">
                           {step.done ? (
                             <Badge tone="success">{t("common.done")}</Badge>
                           ) : step === nextStep ? (
@@ -235,7 +235,7 @@ export default function Dashboard() {
                         </Box>
                         <BlockStack gap="050">
                           <Text as="p" fontWeight={step.done ? "regular" : "semibold"} tone={step.done ? "subdued" : "base"}>
-                            <Link to={step.to}>{step.label}</Link>
+                            {step.done ? step.label : <Link to={step.to}>{step.label}</Link>}
                           </Text>
                           <Text as="p" tone="subdued" variant="bodySm">
                             {step.hint}
@@ -262,7 +262,6 @@ export default function Dashboard() {
             <Stat
               label={t("dashboard.stat.orders7d")}
               value={String(stats.week.orders)}
-              hint={stats.recentFailures > 0 ? t("dashboard.stat.failedHint", { n: stats.recentFailures }) : undefined}
             />
             <Stat
               label={t("dashboard.stat.managedProducts")}
@@ -306,7 +305,7 @@ export default function Dashboard() {
             <BlockStack gap="300">
               <SectionHeader
                 title={t("common.needsAttention")}
-                count={stats.unread}
+                count={stats.unread > 0 ? stats.unread : undefined}
                 action={{ content: t("common.viewAll"), to: "/app/notifications" }}
               />
               {notifications.length === 0 ? (
@@ -317,6 +316,9 @@ export default function Dashboard() {
                     <Box
                       key={n.id}
                       paddingBlock="200"
+                      paddingInline={n.readAt ? undefined : "200"}
+                      background={n.readAt ? undefined : "bg-surface-secondary"}
+                      borderRadius={n.readAt ? undefined : "200"}
                       borderBlockEndWidth={index < notifications.length - 1 ? "025" : undefined}
                       borderColor="border"
                     >

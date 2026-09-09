@@ -50,6 +50,8 @@ export const en = {
 
   // ---- Plan ---------------------------------------------------------------
   "dashboard.plan.manage": "Manage plan",
+  "dashboard.sync.alreadyRunning": "A sync is already running.",
+  "dashboard.sync.supplierAlreadyRunning": "A supplier check is already running.",
 } as const;
 
 export const vi: Partial<Record<keyof typeof en, string>> = {
@@ -86,4 +88,6 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   "dashboard.quick.openReports.hint": "Doanh thu, giá nhập và lợi nhuận theo ngày",
 
   "dashboard.plan.manage": "Quản lý gói",
+  "dashboard.sync.alreadyRunning": "Đang có một lượt đồng bộ chạy rồi.",
+  "dashboard.sync.supplierAlreadyRunning": "Đang có một lượt kiểm tra nhà cung cấp chạy rồi.",
 };
