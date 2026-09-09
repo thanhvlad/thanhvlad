@@ -1,16 +1,17 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { Link, useFetcher, useLoaderData, useNavigate, useSearchParams } from "@remix-run/react";
 import {
   Badge,
   Banner,
   BlockStack,
+  Box,
   Button,
   Card,
-  EmptyState,
   IndexTable,
   InlineStack,
   Layout,
+  Modal,
   Page,
   Select,
   Tabs,
@@ -18,8 +19,11 @@ import {
   TextField,
   useIndexResourceState,
 } from "@shopify/polaris";
+import { EmptyScreen } from "~/components/EmptyScreen";
+import { MarginText } from "~/components/import-margin";
 import { JobProgress } from "~/components/JobProgress";
 import { Paginator } from "~/components/Paginator";
+import { SectionHeader } from "~/components/SectionHeader";
 import { PlatformBadge, StatusBadge } from "~/components/StatusBadge";
 import { Thumb } from "~/components/Thumb";
 import { readForm, requireShop } from "~/lib/auth.server";
@@ -27,7 +31,7 @@ import { aiLandingAvailable } from "~/services/ai-landing.server";
 import { errorMessage } from "~/lib/errors";
 import { formatMoney, pageParam } from "~/lib/format";
 import { useJobRun } from "~/lib/use-job-run";
-import { useMessage, useT } from "~/lib/use-t";
+import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
 import { applyPricingRuleToImport, listImportList, removeFromImportList, summarizeMargins, addToImportList } from "~/services/import.server";
 import { createJobRun } from "~/services/jobs.server";
 import { enqueue } from "~/services/jobs/index.server";
@@ -38,6 +42,9 @@ import type { ImportStatus } from "@prisma/client";
 const MAX_CSV_ROWS = 500;
 
 const TABS: Array<ImportStatus | "ALL"> = ["ALL", "DRAFT", "FAILED", "PUSHED"];
+
+/** Intents that act on the selected rows, so the table shows the wait. */
+const BULK_INTENTS = new Set(["push", "rewrite", "remove", "apply-rule"]);
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
@@ -135,237 +142,344 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 };
 
+type ModalName = "add" | "rule" | "remove";
+
 export default function ImportListPage() {
   const t = useT();
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const actionMessage = useMessage(fetcher.data as Parameters<typeof useMessage>[0]);
+  const failureMessage = useErrorMessage(fetcher.data as Parameters<typeof useErrorMessage>[0]);
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const [search, setSearch] = useState(data.search);
   const [ruleId, setRuleId] = useState(data.rules.find((r) => r.isDefault)?.id ?? "");
   const [reference, setReference] = useState("");
   const [csv, setCsv] = useState("");
+  const [modal, setModal] = useState<ModalName | null>(null);
+  const [lastIntent, setLastIntent] = useState("");
   const items = data.list.items;
   const { selectedResources, allResourcesSelected, handleSelectionChange, clearSelection } = useIndexResourceState(items);
   const selectedIndex = TABS.findIndex((id) => id === data.status);
   const { jobRunId, clearJobRun } = useJobRun(fetcher.data, clearSelection);
 
-  const tabLabel = (id: ImportStatus | "ALL") =>
-    id === "DRAFT" ? t("import.tab.draft") : id === "FAILED" ? t("import.tab.failed") : id === "PUSHED" ? t("import.tab.pushed") : t("common.all");
+  const busy = fetcher.state !== "idle";
+  const pendingIntent = busy ? String(fetcher.formData?.get("intent") ?? "") : "";
+  const selectedCount = selectedResources.length;
+
+  // The list hides archived products, so the "All" count must too — otherwise
+  // the tab promises more rows than it shows.
+  const counts = data.list.counts;
+  const allCount = (Object.keys(counts) as ImportStatus[]).filter((s) => s !== "ARCHIVED").reduce((sum, s) => sum + (counts[s] ?? 0), 0);
+
+  // A modal launched the submission; close it once the server says yes, and
+  // clear the field that was just consumed. `fetcher.data` only changes per
+  // submission, so this runs once per outcome and not on every render.
+  const clearSelectionRef = useRef(clearSelection);
+  clearSelectionRef.current = clearSelection;
+  useEffect(() => {
+    if (fetcher.state !== "idle" || !fetcher.data || !fetcher.data.ok) return;
+    setModal(null);
+    if (lastIntent === "add") setReference("");
+    if (lastIntent === "import-csv") setCsv("");
+    if (lastIntent === "remove" || lastIntent === "apply-rule") clearSelectionRef.current();
+  }, [fetcher.state, fetcher.data, lastIntent]);
 
   const submit = (intent: string, extra: Record<string, string> = {}) => {
+    setLastIntent(intent);
     fetcher.submit({ intent, ids: selectedResources.join(","), ...extra }, { method: "post" });
   };
+  const submitForm = (intent: string, fields: Record<string, string>) => {
+    setLastIntent(intent);
+    fetcher.submit({ intent, ...fields }, { method: "post" });
+  };
+
+  const applySearch = (value: string) => {
+    const sp = new URLSearchParams(params);
+    if (value) sp.set("q", value);
+    else sp.delete("q");
+    sp.delete("page");
+    navigate(`?${sp.toString()}`);
+  };
+
+  const tabLabel = (id: ImportStatus | "ALL") =>
+    id === "DRAFT" ? t("import.tab.draft") : id === "FAILED" ? t("import.tab.failed") : id === "PUSHED" ? t("import.tab.pushed") : t("common.all");
+  const tabCount = (id: ImportStatus | "ALL") => (id === "ALL" ? allCount : (counts[id] ?? 0));
+
+  // A message that arrived with a job id announces work that has only started,
+  // so it reads as information, not as a result.
+  const messageTone = fetcher.data && "jobRunId" in fetcher.data && fetcher.data.jobRunId ? "info" : "success";
+  const modalFailure = failureMessage && (lastIntent === "add" || lastIntent === "import-csv") ? failureMessage : undefined;
+
+  const listIsEmpty = allCount === 0 && !data.search && data.status === "ALL";
+
+  const table = (
+    <IndexTable
+      resourceName={{ singular: t("import.resource.singular"), plural: t("import.resource.plural") }}
+      itemCount={items.length}
+      selectedItemsCount={allResourcesSelected ? "All" : selectedCount}
+      onSelectionChange={handleSelectionChange}
+      loading={busy && BULK_INTENTS.has(pendingIntent)}
+      promotedBulkActions={[
+        { content: t("import.list.bulk.push"), onAction: () => submit("push"), disabled: busy },
+        // Rewrites and publishes in one go: the merchant has already decided
+        // what the finished form looks like, so a review step in between
+        // would only be a step.
+        { content: t("import.list.bulk.rewrite"), onAction: () => submit("rewrite"), disabled: busy },
+        { content: t("action.remove"), onAction: () => setModal("remove"), disabled: busy },
+      ]}
+      bulkActions={[{ content: t("import.list.bulk.applyRule"), onAction: () => setModal("rule"), disabled: busy }]}
+      headings={[
+        { title: t("import.column.product") },
+        { title: t("common.variants"), alignment: "end" },
+        { title: t("common.cost"), alignment: "end" },
+        { title: t("common.price"), alignment: "end" },
+        { title: t("import.margin"), alignment: "end" },
+        { title: t("common.status") },
+      ]}
+    >
+      {items.map((item, index) => (
+        <IndexTable.Row id={item.id} key={item.id} position={index} selected={selectedResources.includes(item.id)}>
+          <IndexTable.Cell>
+            <InlineStack gap="300" blockAlign="center" wrap={false}>
+              <Thumb src={item.image} alt={item.title} />
+              <BlockStack gap="050">
+                <Link to={`/app/import/${item.id}`}>
+                  <Text as="span" fontWeight="semibold">
+                    {item.title}
+                  </Text>
+                </Link>
+                <InlineStack gap="200" blockAlign="center">
+                  {item.storeName ? (
+                    <Text as="span" tone="subdued" variant="bodySm">
+                      {item.storeName}
+                    </Text>
+                  ) : item.platform === "MANUAL" ? (
+                    <Text as="span" tone="subdued" variant="bodySm">
+                      {t("import.list.notLinked")}
+                    </Text>
+                  ) : (
+                    <PlatformBadge platform={item.platform} />
+                  )}
+                  {!item.available && <Badge tone="critical">{t("import.unavailable")}</Badge>}
+                </InlineStack>
+                {item.pushError && (
+                  <Text as="span" tone="critical" variant="bodySm">
+                    {item.pushError}
+                  </Text>
+                )}
+              </BlockStack>
+            </InlineStack>
+          </IndexTable.Cell>
+          <IndexTable.Cell>
+            <Text as="p" alignment="end" numeric>
+              {item.variantCount}
+            </Text>
+          </IndexTable.Cell>
+          <IndexTable.Cell>
+            <Text as="p" alignment="end" numeric>
+              {moneyRange(item.margins.minCost, item.margins.maxCost, data.currency)}
+            </Text>
+          </IndexTable.Cell>
+          <IndexTable.Cell>
+            <Text as="p" alignment="end" numeric>
+              {moneyRange(item.margins.minPrice, item.margins.maxPrice, data.currency)}
+            </Text>
+          </IndexTable.Cell>
+          <IndexTable.Cell>
+            <MarginText value={item.margins.avgMargin} />
+          </IndexTable.Cell>
+          <IndexTable.Cell>
+            {item.status === "PUSHED" && item.pushedProductId ? (
+              // The one sanctioned inline style: the anchor's underline runs
+              // under the badge and makes it look struck through.
+              <Link to={`/app/products/${item.pushedProductId}`} style={{ textDecoration: "none" }}>
+                <StatusBadge status={item.status} />
+              </Link>
+            ) : (
+              <StatusBadge status={item.status} />
+            )}
+          </IndexTable.Cell>
+        </IndexTable.Row>
+      ))}
+    </IndexTable>
+  );
 
   return (
     <Page
+      fullWidth
       title={t("page.import.title")}
       subtitle={t("page.import.subtitle")}
-      primaryAction={{ content: t("import.pushSelected"), disabled: selectedResources.length === 0, onAction: () => submit("push"), loading: fetcher.state !== "idle" }}
-      secondaryActions={[
-        {
-          // Rewrites and publishes in one go: the merchant has already decided
-          // what the finished form looks like, so a review step in between
-          // would only be a step.
-          content: t("import.rewriteSelected"),
-          disabled: selectedResources.length === 0 || fetcher.state !== "idle",
-          onAction: () => submit("rewrite"),
-        },
-        { content: t("nav.search"), url: "/app/search" },
-      ]}
+      primaryAction={{ content: t("import.list.addProducts"), onAction: () => setModal("add") }}
+      secondaryActions={[{ content: t("nav.search"), url: "/app/search" }]}
     >
       <Layout>
         <Layout.Section>
-          <JobProgress jobRunId={jobRunId} onDone={clearJobRun} />
-          {actionMessage && (
-            <Banner tone="success">
-              <p>{actionMessage}</p>
-            </Banner>
-          )}
-          {fetcher.data && "error" in fetcher.data && fetcher.data.error && (
-            <Banner tone="critical">
-              <p>{fetcher.data.error}</p>
-            </Banner>
-          )}
+          <BlockStack gap="300">
+            <JobProgress jobRunId={jobRunId} onDone={clearJobRun} />
+            {actionMessage && (
+              <Banner tone={messageTone}>
+                <p>{actionMessage}</p>
+              </Banner>
+            )}
+            {failureMessage && !modalFailure && (
+              <Banner tone="critical">
+                <p>{failureMessage}</p>
+              </Banner>
+            )}
+          </BlockStack>
         </Layout.Section>
 
         <Layout.Section>
-          <Card padding="0">
-            <Tabs
-              tabs={TABS.map((id) => ({
-                id,
-                content:
-                  id === "ALL"
-                    ? `${t("common.all")} (${Object.values(data.list.counts).reduce((a, b) => a + (b ?? 0), 0)})`
-                    : `${tabLabel(id)} (${data.list.counts[id as ImportStatus] ?? 0})`,
-              }))}
-              selected={selectedIndex < 0 ? 0 : selectedIndex}
-              onSelect={(i) => {
-                const sp = new URLSearchParams(params);
-                sp.set("status", TABS[i]);
-                sp.delete("page");
-                navigate(`?${sp.toString()}`);
-              }}
-            />
-            <div style={{ padding: "var(--p-space-300)" }}>
-              <InlineStack gap="300" blockAlign="end" wrap>
-                <div style={{ flex: 1, minWidth: 240 }}>
-                  <TextField
-                    label={t("action.search")}
-                    labelHidden
-                    value={search}
-                    onChange={setSearch}
-                    autoComplete="off"
-                    placeholder={t("import.searchPlaceholder")}
-                    onClearButtonClick={() => {
-                      setSearch("");
-                      navigate("?");
-                    }}
-                    clearButton
-                    connectedRight={
-                      <Button
-                        onClick={() => {
-                          const sp = new URLSearchParams(params);
-                          if (search) sp.set("q", search);
-                          else sp.delete("q");
-                          sp.delete("page");
-                          navigate(`?${sp.toString()}`);
-                        }}
-                      >
-                        {t("action.search")}
-                      </Button>
-                    }
-                  />
-                </div>
-                <Select
-                  label={t("import.pricingRule")}
+          {listIsEmpty ? (
+            <EmptyScreen heading={t("import.empty.heading")} body={t("import.list.empty.body")} action={{ content: t("nav.search"), url: "/app/search" }} />
+          ) : (
+            <Card padding="0">
+              <Tabs
+                tabs={TABS.map((id) => ({ id, content: `${tabLabel(id)} (${tabCount(id)})` }))}
+                selected={selectedIndex < 0 ? 0 : selectedIndex}
+                onSelect={(i) => {
+                  const sp = new URLSearchParams(params);
+                  sp.set("status", TABS[i]);
+                  sp.delete("page");
+                  navigate(`?${sp.toString()}`);
+                }}
+              />
+              <Box padding="300">
+                <TextField
+                  label={t("action.search")}
                   labelHidden
-                  options={[{ label: t("import.builtInDefaultRule"), value: "" }, ...data.rules.map((r) => ({ label: r.name, value: r.id }))]}
-                  value={ruleId}
-                  onChange={setRuleId}
+                  value={search}
+                  onChange={setSearch}
+                  autoComplete="off"
+                  placeholder={t("import.searchPlaceholder")}
+                  clearButton
+                  onClearButtonClick={() => {
+                    setSearch("");
+                    applySearch("");
+                  }}
+                  connectedRight={<Button onClick={() => applySearch(search)}>{t("action.search")}</Button>}
                 />
-                <Button disabled={selectedResources.length === 0} onClick={() => submit("apply-rule", { ruleId })}>
-                  {t("import.applyRule")}
-                </Button>
-                <Button tone="critical" disabled={selectedResources.length === 0} onClick={() => submit("remove")}>
-                  {t("action.remove")}
-                </Button>
-              </InlineStack>
-            </div>
-            {items.length === 0 ? (
-              <EmptyState
-                heading={t("import.empty.heading")}
-                image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
-                action={{ content: t("nav.search"), url: "/app/search" }}
-              >
-                <p>{t("import.empty.body")}</p>
-              </EmptyState>
-            ) : (
-              <IndexTable
-                resourceName={{ singular: t("import.resource.singular"), plural: t("import.resource.plural") }}
-                itemCount={items.length}
-                selectedItemsCount={allResourcesSelected ? "All" : selectedResources.length}
-                onSelectionChange={handleSelectionChange}
-                headings={[
-                  { title: t("import.column.product") },
-                  { title: t("common.supplier") },
-                  { title: t("common.variants") },
-                  { title: t("common.cost") },
-                  { title: t("common.price") },
-                  { title: t("import.margin") },
-                  { title: t("common.status") },
-                ]}
-              >
-                {items.map((item, index) => (
-                  <IndexTable.Row id={item.id} key={item.id} position={index} selected={selectedResources.includes(item.id)}>
-                    <IndexTable.Cell>
-                      <InlineStack gap="300" blockAlign="center" wrap={false}>
-                        <Thumb src={item.image} alt={item.title} />
-                        <BlockStack gap="050">
-                          <Link to={`/app/import/${item.id}`}>
-                            <Text as="span" fontWeight="semibold">
-                              {item.title}
-                            </Text>
-                          </Link>
-                          {item.pushError && (
-                            <Text as="span" tone="critical" variant="bodySm">
-                              {item.pushError}
-                            </Text>
-                          )}
-                        </BlockStack>
-                      </InlineStack>
-                    </IndexTable.Cell>
-                    <IndexTable.Cell>
-                      <BlockStack gap="050">
-                        <PlatformBadge platform={item.platform} />
-                        {item.storeName && (
-                          <Text as="span" tone="subdued" variant="bodySm">
-                            {item.storeName}
-                          </Text>
-                        )}
-                        {!item.available && <Badge tone="critical">{t("import.unavailable")}</Badge>}
-                      </BlockStack>
-                    </IndexTable.Cell>
-                    <IndexTable.Cell>{item.variantCount}</IndexTable.Cell>
-                    <IndexTable.Cell>
-                      {formatMoney(item.margins.minCost, data.currency)}
-                      {item.margins.minCost !== item.margins.maxCost ? ` – ${formatMoney(item.margins.maxCost, data.currency)}` : ""}
-                    </IndexTable.Cell>
-                    <IndexTable.Cell>
-                      {formatMoney(item.margins.minPrice, data.currency)}
-                      {item.margins.minPrice !== item.margins.maxPrice ? ` – ${formatMoney(item.margins.maxPrice, data.currency)}` : ""}
-                    </IndexTable.Cell>
-                    <IndexTable.Cell>{item.margins.avgMargin}%</IndexTable.Cell>
-                    <IndexTable.Cell>
-                      {item.status === "PUSHED" && item.pushedProductId ? (
-                        <Link to={`/app/products/${item.pushedProductId}`}>
-                          <StatusBadge status={item.status} />
-                        </Link>
-                      ) : (
-                        <StatusBadge status={item.status} />
-                      )}
-                    </IndexTable.Cell>
-                  </IndexTable.Row>
-                ))}
-              </IndexTable>
-            )}
-            <div style={{ padding: "var(--p-space-300)" }}>
-              <Paginator page={data.list.page} pageSize={data.list.pageSize} total={data.list.total} />
-            </div>
-          </Card>
-        </Layout.Section>
-
-        <Layout.Section variant="oneHalf">
-          <Card>
-            <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                {t("import.addByLink")}
-              </Text>
-              <TextField label={t("import.productUrlOrId")} labelHidden value={reference} onChange={setReference} autoComplete="off" placeholder="https://www.aliexpress.com/item/1005006001.html" />
-              <Button onClick={() => fetcher.submit({ intent: "add", reference }, { method: "post" })} disabled={!reference.trim()} loading={fetcher.state !== "idle"}>
-                {t("action.addToImport")}
-              </Button>
-            </BlockStack>
-          </Card>
-        </Layout.Section>
-        <Layout.Section variant="oneHalf">
-          <Card>
-            <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                {t("import.bulkCsv.title")}
-              </Text>
-              <Text as="p" tone="subdued">
-                {t("import.bulkCsv.help")}
-              </Text>
-              <TextField label={t("import.bulkCsv.field")} labelHidden multiline={4} value={csv} onChange={setCsv} autoComplete="off" placeholder={"url\nhttps://www.aliexpress.com/item/1005006001.html\n1005006002"} />
-              <Button onClick={() => fetcher.submit({ intent: "import-csv", csv }, { method: "post" })} disabled={!csv.trim()} loading={fetcher.state !== "idle"}>
-                {t("import.bulkCsv.action")}
-              </Button>
-            </BlockStack>
-          </Card>
+              </Box>
+              {items.length === 0 ? (
+                data.search ? (
+                  <EmptyScreen
+                    compact
+                    heading={t("import.list.noMatch.heading", { q: data.search })}
+                    body={t("import.list.noMatch.body")}
+                    action={{
+                      content: t("import.list.clearSearch"),
+                      onAction: () => {
+                        setSearch("");
+                        applySearch("");
+                      },
+                    }}
+                  />
+                ) : (
+                  <EmptyScreen
+                    compact
+                    heading={t("import.list.emptyTab.heading")}
+                    body={t("import.list.emptyTab.body")}
+                    action={{ content: t("common.viewAll"), url: "/app/import" }}
+                  />
+                )
+              ) : (
+                table
+              )}
+              <Box padding="300">
+                <Paginator page={data.list.page} pageSize={data.list.pageSize} total={data.list.total} />
+              </Box>
+            </Card>
+          )}
         </Layout.Section>
       </Layout>
+
+      <Modal open={modal === "add"} onClose={() => setModal(null)} title={t("import.list.addModal.title")}>
+        {modalFailure && (
+          <Modal.Section>
+            <Banner tone="critical">
+              <p>{modalFailure}</p>
+            </Banner>
+          </Modal.Section>
+        )}
+        <Modal.Section>
+          <BlockStack gap="300">
+            <SectionHeader title={t("import.addByLink")} />
+            <TextField
+              label={t("import.productUrlOrId")}
+              value={reference}
+              onChange={setReference}
+              autoComplete="off"
+              placeholder={t("import.list.linkPlaceholder")}
+              helpText={t("import.list.addByLink.help")}
+            />
+            <InlineStack align="end">
+              <Button onClick={() => submitForm("add", { reference })} disabled={!reference.trim() || busy} loading={pendingIntent === "add"}>
+                {t("action.addToImport")}
+              </Button>
+            </InlineStack>
+          </BlockStack>
+        </Modal.Section>
+        <Modal.Section>
+          <BlockStack gap="300">
+            <SectionHeader title={t("import.bulkCsv.title")} />
+            <TextField
+              label={t("import.bulkCsv.field")}
+              labelHidden
+              multiline={4}
+              value={csv}
+              onChange={setCsv}
+              autoComplete="off"
+              placeholder={t("import.list.csvPlaceholder")}
+              helpText={t("import.bulkCsv.help")}
+            />
+            <InlineStack align="end">
+              <Button onClick={() => submitForm("import-csv", { csv })} disabled={!csv.trim() || busy} loading={pendingIntent === "import-csv"}>
+                {t("import.bulkCsv.action")}
+              </Button>
+            </InlineStack>
+          </BlockStack>
+        </Modal.Section>
+      </Modal>
+
+      <Modal
+        open={modal === "rule"}
+        onClose={() => setModal(null)}
+        title={t("import.list.applyRuleModal.title", { n: selectedCount })}
+        primaryAction={{ content: t("import.applyRule"), onAction: () => submit("apply-rule", { ruleId }), loading: pendingIntent === "apply-rule", disabled: selectedCount === 0 }}
+        secondaryActions={[{ content: t("action.cancel"), onAction: () => setModal(null) }]}
+      >
+        <Modal.Section>
+          <BlockStack gap="300">
+            <Select
+              label={t("import.pricingRule")}
+              options={[{ label: t("import.builtInDefaultRule"), value: "" }, ...data.rules.map((r) => ({ label: r.name, value: r.id }))]}
+              value={ruleId}
+              onChange={setRuleId}
+            />
+            <Text as="p" tone="subdued">
+              {t("import.list.applyRuleModal.help")}
+            </Text>
+          </BlockStack>
+        </Modal.Section>
+      </Modal>
+
+      <Modal
+        open={modal === "remove"}
+        onClose={() => setModal(null)}
+        title={t("import.list.removeModal.title", { n: selectedCount })}
+        primaryAction={{ content: t("action.remove"), destructive: true, onAction: () => submit("remove"), loading: pendingIntent === "remove", disabled: selectedCount === 0 }}
+        secondaryActions={[{ content: t("action.cancel"), onAction: () => setModal(null) }]}
+      >
+        <Modal.Section>
+          <Text as="p">{t("import.list.removeModal.body")}</Text>
+        </Modal.Section>
+      </Modal>
     </Page>
   );
+}
+
+/** "$1.00 – $3.00", or a single figure when every variant costs the same. */
+function moneyRange(min: string, max: string, currency: string) {
+  return min === max ? formatMoney(min, currency) : `${formatMoney(min, currency)} – ${formatMoney(max, currency)}`;
 }

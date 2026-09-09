@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
 import { useFetcher, useLoaderData, useNavigate } from "@remix-run/react";
+import { useAppBridge } from "@shopify/app-bridge-react";
 import {
   Badge,
   Banner,
@@ -16,16 +17,22 @@ import {
   InlineGrid,
   InlineStack,
   Layout,
+  Modal,
   Page,
   Select,
-  Tabs,
   Text,
   TextField,
 } from "@shopify/polaris";
+import { ChevronLeftIcon, ChevronRightIcon, DeleteIcon } from "@shopify/polaris-icons";
+import { EmptyScreen } from "~/components/EmptyScreen";
+import { MarginText, marginTone } from "~/components/import-margin";
+import { SectionHeader } from "~/components/SectionHeader";
+import { Stat } from "~/components/Stat";
 import { PlatformBadge, StatusBadge } from "~/components/StatusBadge";
+import { Thumb } from "~/components/Thumb";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
-import { formatMoney } from "~/lib/format";
+import { formatMoney, formatPercent } from "~/lib/format";
 import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
 import {
   applyPricingRuleToImport,
@@ -152,14 +159,18 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   }
 };
 
+type Product = Awaited<ReturnType<typeof loader>>["product"];
+type Variant = Product["variants"][number];
+type ModalState = { kind: "remove" } | { kind: "split"; option: string } | null;
+
 export default function ImportEditPage() {
   const t = useT();
   const { product, rules, collections, shipping, currency, country } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
+  const shopify = useAppBridge();
   const actionMessage = useMessage(fetcher.data as Parameters<typeof useMessage>[0]);
   const failureMessage = useErrorMessage(fetcher.data as Parameters<typeof useErrorMessage>[0]);
   const navigate = useNavigate();
-  const [tab, setTab] = useState(0);
   const [form, setForm] = useState({ title: product.title, description: product.description, vendor: product.vendor, productType: product.productType, tags: product.tags, handle: product.handle });
   const [collectionsSel, setCollectionsSel] = useState<string[]>(product.collections);
   const [images, setImages] = useState<string[]>(product.images);
@@ -168,6 +179,11 @@ export default function ImportEditPage() {
   const [variants, setVariants] = useState(product.variants);
   const [ruleId, setRuleId] = useState(product.pricingRuleId);
   const [bulkPrice, setBulkPrice] = useState("");
+  const [modal, setModal] = useState<ModalState>(null);
+
+  const busy = fetcher.state !== "idle";
+  const pendingIntent = busy ? String(fetcher.formData?.get("intent") ?? "") : "";
+  const savedToast = fetcher.data && "messageKey" in fetcher.data && fetcher.data.messageKey === "msg.saved";
 
   // In an effect: calling navigate() from the render body updates the router
   // while another component is rendering, and runs twice under StrictMode, so
@@ -177,7 +193,34 @@ export default function ImportEditPage() {
     if (redirectTo) navigate(redirectTo);
   }, [redirectTo, navigate]);
 
+  // "Saved." is a toast, not a banner the merchant has to dismiss; anything
+  // else stays a banner. A successful outcome also closes whichever
+  // confirmation modal launched it.
+  useEffect(() => {
+    if (fetcher.state !== "idle" || !fetcher.data) return;
+    if (savedToast && actionMessage) shopify.toast.show(actionMessage);
+    if (fetcher.data.ok) setModal(null);
+  }, [fetcher.state, fetcher.data, savedToast, actionMessage, shopify]);
+
+  // Applying a pricing rule and saving both change what the server holds, so
+  // the fields are reloaded from the loader once it revalidates — but only
+  // then, or a background revalidation would wipe half-typed edits.
+  const reloadRef = useRef<"all" | "variants" | null>(null);
+  useEffect(() => {
+    const mode = reloadRef.current;
+    if (!mode) return;
+    reloadRef.current = null;
+    setVariants(product.variants);
+    if (mode === "all") {
+      setForm({ title: product.title, description: product.description, vendor: product.vendor, productType: product.productType, tags: product.tags, handle: product.handle });
+      setCollectionsSel(product.collections);
+      setImages(product.images);
+      setExcluded(product.excludedValues);
+    }
+  }, [product]);
+
   const save = () => {
+    reloadRef.current = "all";
     fetcher.submit(
       {
         intent: "save",
@@ -190,57 +233,63 @@ export default function ImportEditPage() {
       { method: "post" },
     );
   };
+  const applyRule = () => {
+    reloadRef.current = "variants";
+    fetcher.submit({ intent: "apply-rule", ruleId }, { method: "post" });
+  };
 
-  const updateVariant = (id: string, patch: Partial<(typeof variants)[number]>) => setVariants((vs) => vs.map((v) => (v.id === id ? { ...v, ...patch } : v)));
+  const updateVariant = (id: string, patch: Partial<Variant>) => setVariants((vs) => vs.map((v) => (v.id === id ? { ...v, ...patch } : v)));
   const optionValues = (index: number) => [...new Set(variants.map((v) => v.optionValues[index]).filter(Boolean))];
-  const isExcluded = (v: (typeof variants)[number]) => product.options.some((name, i) => (excluded[name] ?? []).includes(v.optionValues[i]));
+  const isExcluded = (v: Variant) => product.options.some((name, i) => (excluded[name] ?? []).includes(v.optionValues[i]));
 
-  const tabs = [
-    { id: "product", content: t("import.tab.product") },
-    { id: "description", content: t("import.tab.description") },
-    { id: "variants", content: `${t("common.variants")} (${variants.filter((v) => v.isEnabled && !isExcluded(v)).length}/${variants.length})` },
-    { id: "images", content: `${t("import.tab.images")} (${images.length})` },
-    { id: "shipping", content: t("nav.shipping") },
-  ];
+  // Save is only meaningful when something differs from what the server holds.
+  const initialSnapshot = useMemo(() => snapshot(product, product.variants), [product]);
+  const dirty = snapshot({ ...form, collections: collectionsSel, images, excludedValues: excluded }, variants) !== initialSnapshot;
+
+  const onSale = variants.filter((v) => v.isEnabled && !isExcluded(v));
+  const excludedCount = variants.filter((v) => isExcluded(v)).length;
+  const summary = summarize(onSale);
 
   return (
     <Page
       backAction={{ url: "/app/import" }}
       title={product.title}
+      subtitle={t("import.editor.subtitle")}
       titleMetadata={<StatusBadge status={product.status} />}
-      primaryAction={{ content: t("action.push"), onAction: () => fetcher.submit({ intent: "push" }, { method: "post" }), loading: fetcher.state !== "idle", disabled: product.status === "PUSHED" }}
+      primaryAction={{
+        content: t("action.push"),
+        onAction: () => fetcher.submit({ intent: "push" }, { method: "post" }),
+        loading: pendingIntent === "push",
+        disabled: product.status === "PUSHED" || busy,
+      }}
       secondaryActions={[
-        { content: t("action.save"), onAction: save },
-        { content: t("action.remove"), destructive: true, onAction: () => fetcher.submit({ intent: "remove" }, { method: "post" }) },
+        { content: t("action.save"), onAction: save, loading: pendingIntent === "save", disabled: !dirty || busy },
+        { content: t("action.remove"), destructive: true, onAction: () => setModal({ kind: "remove" }), disabled: busy },
       ]}
     >
       <Layout>
-        <Layout.Section>
-          {actionMessage && (
-            <Banner tone="success">
-              <p>{actionMessage}</p>
-            </Banner>
-          )}
-          {failureMessage && (
-            <Banner tone="critical">
-              <p>{failureMessage}</p>
-            </Banner>
-          )}
-          {product.pushError && product.status === "FAILED" && (
-            <Banner tone="critical" title={t("import.detail.pushFailed")}>
-              <p>{product.pushError}</p>
-            </Banner>
-          )}
-          {product.status === "PUSHED" && product.pushedProductId && (
-            <Banner tone="success" title={t("import.detail.alreadyInStore")} action={{ content: t("import.detail.openProduct"), url: `/app/products/${product.pushedProductId}` }} />
-          )}
-        </Layout.Section>
+        {((actionMessage && !savedToast) || failureMessage) && (
+          <Layout.Section>
+            <BlockStack gap="300">
+              {actionMessage && !savedToast && (
+                <Banner tone="success">
+                  <p>{actionMessage}</p>
+                </Banner>
+              )}
+              {failureMessage && (
+                <Banner tone="critical">
+                  <p>{failureMessage}</p>
+                </Banner>
+              )}
+            </BlockStack>
+          </Layout.Section>
+        )}
 
         <Layout.Section>
-          <Card padding="0">
-            <Tabs tabs={tabs} selected={tab} onSelect={setTab} />
-            <Box padding="400">
-              {tab === 0 && (
+          <BlockStack gap="400">
+            <Card>
+              <BlockStack gap="400">
+                <SectionHeader title={t("import.editor.section.details")} />
                 <FormLayout>
                   <TextField label={t("import.field.title")} value={form.title} onChange={(v) => setForm({ ...form, title: v })} autoComplete="off" maxLength={255} showCharacterCount />
                   <FormLayout.Group>
@@ -262,11 +311,21 @@ export default function ImportEditPage() {
                     </BlockStack>
                   )}
                 </FormLayout>
-              )}
+              </BlockStack>
+            </Card>
 
-              {tab === 1 && (
-                <BlockStack gap="300">
-                  <TextField label={t("import.field.description")} value={form.description} onChange={(v) => setForm({ ...form, description: v })} multiline={16} autoComplete="off" />
+            <Card>
+              <BlockStack gap="400">
+                <SectionHeader title={t("import.tab.description")} />
+                <TextField
+                  label={t("import.field.description")}
+                  value={form.description}
+                  onChange={(v) => setForm({ ...form, description: v })}
+                  multiline={12}
+                  autoComplete="off"
+                  helpText={t("import.editor.descriptionHelp")}
+                />
+                <BlockStack gap="200">
                   <Text as="p" fontWeight="semibold">
                     {t("import.preview")}
                   </Text>
@@ -274,13 +333,71 @@ export default function ImportEditPage() {
                     <div dangerouslySetInnerHTML={{ __html: form.description }} />
                   </Box>
                 </BlockStack>
-              )}
+              </BlockStack>
+            </Card>
 
-              {tab === 2 && (
-                <BlockStack gap="400">
+            <Card>
+              <BlockStack gap="400">
+                <SectionHeader title={t("import.tab.images")} count={images.length} />
+                <TextField
+                  label={t("import.addImageUrl")}
+                  value={newImage}
+                  onChange={setNewImage}
+                  autoComplete="off"
+                  connectedRight={
+                    <Button
+                      disabled={!newImage.trim()}
+                      onClick={() => {
+                        if (newImage.trim()) setImages((imgs) => [...imgs, newImage.trim()]);
+                        setNewImage("");
+                      }}
+                    >
+                      {t("action.add")}
+                    </Button>
+                  }
+                />
+                {images.length === 0 ? (
+                  <EmptyScreen compact heading={t("import.editor.images.empty")} body={t("import.editor.images.emptyBody")} />
+                ) : (
+                  <InlineGrid columns={{ xs: 3, sm: 4, md: 6 }} gap="300">
+                    {images.map((src, i) => (
+                      <Box key={`${src}-${i}`} borderColor="border" borderWidth="025" borderRadius="200" padding="200">
+                        <BlockStack gap="200" inlineAlign="center">
+                          <Thumb src={src} alt={form.title} size="large" />
+                          {i === 0 ? <Badge tone="info">{t("import.editor.images.featured")}</Badge> : <Badge>{String(i + 1)}</Badge>}
+                          <InlineStack gap="100" wrap={false}>
+                            <Button size="micro" icon={ChevronLeftIcon} accessibilityLabel={t("import.editor.images.moveEarlier")} disabled={i === 0} onClick={() => setImages((imgs) => swap(imgs, i, i - 1))} />
+                            <Button size="micro" icon={DeleteIcon} tone="critical" accessibilityLabel={t("action.remove")} onClick={() => setImages((imgs) => imgs.filter((_, j) => j !== i))} />
+                            <Button size="micro" icon={ChevronRightIcon} accessibilityLabel={t("import.editor.images.moveLater")} disabled={i === images.length - 1} onClick={() => setImages((imgs) => swap(imgs, i, i + 1))} />
+                          </InlineStack>
+                        </BlockStack>
+                      </Box>
+                    ))}
+                  </InlineGrid>
+                )}
+                <Text as="p" tone="subdued" variant="bodySm">
+                  {t("import.featuredImageHint")}
+                </Text>
+              </BlockStack>
+            </Card>
+
+            <Card>
+              <BlockStack gap="400">
+                <SectionHeader title={t("common.variants")} count={variants.length} />
+                <Text as="p" tone="subdued" variant="bodySm">
+                  {t("import.editor.stat.variantsHint", { enabled: onSale.length, total: variants.length })}
+                  {excludedCount > 0 ? ` · ${t("import.editor.variants.excludedHint", { n: excludedCount })}` : ""}
+                </Text>
+
+                <BlockStack gap="200">
+                  <Text as="p" fontWeight="semibold">
+                    {t("import.editor.variants.bulkPricing")}
+                  </Text>
                   <InlineStack gap="300" blockAlign="end" wrap>
                     <Select label={t("import.pricingRule")} options={[{ label: t("import.builtInDefault"), value: "" }, ...rules.map((r) => ({ label: r.name, value: r.id }))]} value={ruleId} onChange={setRuleId} />
-                    <Button onClick={() => fetcher.submit({ intent: "apply-rule", ruleId }, { method: "post" })}>{t("import.applyRuleAllVariants")}</Button>
+                    <Button onClick={applyRule} loading={pendingIntent === "apply-rule"} disabled={busy}>
+                      {t("import.applyRuleAllVariants")}
+                    </Button>
                     <TextField label={t("import.setAllPricesTo")} value={bulkPrice} onChange={setBulkPrice} type="number" autoComplete="off" prefix={currency} />
                     <Button
                       disabled={!bulkPrice}
@@ -292,172 +409,226 @@ export default function ImportEditPage() {
                       {t("action.apply")}
                     </Button>
                   </InlineStack>
+                </BlockStack>
 
-                  {product.options.length > 0 && (
-                    <BlockStack gap="200">
-                      <Text as="p" fontWeight="semibold">
-                        {t("import.excludeOptionValues")}
-                      </Text>
-                      {product.options.map((name, i) => (
-                        <InlineStack key={name} gap="200" blockAlign="center" wrap>
-                          <Text as="span" tone="subdued">
-                            {name}:
-                          </Text>
-                          {optionValues(i).map((value) => (
-                            <Checkbox
-                              key={value}
-                              label={value}
-                              checked={!(excluded[name] ?? []).includes(value)}
-                              onChange={(checked) =>
-                                setExcluded((e) => ({ ...e, [name]: checked ? (e[name] ?? []).filter((x) => x !== value) : [...(e[name] ?? []), value] }))
-                              }
-                            />
-                          ))}
-                          <Button size="slim" onClick={() => fetcher.submit({ intent: "split", option: name }, { method: "post" })}>
-                            {t("import.splitBy")} {name}
-                          </Button>
-                        </InlineStack>
-                      ))}
-                    </BlockStack>
-                  )}
-
-                  <Divider />
+                {product.options.length > 0 && (
                   <BlockStack gap="200">
-                    {variants.map((v) => {
-                      const off = isExcluded(v);
-                      const margin = Number(v.price) > 0 ? (((Number(v.price) - Number(v.cost)) / Number(v.price)) * 100).toFixed(1) : "0.0";
-                      return (
-                        <Box key={v.id} padding="300" background={off || !v.isEnabled ? "bg-surface-secondary" : undefined} borderRadius="200" borderColor="border" borderWidth="025">
-                          <InlineGrid columns={{ xs: 1, md: ["oneThird", "twoThirds"] }} gap="300">
-                            <InlineStack gap="300" blockAlign="center">
-                              <Checkbox label="" labelHidden checked={v.isEnabled && !off} disabled={off} onChange={(checked) => updateVariant(v.id, { isEnabled: checked })} />
-                              {v.image && <img src={v.image} alt="" width={48} height={48} style={{ borderRadius: 8, objectFit: "cover" }} />}
-                              <BlockStack gap="050">
-                                <Text as="p" fontWeight="semibold">
-                                  {v.title}
-                                </Text>
-                                <InlineStack gap="100">
-                                  <Text as="span" tone="subdued" variant="bodySm">
-                                    {t("common.cost")} {formatMoney(v.cost, currency)}
-                                  </Text>
-                                  <Text as="span" tone="subdued" variant="bodySm">
-                                    · {t("import.margin")} {margin}%
-                                  </Text>
-                                  {v.supplierStock !== null && (
-                                    <Badge tone={v.supplierAvailable && v.supplierStock > 0 ? "success" : "critical"}>{`${t("common.stock")} ${v.supplierStock}`}</Badge>
-                                  )}
-                                </InlineStack>
-                              </BlockStack>
-                            </InlineStack>
-                            <InlineGrid columns={{ xs: 2, md: 4 }} gap="200">
-                              <TextField label={t("common.price")} type="number" value={v.price} onChange={(val) => updateVariant(v.id, { price: val })} autoComplete="off" prefix={currency} />
-                              <TextField label={t("import.field.compareAt")} type="number" value={v.compareAtPrice} onChange={(val) => updateVariant(v.id, { compareAtPrice: val })} autoComplete="off" prefix={currency} />
-                              <TextField label={t("import.field.sku")} value={v.sku} onChange={(val) => updateVariant(v.id, { sku: val })} autoComplete="off" />
-                              <TextField label={t("import.field.inventory")} type="number" value={String(v.inventory)} onChange={(val) => updateVariant(v.id, { inventory: Number(val) })} autoComplete="off" />
-                            </InlineGrid>
-                          </InlineGrid>
-                        </Box>
-                      );
-                    })}
-                  </BlockStack>
-                </BlockStack>
-              )}
-
-              {tab === 3 && (
-                <BlockStack gap="300">
-                  <InlineStack gap="200" blockAlign="end">
-                    <div style={{ flex: 1 }}>
-                      <TextField label={t("import.addImageUrl")} value={newImage} onChange={setNewImage} autoComplete="off" />
-                    </div>
-                    <Button
-                      onClick={() => {
-                        if (newImage.trim()) setImages((imgs) => [...imgs, newImage.trim()]);
-                        setNewImage("");
-                      }}
-                    >
-                      {t("action.add")}
-                    </Button>
-                  </InlineStack>
-                  <InlineGrid columns={{ xs: 2, sm: 3, md: 5 }} gap="200">
-                    {images.map((src, i) => (
-                      <Box key={`${src}-${i}`} borderColor="border" borderWidth="025" borderRadius="200" padding="100">
-                        <BlockStack gap="100">
-                          <img src={src} alt="" style={{ width: "100%", aspectRatio: "1/1", objectFit: "cover", borderRadius: 6 }} />
-                          <InlineStack gap="100" align="space-between">
-                            <Button size="micro" disabled={i === 0} onClick={() => setImages((imgs) => swap(imgs, i, i - 1))}>
-                              ←
-                            </Button>
-                            <Button size="micro" tone="critical" onClick={() => setImages((imgs) => imgs.filter((_, j) => j !== i))}>
-                              {t("action.remove")}
-                            </Button>
-                            <Button size="micro" disabled={i === images.length - 1} onClick={() => setImages((imgs) => swap(imgs, i, i + 1))}>
-                              →
-                            </Button>
-                          </InlineStack>
-                        </BlockStack>
-                      </Box>
+                    <Text as="p" fontWeight="semibold">
+                      {t("import.excludeOptionValues")}
+                    </Text>
+                    {product.options.map((name, i) => (
+                      <InlineStack key={name} gap="200" blockAlign="center" wrap>
+                        <Text as="span" tone="subdued">
+                          {name}:
+                        </Text>
+                        {optionValues(i).map((value) => (
+                          <Checkbox
+                            key={value}
+                            label={value}
+                            checked={!(excluded[name] ?? []).includes(value)}
+                            onChange={(checked) =>
+                              setExcluded((e) => ({ ...e, [name]: checked ? (e[name] ?? []).filter((x) => x !== value) : [...(e[name] ?? []), value] }))
+                            }
+                          />
+                        ))}
+                        <Button size="slim" onClick={() => setModal({ kind: "split", option: name })} disabled={busy}>
+                          {t("import.splitBy")} {name}
+                        </Button>
+                      </InlineStack>
                     ))}
-                  </InlineGrid>
-                  <Text as="p" tone="subdued" variant="bodySm">
-                    {t("import.featuredImageHint")}
-                  </Text>
-                </BlockStack>
-              )}
+                  </BlockStack>
+                )}
 
-              {tab === 4 && (
-                <BlockStack gap="300">
-                  <Text as="p" tone="subdued">
-                    {t("import.shipping.introPrefix")} {country} {t("import.shipping.introSuffix")}
-                  </Text>
-                  {shipping.length === 0 ? (
-                    <Text as="p">{t("import.shipping.noQuotes")}</Text>
-                  ) : (
-                    <DataTable
-                      columnContentTypes={["text", "numeric", "text", "text"]}
-                      headings={[t("import.shipping.carrier"), t("common.cost"), t("import.shipping.delivery"), t("nav.tracking")]}
-                      rows={shipping.map((s) => [
-                        s.carrierName,
-                        formatMoney(s.cost, s.currency),
-                        s.minDeliveryDays && s.maxDeliveryDays ? `${s.minDeliveryDays}–${s.maxDeliveryDays} ${t("import.shipping.days")}` : "—",
-                        s.hasTracking ? t("common.yes") : t("common.no"),
-                      ])}
-                    />
-                  )}
-                </BlockStack>
-              )}
-            </Box>
-          </Card>
+                <Divider />
+
+                {variants.length === 0 ? (
+                  <EmptyScreen compact heading={t("import.editor.variants.empty")} body={t("import.editor.variants.emptyBody")} />
+                ) : (
+                  <DataTable
+                    columnContentTypes={["text", "numeric", "numeric", "numeric", "numeric", "text", "numeric"]}
+                    headings={[t("import.column.product"), t("common.cost"), t("common.price"), t("import.field.compareAt"), t("import.margin"), t("import.field.sku"), t("import.field.inventory")]}
+                    verticalAlign="middle"
+                    rows={variants.map((v) => {
+                      const off = isExcluded(v);
+                      const price = Number(v.price);
+                      const margin = price > 0 ? ((price - Number(v.cost)) / price) * 100 : 0;
+                      return [
+                        <InlineStack key={`${v.id}-product`} gap="200" blockAlign="center" wrap={false}>
+                          <Checkbox label={t("import.editor.variants.includeVariant")} labelHidden checked={v.isEnabled && !off} disabled={off} onChange={(checked) => updateVariant(v.id, { isEnabled: checked })} />
+                          <Thumb src={v.image} alt={v.title} />
+                          <BlockStack gap="050">
+                            <Text as="span" fontWeight="semibold" tone={off || !v.isEnabled ? "subdued" : undefined}>
+                              {v.title}
+                            </Text>
+                            {v.supplierStock !== null && (
+                              <InlineStack>
+                                <Badge tone={v.supplierAvailable && v.supplierStock > 0 ? "success" : "critical"}>{`${t("common.stock")} ${v.supplierStock}`}</Badge>
+                              </InlineStack>
+                            )}
+                          </BlockStack>
+                        </InlineStack>,
+                        <Text key={`${v.id}-cost`} as="span" numeric>
+                          {formatMoney(v.cost, currency)}
+                        </Text>,
+                        <TextField key={`${v.id}-price`} label={t("common.price")} labelHidden type="number" value={v.price} onChange={(val) => updateVariant(v.id, { price: val })} autoComplete="off" prefix={currency} />,
+                        <TextField key={`${v.id}-compare`} label={t("import.field.compareAt")} labelHidden type="number" value={v.compareAtPrice} onChange={(val) => updateVariant(v.id, { compareAtPrice: val })} autoComplete="off" prefix={currency} />,
+                        <MarginText key={`${v.id}-margin`} value={margin} />,
+                        <TextField key={`${v.id}-sku`} label={t("import.field.sku")} labelHidden value={v.sku} onChange={(val) => updateVariant(v.id, { sku: val })} autoComplete="off" />,
+                        <TextField key={`${v.id}-inventory`} label={t("import.field.inventory")} labelHidden type="number" value={String(v.inventory)} onChange={(val) => updateVariant(v.id, { inventory: Number(val) })} autoComplete="off" />,
+                      ];
+                    })}
+                  />
+                )}
+              </BlockStack>
+            </Card>
+
+            <Card>
+              <BlockStack gap="400">
+                <SectionHeader title={t("nav.shipping")} />
+                <Text as="p" tone="subdued">
+                  {t("import.editor.shipping.intro", { country })}
+                </Text>
+                {shipping.length === 0 ? (
+                  <EmptyScreen compact heading={t("import.shipping.noQuotes")} body={t("import.editor.shipping.noQuotesBody")} />
+                ) : (
+                  <DataTable
+                    columnContentTypes={["text", "numeric", "text", "text"]}
+                    headings={[t("import.shipping.carrier"), t("common.cost"), t("import.shipping.delivery"), t("nav.tracking")]}
+                    rows={shipping.map((s) => [
+                      s.carrierName,
+                      formatMoney(s.cost, s.currency),
+                      s.minDeliveryDays && s.maxDeliveryDays ? `${s.minDeliveryDays}–${s.maxDeliveryDays} ${t("import.shipping.days")}` : "—",
+                      s.hasTracking ? t("common.yes") : t("common.no"),
+                    ])}
+                  />
+                )}
+              </BlockStack>
+            </Card>
+          </BlockStack>
         </Layout.Section>
 
         <Layout.Section variant="oneThird">
-          <Card>
-            <BlockStack gap="200">
-              <Text as="h2" variant="headingMd">
-                {t("common.supplier")}
-              </Text>
-              {product.supplier ? (
-                <BlockStack gap="100">
-                  <PlatformBadge platform={product.supplier.platform} />
-                  {product.supplier.storeName && <Text as="p">{product.supplier.storeName}</Text>}
-                  <InlineStack gap="200">
-                    {product.supplier.rating ? <Badge>{`★ ${product.supplier.rating.toFixed(1)}`}</Badge> : null}
-                    {product.supplier.orderCount ? <Badge>{`${product.supplier.orderCount.toLocaleString()} ${t("import.supplier.orders")}`}</Badge> : null}
-                  </InlineStack>
-                  {product.supplier.url && (
-                    <Button url={product.supplier.url} external size="slim">
-                      {t("import.supplier.openPage")}
-                    </Button>
-                  )}
-                </BlockStack>
-              ) : (
-                <Text as="p" tone="subdued">
-                  {t("import.supplier.notLinked")}
+          <BlockStack gap="400">
+            <Card>
+              <BlockStack gap="400">
+                <SectionHeader title={t("import.editor.section.pricing")} />
+                <InlineGrid columns={{ xs: 2 }} gap="400">
+                  <Stat plain size="medium" label={t("import.editor.stat.cost")} value={summary ? moneyRange(summary.minCost, summary.maxCost, currency) : "—"} />
+                  <Stat plain size="medium" label={t("import.editor.stat.price")} value={summary ? moneyRange(summary.minPrice, summary.maxPrice, currency) : "—"} />
+                  <Stat
+                    plain
+                    size="medium"
+                    label={t("import.editor.stat.margin")}
+                    value={summary ? formatPercent(summary.avgMargin) : "—"}
+                    tone={summary ? marginTone(summary.avgMargin) : "subdued"}
+                  />
+                  <Stat
+                    plain
+                    size="medium"
+                    label={t("import.editor.stat.profit")}
+                    value={summary ? moneyRange(summary.minProfit, summary.maxProfit, currency) : "—"}
+                    tone={summary && summary.minProfit < 0 ? "critical" : "default"}
+                  />
+                </InlineGrid>
+                <Text as="p" tone="subdued" variant="bodySm">
+                  {summary ? t("import.editor.stat.variantsHint", { enabled: onSale.length, total: variants.length }) : t("import.editor.stat.noVariants")}
                 </Text>
-              )}
-            </BlockStack>
-          </Card>
+              </BlockStack>
+            </Card>
+
+            <Card>
+              <BlockStack gap="300">
+                <InlineStack align="space-between" blockAlign="center" gap="200">
+                  <Text as="h2" variant="headingMd">
+                    {t("common.status")}
+                  </Text>
+                  <InlineStack gap="200">
+                    {dirty && <Badge tone="attention">{t("import.editor.unsaved")}</Badge>}
+                    <StatusBadge status={product.status} />
+                  </InlineStack>
+                </InlineStack>
+                <Text as="p" tone="subdued">
+                  {t(`import.editor.status.${product.status}`)}
+                </Text>
+                {dirty && (
+                  <Text as="p" tone="caution">
+                    {t("import.editor.unsavedHint")}
+                  </Text>
+                )}
+                {product.pushError && product.status === "FAILED" && (
+                  <Banner tone="critical" title={t("import.detail.pushFailed")}>
+                    <p>{product.pushError}</p>
+                  </Banner>
+                )}
+                {product.status === "PUSHED" && product.pushedProductId && (
+                  <InlineStack>
+                    <Button url={`/app/products/${product.pushedProductId}`}>{t("import.detail.openProduct")}</Button>
+                  </InlineStack>
+                )}
+              </BlockStack>
+            </Card>
+
+            <Card>
+              <BlockStack gap="300">
+                <SectionHeader title={t("common.supplier")} />
+                {product.supplier ? (
+                  <BlockStack gap="200">
+                    <InlineStack gap="200" blockAlign="center">
+                      <PlatformBadge platform={product.supplier.platform} />
+                      {product.supplier.storeName && <Text as="span">{product.supplier.storeName}</Text>}
+                    </InlineStack>
+                    <InlineStack gap="200">
+                      {product.supplier.rating ? <Badge>{`★ ${product.supplier.rating.toFixed(1)}`}</Badge> : null}
+                      {product.supplier.orderCount ? <Badge>{`${product.supplier.orderCount.toLocaleString()} ${t("import.supplier.orders")}`}</Badge> : null}
+                    </InlineStack>
+                    {product.supplier.url && (
+                      <InlineStack>
+                        <Button url={product.supplier.url} external size="slim">
+                          {t("import.supplier.openPage")}
+                        </Button>
+                      </InlineStack>
+                    )}
+                  </BlockStack>
+                ) : (
+                  <Text as="p" tone="subdued">
+                    {t("import.supplier.notLinked")}
+                  </Text>
+                )}
+              </BlockStack>
+            </Card>
+          </BlockStack>
         </Layout.Section>
       </Layout>
+
+      <Modal
+        open={modal?.kind === "remove"}
+        onClose={() => setModal(null)}
+        title={t("import.editor.removeModal.title")}
+        primaryAction={{ content: t("action.remove"), destructive: true, onAction: () => fetcher.submit({ intent: "remove" }, { method: "post" }), loading: pendingIntent === "remove" }}
+        secondaryActions={[{ content: t("action.cancel"), onAction: () => setModal(null) }]}
+      >
+        <Modal.Section>
+          <Text as="p">{t("import.editor.removeModal.body")}</Text>
+        </Modal.Section>
+      </Modal>
+
+      <Modal
+        open={modal?.kind === "split"}
+        onClose={() => setModal(null)}
+        title={t("import.editor.splitModal.title", { option: modal?.kind === "split" ? modal.option : "" })}
+        primaryAction={{
+          content: t("import.editor.splitModal.confirm"),
+          onAction: () => {
+            if (modal?.kind === "split") fetcher.submit({ intent: "split", option: modal.option }, { method: "post" });
+          },
+          loading: pendingIntent === "split",
+        }}
+        secondaryActions={[{ content: t("action.cancel"), onAction: () => setModal(null) }]}
+      >
+        <Modal.Section>
+          <Text as="p">{t("import.editor.splitModal.body", { option: modal?.kind === "split" ? modal.option : "" })}</Text>
+        </Modal.Section>
+      </Modal>
     </Page>
   );
 }
@@ -466,4 +637,49 @@ function swap<T>(arr: T[], a: number, b: number): T[] {
   const next = [...arr];
   [next[a], next[b]] = [next[b], next[a]];
   return next;
+}
+
+/** Everything the Save action sends, in one comparable string. */
+function snapshot(
+  fields: { title: string; description: string; vendor: string; productType: string; tags: string; handle: string; collections: string[]; images: string[]; excludedValues: Record<string, string[]> },
+  variants: Variant[],
+) {
+  return JSON.stringify({
+    title: fields.title,
+    description: fields.description,
+    vendor: fields.vendor,
+    productType: fields.productType,
+    tags: fields.tags,
+    handle: fields.handle,
+    collections: fields.collections,
+    images: fields.images,
+    excludedValues: fields.excludedValues,
+    variants: variants.map((v) => ({ id: v.id, price: v.price, compareAtPrice: v.compareAtPrice, sku: v.sku, inventory: v.inventory, isEnabled: v.isEnabled })),
+  });
+}
+
+/**
+ * The figures for the pricing summary, from the variants as they are being
+ * edited rather than as saved, so a price change shows its margin at once.
+ */
+function summarize(rows: Array<{ cost: string; price: string }>) {
+  if (rows.length === 0) return null;
+  const costs = rows.map((r) => Number(r.cost) || 0);
+  const prices = rows.map((r) => Number(r.price) || 0);
+  const profits = rows.map((_, i) => prices[i] - costs[i]);
+  const margins = rows.map((_, i) => (prices[i] > 0 ? (profits[i] / prices[i]) * 100 : 0));
+  return {
+    minCost: Math.min(...costs),
+    maxCost: Math.max(...costs),
+    minPrice: Math.min(...prices),
+    maxPrice: Math.max(...prices),
+    minProfit: Math.min(...profits),
+    maxProfit: Math.max(...profits),
+    avgMargin: margins.reduce((a, b) => a + b, 0) / margins.length,
+  };
+}
+
+/** "$1.00 – $3.00", or a single figure when every variant is the same. */
+function moneyRange(min: number, max: number, currency: string) {
+  return min === max ? formatMoney(min, currency) : `${formatMoney(min, currency)} – ${formatMoney(max, currency)}`;
 }
