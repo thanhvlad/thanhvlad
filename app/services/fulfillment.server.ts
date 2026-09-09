@@ -101,7 +101,22 @@ function idempotencyKeyFor(orderId: string, platform: string, lines: GroupLine[]
  * and a merchant clicking "Order now" at the same moment cannot both decide the
  * order is unordered and both place it upstream.
  */
-export async function placeSupplierOrders(shop: ShopWithSettings, orderId: string, options: { force?: boolean; actor?: string; supplierNote?: string | null } = {}): Promise<PlaceOrderOutcome> {
+export async function placeSupplierOrders(
+  shop: ShopWithSettings,
+  orderId: string,
+  options: {
+    force?: boolean;
+    actor?: string;
+    supplierNote?: string | null;
+    /**
+     * Restrict placement to these Shopify line items. Shopify splits an order
+     * into several fulfilment orders and asks about them one at a time, so
+     * without a scope a single "Request fulfillment" on one of them orders
+     * every outstanding line on the whole order upstream.
+     */
+    shopifyLineItemIds?: string[];
+  } = {},
+): Promise<PlaceOrderOutcome> {
   const order = await evaluateAndStoreOrder(shop, orderId);
   const full = await prisma.order.findUnique({ where: { id: orderId }, include: { lineItems: true, purchaseOrders: true } });
   if (!full) return { orderId, ok: false, purchaseOrderIds: [], error: "Order not found" };
@@ -114,8 +129,11 @@ export async function placeSupplierOrders(shop: ShopWithSettings, orderId: strin
 
   const covered = await coveredSupplierLines(orderId);
 
+  const scope = options.shopifyLineItemIds?.length ? new Set(options.shopifyLineItemIds) : null;
+
   const groups = new Map<string, Group>();
   for (const li of full.lineItems) {
+    if (scope && !scope.has(li.shopifyLineItemId)) continue;
     if (!li.productVariantId || li.isCanceled || li.isFulfilled) continue;
     const resolution = lineResolution(li);
     if (!resolution?.ok) continue;

@@ -357,7 +357,16 @@ export async function handleFulfillmentRequest(shop: ShopWithSettings, topic: st
   // Place the supplier order right away when nothing blocks it; otherwise the
   // order sits in the pipeline with its reasons visible, as usual.
   if (blocking.length === 0) {
-    const outcome = await placeSupplierOrders(shop, order.id, { actor: "fulfillment-request" });
+    // Only the lines Shopify actually asked about. parsed.lineItems was stored
+    // on the request row and never read, so a request covering one fulfilment
+    // order placed every outstanding line on the whole order upstream.
+    const requestedLineIds = parsed.lineItems
+      .map((li) => li.shopifyLineItemId)
+      .filter((id): id is string => Boolean(id));
+    const outcome = await placeSupplierOrders(shop, order.id, {
+      actor: "fulfillment-request",
+      shopifyLineItemIds: requestedLineIds,
+    });
     if (!outcome.ok) {
       await notify(shop.id, {
         type: "order.failed",
