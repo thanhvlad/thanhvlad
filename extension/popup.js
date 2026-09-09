@@ -8,6 +8,18 @@ document.getElementById("options").addEventListener("click", (e) => {
   chrome.runtime.openOptionsPage();
 });
 
+function appOrigin(raw) {
+  // The App URL field takes an ORIGIN. A value carrying the endpoint path makes
+  // the request url double up (".../api/extension/capture/api/extension/capture")
+  // and the browser reports only "Failed to fetch". Keep the origin, drop the rest.
+  const value = /^https?:\/\//i.test(raw.trim()) ? raw.trim() : `https://${raw.trim()}`;
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
+
 async function currentTabUrl() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab?.url ?? "";
@@ -29,7 +41,11 @@ function looksLikeProduct(url) {
     status.innerHTML = '<span class="err">Set the app URL and token in options.</span>';
     return;
   }
-  const base = (/^https?:\/\//i.test(appUrl) ? appUrl : `https://${appUrl}`).replace(/\/+$/, "");
+  const base = appOrigin(appUrl);
+  if (!base) {
+    status.innerHTML = `<span class="err">"${appUrl}" is not a valid app URL.</span>`;
+    return;
+  }
   const endpoint = `${base}/api/extension/capture`;
   button.disabled = false;
   button.addEventListener("click", async () => {

@@ -24,7 +24,7 @@ function normaliseAppUrl(raw) {
     return { error: `"${raw.trim()}" is not a valid URL.` };
   }
   if (parsed.pathname !== "/" && parsed.pathname !== "") {
-    return { error: `Use only the origin, without a path: ${parsed.origin}` };
+    return { error: `Enter only the origin, without a path. Did you mean ${parsed.origin} ?` };
   }
   return { value: parsed.origin };
 }

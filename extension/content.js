@@ -69,6 +69,18 @@ function buildButton() {
   return host;
 }
 
+function appOrigin(raw) {
+  // The App URL field takes an ORIGIN. A value carrying the endpoint path makes
+  // the request url double up (".../api/extension/capture/api/extension/capture")
+  // and the browser reports only "Failed to fetch". Keep the origin, drop the rest.
+  const value = /^https?:\/\//i.test(raw.trim()) ? raw.trim() : `https://${raw.trim()}`;
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
+
 async function send(button, msg) {
   button.disabled = true;
   msg.className = "msg";
@@ -82,10 +94,13 @@ async function send(button, msg) {
     return;
   }
 
-  // Heal a value saved before options.js validated it: without a scheme the
-  // string is a RELATIVE url, so the browser looks inside the extension and
-  // the only symptom is a bare "Failed to fetch".
-  const base = (/^https?:\/\//i.test(appUrl) ? appUrl : `https://${appUrl}`).replace(/\/+$/, "");
+  const base = appOrigin(appUrl);
+  if (!base) {
+    msg.className = "msg err";
+    msg.textContent = `"${appUrl}" is not a valid app URL. Set it in the extension options.`;
+    button.disabled = false;
+    return;
+  }
   const endpoint = `${base}${ENDPOINT}`;
 
   try {
