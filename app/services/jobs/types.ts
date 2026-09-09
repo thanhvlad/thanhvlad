@@ -4,6 +4,12 @@
 export interface JobPayloads {
   /** Push a batch of import-list products to Shopify. */
   "push-products": { shopId: string; importedProductIds: string[]; jobRunId: string; actor?: string };
+  /**
+   * Rewrite import-list products into finished landing pages and, by default,
+   * push them straight to the store. Each product is one Claude call over a
+   * long contract, so this cannot run inside a request.
+   */
+  "rewrite-landing": { shopId: string; importedProductIds: string[]; jobRunId: string; actor?: string; pushAfter?: boolean };
   /** Place supplier orders for a batch of Shopify orders. */
   "place-orders": { shopId: string; orderIds: string[]; jobRunId: string; actor?: string };
   /**

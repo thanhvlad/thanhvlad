@@ -3,6 +3,7 @@ import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
 import { refreshRates } from "../currency.server";
 import { placeSupplierOrders, syncOpenPurchaseOrders, syncPendingTracking } from "../fulfillment.server";
+import { landingExamples, rewriteImportedProduct } from "../landing-rewrite.server";
 import { addToImportList, pushImportedProduct } from "../import.server";
 import { runInventorySync } from "../inventory-sync.server";
 import { runJob } from "../jobs.server";
@@ -23,6 +24,43 @@ import { enqueue, registerHandler } from "./queue.server";
  * retries are safe.
  */
 export function registerAllHandlers() {
+  registerHandler("rewrite-landing", async ({ shopId, importedProductIds, jobRunId, actor, pushAfter }) => {
+    const shop = await getShopById(shopId);
+    if (!shop) return;
+    const client = await offlineClient(shop.domain);
+    return runJob(jobRunId, async ({ progress }) => {
+      // Fetched once for the batch: the same worked examples serve every
+      // product, and they cost tokens on each call.
+      const examples = await landingExamples(shop.id);
+      let ok = 0;
+      let failed = 0;
+      const results: Array<{ id: string; ok: boolean; title?: string; error?: string }> = [];
+      for (const id of importedProductIds) {
+        const rewrite = await rewriteImportedProduct(shop, id, { actor, examples });
+        let error = rewrite.error;
+        let succeeded = rewrite.ok;
+        // Only a page that passed the contract check is allowed near the store.
+        if (succeeded && pushAfter) {
+          const pushed = await pushImportedProduct(shop, client, id, actor);
+          succeeded = pushed.ok;
+          if (!pushed.ok) error = pushed.error;
+        }
+        results.push({ id, ok: succeeded, title: rewrite.title, error });
+        if (succeeded) ok += 1;
+        else failed += 1;
+        await progress({ processed: 1, succeeded: succeeded ? 1 : 0, failed: succeeded ? 0 : 1 });
+      }
+      await notify(shopId, {
+        type: "job.finished",
+        severity: failed ? "warning" : "info",
+        title: `Rewrote ${ok} landing page(s)${failed ? `, ${failed} failed` : ""}`,
+        body: failed ? "Open the import list to see which rule each rejected page broke." : undefined,
+        link: failed ? "/app/import" : "/app/products",
+      });
+      return { ok, failed, results };
+    });
+  });
+
   registerHandler("push-products", async ({ shopId, importedProductIds, jobRunId, actor }) => {
     const shop = await getShopById(shopId);
     if (!shop) return;

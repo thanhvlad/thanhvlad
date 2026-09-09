@@ -23,6 +23,7 @@ import { Paginator } from "~/components/Paginator";
 import { PlatformBadge, StatusBadge } from "~/components/StatusBadge";
 import { Thumb } from "~/components/Thumb";
 import { readForm, requireShop } from "~/lib/auth.server";
+import { aiLandingAvailable } from "~/services/ai-landing.server";
 import { errorMessage } from "~/lib/errors";
 import { formatMoney, pageParam } from "~/lib/format";
 import { useJobRun } from "~/lib/use-job-run";
@@ -82,6 +83,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         if (ids.length === 0) return { ok: false, error: "Select at least one product." };
         const job = await createJobRun({ shopId: shop.id, type: "push-products", total: ids.length, payload: { ids } });
         await enqueue("push-products", { shopId: shop.id, importedProductIds: ids, jobRunId: job.id, actor });
+        return { ok: true, jobRunId: job.id };
+      }
+      case "rewrite": {
+        if (ids.length === 0) return { ok: false, error: "Select at least one product." };
+        if (!aiLandingAvailable()) return { ok: false, error: "Add an ANTHROPIC_API_KEY to use the AI rewrite." };
+        const job = await createJobRun({ shopId: shop.id, type: "rewrite-landing", total: ids.length, payload: { ids } });
+        await enqueue("rewrite-landing", { shopId: shop.id, importedProductIds: ids, jobRunId: job.id, actor, pushAfter: true });
         return { ok: true, jobRunId: job.id };
       }
       case "remove": {
@@ -155,7 +163,17 @@ export default function ImportListPage() {
       title={t("page.import.title")}
       subtitle={t("page.import.subtitle")}
       primaryAction={{ content: t("import.pushSelected"), disabled: selectedResources.length === 0, onAction: () => submit("push"), loading: fetcher.state !== "idle" }}
-      secondaryActions={[{ content: t("nav.search"), url: "/app/search" }]}
+      secondaryActions={[
+        {
+          // Rewrites and publishes in one go: the merchant has already decided
+          // what the finished form looks like, so a review step in between
+          // would only be a step.
+          content: t("import.rewriteSelected"),
+          disabled: selectedResources.length === 0 || fetcher.state !== "idle",
+          onAction: () => submit("rewrite"),
+        },
+        { content: t("nav.search"), url: "/app/search" },
+      ]}
     >
       <Layout>
         <Layout.Section>
