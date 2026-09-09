@@ -1,28 +1,17 @@
 import { useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { Link, useFetcher, useLoaderData } from "@remix-run/react";
-import {
-  Badge,
-  Banner,
-  BlockStack,
-  Box,
-  Button,
-  Card,
-  EmptyState,
-  IndexTable,
-  InlineGrid,
-  InlineStack,
-  Layout,
-  Page,
-  Text,
-  Tooltip,
-  useIndexResourceState,
-} from "@shopify/polaris";
+import { Link, useFetcher, useLoaderData, useNavigate, useSearchParams } from "@remix-run/react";
+import type { PurchaseOrderStatus, SupplierPlatform } from "@prisma/client";
+import { Badge, Banner, BlockStack, Button, Card, IndexTable, InlineGrid, InlineStack, Layout, Page, Tabs, Text, Tooltip, useIndexResourceState } from "@shopify/polaris";
+import { EmptyScreen } from "~/components/EmptyScreen";
+import { SectionHeader } from "~/components/SectionHeader";
+import { Stat } from "~/components/Stat";
 import { PlatformBadge, StatusBadge } from "~/components/StatusBadge";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { formatDate, formatMoney, relativeTime } from "~/lib/format";
-import { useMessage, useT } from "~/lib/use-t";
+import type { I18nVars } from "~/lib/i18n";
+import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
 import { checkPayments, getPaymentQueue, markPaidManually, undoManualPayment } from "~/services/payments.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -39,12 +28,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     switch (intent) {
       case "check": {
         const result = await checkPayments(shop, ids.length ? ids : undefined);
+        // `message` is kept for anything that reads it; the key is what lets a
+        // Vietnamese merchant read the outcome in their own language.
         return {
           ok: true,
           message:
             result.paid > 0
               ? `${result.paid} of ${result.checked} order(s) are now paid.`
               : `Checked ${result.checked} order(s); none are paid yet.`,
+          messageKey: result.paid > 0 ? "payments.msg.checkedPaid" : "payments.msg.checkedNone",
+          messageVars: { paid: result.paid, checked: result.checked },
         };
       }
       case "mark-paid": {
@@ -63,18 +56,61 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 };
 
+type ActionResult = { ok?: boolean; message?: string; messageKey?: string; messageVars?: I18nVars; error?: string };
+
+/**
+ * The queue only ever holds the two "placed upstream, not paid" statuses
+ * (`UNPAID_STATUSES` in the payments service, which cannot be imported into a
+ * client component), plus the deadline-derived Overdue view.
+ */
+const TABS = ["all", "AWAITING_PAYMENT", "PLACED", "overdue"] as const;
+type TabId = (typeof TABS)[number];
+
+/** Supplier platform as the merchant names it; PlatformBadge keeps the same wording. */
+function platformName(platform: SupplierPlatform): string {
+  return platform === "ALIEXPRESS" ? "AliExpress" : platform === "CJ_DROPSHIPPING" ? "CJ" : platform === "MOCK" ? "Mock" : platform;
+}
+
 export default function PaymentsPage() {
   const t = useT();
   const { queue } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
-  const result = fetcher.data as { message?: string; error?: string } | undefined;
-  const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
+  const navigate = useNavigate();
+  const [params] = useSearchParams();
+  const result = fetcher.data as ActionResult | undefined;
+  const actionMessage = useMessage(result);
+  const actionError = useErrorMessage(result);
   const [opened, setOpened] = useState<string[]>([]);
-  const items = queue.items;
+
+  const busy = fetcher.state !== "idle";
+  const pendingIntent = busy ? fetcher.formData?.get("intent") : null;
+  const pendingIds = busy ? String(fetcher.formData?.get("ids") ?? "") : "";
+
+  const tabParam = params.get("status") as TabId | null;
+  const tab: TabId = tabParam && TABS.includes(tabParam) ? tabParam : "all";
+  const isOverdue = (hoursLeft: number | null) => hoursLeft !== null && hoursLeft <= 0;
+  const matches = (item: (typeof queue.items)[number], id: TabId) =>
+    id === "all" ? true : id === "overdue" ? isOverdue(item.hoursLeft) : item.status === (id as PurchaseOrderStatus);
+  const items = queue.items.filter((item) => matches(item, tab));
+
+  const tabs = TABS.map((id) => {
+    const label = id === "all" ? t("common.all") : id === "overdue" ? t("payments.tab.overdue") : id === "AWAITING_PAYMENT" ? t("stage.AWAITING_PAYMENT") : t("status.PLACED");
+    return { id, content: `${label} (${queue.items.filter((item) => matches(item, id)).length})` };
+  });
+  const selectedTab = Math.max(0, tabs.findIndex((entry) => entry.id === tab));
+
   const { selectedResources, allResourcesSelected, handleSelectionChange, clearSelection } = useIndexResourceState(items);
 
-  const submit = (intent: string, extra: Record<string, string> = {}) => {
-    fetcher.submit({ intent, ids: selectedResources.join(","), ...extra }, { method: "post" });
+  const submit = (intent: string, ids: string[]) => {
+    fetcher.submit({ intent, ids: ids.join(",") }, { method: "post" });
+  };
+
+  const selectTab = (index: number) => {
+    const sp = new URLSearchParams(params);
+    if (tabs[index].id === "all") sp.delete("status");
+    else sp.set("status", tabs[index].id);
+    clearSelection();
+    navigate(`?${sp.toString()}`);
   };
 
   /**
@@ -83,122 +119,148 @@ export default function PaymentsPage() {
    * to help the merchant keep their place.
    */
   const openSelected = () => {
-    const targets = items.filter((i) => selectedResources.includes(i.id) && i.paymentUrl);
-    targets.slice(0, 10).forEach((item, index) => {
+    const targets = items.filter((i) => selectedResources.includes(i.id) && i.paymentUrl).slice(0, 10);
+    targets.forEach((item, index) => {
       setTimeout(() => window.open(item.paymentUrl!, "_blank", "noopener"), index * 350);
     });
-    setOpened((prev) => [...new Set([...prev, ...targets.slice(0, 10).map((target) => target.id)])]);
+    setOpened((prev) => [...new Set([...prev, ...targets.map((target) => target.id)])]);
   };
+
+  // ---- Stat strip: everything here comes from the queue the loader already built.
+  const oldest = queue.items.reduce<(typeof queue.items)[number] | null>((best, item) => {
+    const when = item.placedAt ?? item.orderCreatedAt;
+    if (!when) return best;
+    const bestWhen = best ? (best.placedAt ?? best.orderCreatedAt) : null;
+    return !bestWhen || new Date(when) < new Date(bestWhen) ? item : best;
+  }, null);
+  const hasDeadlines = queue.items.some((item) => item.hoursLeft !== null);
+
+  const bannerTone = result?.messageKey === "payments.msg.checkedNone" ? "info" : "success";
+
+  const payLabel = selectedResources.length ? `${t("action.pay")} (${selectedResources.length})` : t("action.pay");
 
   return (
     <Page
+      fullWidth
       title={t("page.payments.title")}
       subtitle={t("page.payments.subtitle")}
-      primaryAction={{
-        content: selectedResources.length ? `${t("action.pay")} (${selectedResources.length})` : t("action.pay"),
-        disabled: selectedResources.length === 0,
-        onAction: openSelected,
-      }}
+      primaryAction={{ content: payLabel, disabled: selectedResources.length === 0, onAction: openSelected }}
       secondaryActions={[
-        { content: t("action.checkPayment"), onAction: () => submit("check"), loading: fetcher.state !== "idle" },
         {
-          content: t("payments.markSelectedPaid"),
-          disabled: selectedResources.length === 0,
-          onAction: () => {
-            submit("mark-paid");
-            clearSelection();
-          },
+          content: t("action.checkPayment"),
+          onAction: () => submit("check", []),
+          loading: pendingIntent === "check" && pendingIds === "",
+          disabled: busy || queue.items.length === 0,
         },
+        ...queue.byPlatform
+          .filter((p) => p.bulkUrl)
+          .map((p) => ({ content: t("payments.openUnpaidListOn", { platform: platformName(p.platform) }), url: p.bulkUrl!, external: true })),
       ]}
     >
       <Layout>
-        <Layout.Section>
-          {actionMessage && (
-            <Banner tone="success">
-              <p>{actionMessage}</p>
-            </Banner>
-          )}
-          {result?.error && (
-            <Banner tone="critical">
-              <p>{result.error}</p>
-            </Banner>
-          )}
-          {queue.overdue > 0 && (
-            <Banner tone="critical" title={`${queue.overdue} ${t("payments.overdueBannerTitle")}`}>
-              <p>
-                {t("payments.autoCancelWarning")} {t("payments.overdueBannerBody")}
-              </p>
-            </Banner>
-          )}
-          {queue.expiringSoon > 0 && queue.overdue === 0 && (
-            <Banner tone="warning" title={`${queue.expiringSoon} ${t("payments.expiringSoonTitle")}`} />
-          )}
-        </Layout.Section>
+        {(actionMessage || actionError || queue.overdue > 0 || queue.expiringSoon > 0) && (
+          <Layout.Section>
+            <BlockStack gap="300">
+              {actionMessage && (
+                <Banner tone={bannerTone}>
+                  <p>{actionMessage}</p>
+                </Banner>
+              )}
+              {actionError && (
+                <Banner tone="critical">
+                  <p>{actionError}</p>
+                </Banner>
+              )}
+              {queue.overdue > 0 && (
+                <Banner tone="critical" title={t("payments.banner.overdue", { n: queue.overdue })}>
+                  <p>
+                    {t("payments.autoCancelWarning")} {t("payments.overdueBannerBody")}
+                  </p>
+                </Banner>
+              )}
+              {queue.expiringSoon > 0 && queue.overdue === 0 && (
+                <Banner tone="warning" title={t("payments.banner.dueSoon", { n: queue.expiringSoon })}>
+                  <p>{t("payments.autoCancelWarning")}</p>
+                </Banner>
+              )}
+            </BlockStack>
+          </Layout.Section>
+        )}
 
-        {items.length > 0 && (
+        {queue.items.length > 0 && (
           <Layout.Section>
             <InlineGrid columns={{ xs: 1, sm: 2, md: 4 }} gap="300">
-              {queue.totals.map((total) => (
-                <Card key={total.currency}>
-                  <BlockStack gap="100">
-                    <Text as="p" tone="subdued" variant="bodySm">
-                      {t("payments.outstanding")} ({total.currency})
-                    </Text>
-                    <Text as="p" variant="headingLg">
-                      {formatMoney(total.amount, total.currency)}
-                    </Text>
-                    <Text as="p" tone="subdued" variant="bodySm">
-                      {total.count} {t("payments.orderCount")}
-                    </Text>
-                  </BlockStack>
-                </Card>
+              {queue.totals.slice(0, 1).map((total) => (
+                <Stat
+                  key={total.currency}
+                  label={t("payments.stat.unpaidTotal", { currency: total.currency })}
+                  value={formatMoney(total.amount, total.currency)}
+                  hint={queue.totals.length > 1 ? queue.totals.slice(1).map((extra) => formatMoney(extra.amount, extra.currency)).join(" · ") : t("payments.stat.orders", { n: total.count })}
+                />
               ))}
-              {queue.byPlatform.map((p) => (
-                <Card key={p.platform}>
-                  <BlockStack gap="200">
-                    <InlineStack gap="200" blockAlign="center">
-                      <PlatformBadge platform={p.platform} />
-                      <Text as="p" tone="subdued" variant="bodySm">
-                        {p.count} {t("payments.unpaid")}
-                      </Text>
-                    </InlineStack>
-                    {p.bulkUrl && (
-                      <Button size="slim" url={p.bulkUrl} external>
-                        {t("payments.openUnpaidList")}
-                      </Button>
-                    )}
-                  </BlockStack>
-                </Card>
-              ))}
+              <Stat
+                label={t("payments.stat.unpaidOrders")}
+                value={String(queue.items.length)}
+                hint={queue.expiringSoon > 0 ? t("payments.stat.dueSoon", { n: queue.expiringSoon }) : t("payments.stat.noneDueSoon")}
+                tone={queue.expiringSoon > 0 ? "warning" : "default"}
+              />
+              <Stat
+                label={t("payments.stat.oldest")}
+                value={oldest ? relativeTime(oldest.placedAt ?? oldest.orderCreatedAt) : "—"}
+                hint={oldest ? `${oldest.orderName} · ${formatDate(oldest.placedAt ?? oldest.orderCreatedAt)}` : undefined}
+              />
+              <Stat
+                label={t("payments.stat.overdue")}
+                value={String(queue.overdue)}
+                hint={queue.overdue > 0 ? t("payments.autoCancelWarning") : hasDeadlines ? t("payments.stat.noOverdue") : t("payments.stat.noDeadline")}
+                tone={queue.overdue > 0 ? "critical" : queue.overdue === 0 && hasDeadlines ? "success" : "subdued"}
+              />
             </InlineGrid>
           </Layout.Section>
         )}
 
         <Layout.Section>
           <Card padding="0">
-            {items.length === 0 ? (
-              <EmptyState heading={t("payments.empty")} image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png" action={{ content: t("payments.viewOrders"), url: "/app/orders" }}>
-                <p>{t("payments.emptyBody")}</p>
-              </EmptyState>
+            <Tabs tabs={tabs} selected={selectedTab} onSelect={selectTab} />
+            {queue.items.length === 0 ? (
+              <EmptyScreen heading={t("payments.empty")} body={t("payments.emptyBody")} action={{ content: t("payments.viewOrders"), url: "/app/orders" }} />
+            ) : items.length === 0 ? (
+              <EmptyScreen heading={t("payments.emptyTab")} body={t("payments.emptyTabBody")} action={{ content: t("payments.viewAllUnpaid"), onAction: () => selectTab(0) }} />
             ) : (
               <IndexTable
                 resourceName={{ singular: t("payments.resourceSingular"), plural: t("payments.resourcePlural") }}
                 itemCount={items.length}
                 selectedItemsCount={allResourcesSelected ? "All" : selectedResources.length}
                 onSelectionChange={handleSelectionChange}
+                promotedBulkActions={[
+                  { content: t("payments.paySelected"), onAction: openSelected, disabled: !items.some((i) => selectedResources.includes(i.id) && i.paymentUrl) },
+                  { content: t("payments.checkSelected"), onAction: () => submit("check", selectedResources), disabled: busy },
+                  {
+                    content: t("payments.markSelectedPaid"),
+                    disabled: busy,
+                    onAction: () => {
+                      submit("mark-paid", selectedResources);
+                      clearSelection();
+                    },
+                  },
+                ]}
                 headings={[
-                  { title: t("payments.col.shopifyOrder") },
-                  { title: t("common.supplierOrder") },
-                  { title: t("payments.col.items") },
-                  { title: t("common.shipping") },
-                  { title: t("common.total") },
+                  { title: t("payments.col.order") },
+                  { title: t("common.supplier") },
+                  { title: t("payments.col.items"), alignment: "end" },
+                  { title: t("common.shipping"), alignment: "end" },
+                  { title: t("common.total"), alignment: "end" },
+                  { title: t("common.status") },
                   { title: t("payments.deadline") },
-                  { title: "" },
+                  { title: t("payments.col.placed") },
+                  { title: t("payments.col.actions") },
                 ]}
               >
                 {items.map((item, index) => {
-                  const overdue = item.hoursLeft !== null && item.hoursLeft <= 0;
+                  const overdue = isOverdue(item.hoursLeft);
                   const soon = item.hoursLeft !== null && item.hoursLeft > 0 && item.hoursLeft <= 6;
+                  const wasOpened = opened.includes(item.id);
+                  const markingThisRow = pendingIntent === "mark-paid" && pendingIds === item.id;
                   return (
                     <IndexTable.Row id={item.id} key={item.id} position={index} selected={selectedResources.includes(item.id)}>
                       <IndexTable.Cell>
@@ -217,11 +279,10 @@ export default function PaymentsPage() {
                         <BlockStack gap="050">
                           <InlineStack gap="100" blockAlign="center">
                             <PlatformBadge platform={item.platform} />
-                            <StatusBadge status={item.status} />
+                            <Text as="span" variant="bodySm">
+                              {item.externalOrderId ?? t("payments.notPlaced")}
+                            </Text>
                           </InlineStack>
-                          <Text as="span" variant="bodySm">
-                            {item.externalOrderId ?? t("payments.notPlaced")}
-                          </Text>
                           {item.supplierAccount && (
                             <Text as="span" tone="subdued" variant="bodySm">
                               {t("payments.via")} {item.supplierAccount}
@@ -230,17 +291,27 @@ export default function PaymentsPage() {
                         </BlockStack>
                       </IndexTable.Cell>
                       <IndexTable.Cell>
-                        {formatMoney(item.itemsCost, item.currency)}
-                        <Text as="span" tone="subdued" variant="bodySm">
-                          {" "}
-                          ({item.itemCount})
+                        <BlockStack gap="050" inlineAlign="end">
+                          <Text as="p" numeric alignment="end">
+                            {formatMoney(item.itemsCost, item.currency)}
+                          </Text>
+                          <Text as="p" tone="subdued" variant="bodySm" numeric alignment="end">
+                            ×{item.itemCount}
+                          </Text>
+                        </BlockStack>
+                      </IndexTable.Cell>
+                      <IndexTable.Cell>
+                        <Text as="p" numeric alignment="end">
+                          {formatMoney(item.shippingCost, item.currency)}
                         </Text>
                       </IndexTable.Cell>
-                      <IndexTable.Cell>{formatMoney(item.shippingCost, item.currency)}</IndexTable.Cell>
                       <IndexTable.Cell>
-                        <Text as="span" fontWeight="semibold">
+                        <Text as="p" fontWeight="semibold" numeric alignment="end">
                           {formatMoney(item.totalCost, item.currency)}
                         </Text>
+                      </IndexTable.Cell>
+                      <IndexTable.Cell>
+                        <StatusBadge status={item.status} />
                       </IndexTable.Cell>
                       <IndexTable.Cell>
                         {item.paymentDueAt ? (
@@ -250,26 +321,31 @@ export default function PaymentsPage() {
                             </Badge>
                           </Tooltip>
                         ) : (
-                          <Text as="span" tone="subdued" variant="bodySm">
-                            {item.placedAt ? relativeTime(item.placedAt) : "—"}
+                          <Text as="span" tone="subdued">
+                            —
                           </Text>
                         )}
                       </IndexTable.Cell>
                       <IndexTable.Cell>
-                        <InlineStack gap="100">
+                        {item.placedAt ? (
+                          <Tooltip content={formatDate(item.placedAt)}>
+                            <Text as="span">{relativeTime(item.placedAt)}</Text>
+                          </Tooltip>
+                        ) : (
+                          <Text as="span" tone="subdued">
+                            —
+                          </Text>
+                        )}
+                      </IndexTable.Cell>
+                      <IndexTable.Cell>
+                        <InlineStack gap="100" wrap={false}>
                           {item.paymentUrl && (
-                            <Button
-                              size="slim"
-                              variant={opened.includes(item.id) ? "secondary" : "primary"}
-                              url={item.paymentUrl}
-                              external
-                              onClick={() => setOpened((p) => [...new Set([...p, item.id])])}
-                            >
-                              {opened.includes(item.id) ? t("payments.opened") : t("payments.pay")}
+                            <Button size="slim" variant={wasOpened ? "secondary" : "primary"} url={item.paymentUrl} external onClick={() => setOpened((p) => [...new Set([...p, item.id])])}>
+                              {wasOpened ? t("payments.opened") : t("payments.pay")}
                             </Button>
                           )}
-                          <Button size="slim" onClick={() => fetcher.submit({ intent: "mark-paid", ids: item.id }, { method: "post" })}>
-                            {t("payments.paid")}
+                          <Button size="slim" loading={markingThisRow} disabled={busy && !markingThisRow} onClick={() => submit("mark-paid", [item.id])}>
+                            {t("payments.markPaid")}
                           </Button>
                         </InlineStack>
                       </IndexTable.Cell>
@@ -284,14 +360,10 @@ export default function PaymentsPage() {
         <Layout.Section>
           <Card>
             <BlockStack gap="200">
-              <Text as="h2" variant="headingMd">
-                {t("payments.howItWorks.title")}
+              <SectionHeader title={t("payments.howItWorks.title")} />
+              <Text as="p" tone="subdued">
+                {t("payments.howItWorks.body")}
               </Text>
-              <Box>
-                <Text as="p" tone="subdued">
-                  {t("payments.howItWorks.body")}
-                </Text>
-              </Box>
             </BlockStack>
           </Card>
         </Layout.Section>
