@@ -1,26 +1,30 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { Link, useFetcher, useLoaderData } from "@remix-run/react";
 import {
+  ActionList,
   Badge,
   Banner,
   BlockStack,
   Box,
-  Button,
   Card,
   InlineGrid,
   InlineStack,
   Layout,
-  List,
   Page,
   ProgressBar,
   Text,
 } from "@shopify/polaris";
+import { EmptyScreen } from "~/components/EmptyScreen";
+import { JobProgress } from "~/components/JobProgress";
+import { SectionHeader } from "~/components/SectionHeader";
 import { CountTile, Stat } from "~/components/Stat";
 import { StatusBadge } from "~/components/StatusBadge";
 import { STAGE_ORDER } from "~/domain/orders/pipeline";
 import { readForm, requireShop } from "~/lib/auth.server";
-import { formatMoney, relativeTime } from "~/lib/format";
-import { useT } from "~/lib/use-t";
+import { formatMoney, formatPercent, relativeTime } from "~/lib/format";
+import type { I18nKey } from "~/lib/i18n";
+import { useJobRun } from "~/lib/use-job-run";
+import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
 import { findOrCreateJobRun } from "~/services/jobs.server";
 import { enqueue } from "~/services/jobs/index.server";
 import { listNotifications } from "~/services/notifications.server";
@@ -87,71 +91,160 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   return { ok: false };
 };
 
+/** The onboarding steps, in the order a new store should take them. */
+const ONBOARDING_STEPS = [
+  { key: "supplier", to: "/app/suppliers" },
+  { key: "pricing", to: "/app/pricing" },
+  { key: "shipping", to: "/app/shipping" },
+  { key: "fulfillmentService", to: "/app/settings/fulfillment" },
+  { key: "product", to: "/app/search" },
+  { key: "order", to: "/app/orders" },
+] as const;
+
+/**
+ * Only the severities that change what a merchant should do get a badge; an
+ * "info" row is already distinguished by being unread.
+ */
+function severityBadge(severity: string, t: ReturnType<typeof useT>) {
+  if (severity === "critical" || severity === "error") return <Badge tone="critical">{t("dashboard.attention.urgent")}</Badge>;
+  if (severity === "warning") return <Badge tone="warning">{t("dashboard.attention.warning")}</Badge>;
+  return null;
+}
+
 export default function Dashboard() {
   const { shop, stats, notifications, onboarding, plan, showWelcome } = useLoaderData<typeof loader>();
-  const fetcher = useFetcher<typeof action>();
+  // The two sync actions share one fetcher so only one job can be started at a
+  // time; dismissing the welcome banner has its own so it never greys them out.
+  const syncFetcher = useFetcher<typeof action>();
+  const welcomeFetcher = useFetcher<typeof action>();
   const t = useT();
-  const steps = [
-    { done: onboarding.supplier, label: t("dashboard.onboarding.supplier"), to: "/app/suppliers" },
-    { done: onboarding.pricing, label: t("dashboard.onboarding.pricing"), to: "/app/pricing" },
-    { done: onboarding.shipping, label: t("dashboard.onboarding.shipping"), to: "/app/shipping" },
-    { done: onboarding.fulfillmentService, label: t("dashboard.onboarding.fulfillmentService"), to: "/app/settings/fulfillment" },
-    { done: onboarding.product, label: t("dashboard.onboarding.product"), to: "/app/search" },
-    { done: onboarding.order, label: t("dashboard.onboarding.order"), to: "/app/orders" },
-  ];
+
+  const syncing = syncFetcher.state !== "idle";
+  const syncMessage = useMessage(syncFetcher.data as Parameters<typeof useMessage>[0]);
+  const syncError = useErrorMessage(syncFetcher.data as Parameters<typeof useErrorMessage>[0]);
+  const { jobRunId, clearJobRun } = useJobRun(syncFetcher.data);
+  const startSync = (intent: "sync-orders" | "sync-suppliers") => syncFetcher.submit({ intent }, { method: "post" });
+
+  const steps = ONBOARDING_STEPS.map((step) => ({
+    ...step,
+    done: onboarding[step.key],
+    label: t(`dashboard.onboarding.${step.key}` as I18nKey),
+    hint: t(`dashboard.onboarding.${step.key}.hint` as I18nKey),
+  }));
   const completed = steps.filter((s) => s.done).length;
+  const nextStep = steps.find((s) => !s.done);
+
+  const revenue = Number(stats.week.revenue);
+  const profit = Number(stats.week.profit);
+  const margin = revenue > 0 ? (profit / revenue) * 100 : null;
+  const readyOrders = stats.stages.AWAITING_ORDER;
 
   return (
     <Page
       title={`${t("page.dashboard.title")}, ${shop.name}`}
-      subtitle={t("page.dashboard.subtitle")}
+      subtitle={t("dashboard.subtitle")}
       primaryAction={{ content: t("nav.search"), url: "/app/search" }}
-      secondaryActions={[
-        { content: t("dashboard.action.syncOrders"), onAction: () => fetcher.submit({ intent: "sync-orders" }, { method: "post" }), loading: fetcher.state !== "idle" },
-        { content: t("dashboard.action.checkSupplierOrders"), onAction: () => fetcher.submit({ intent: "sync-suppliers" }, { method: "post" }) },
+      actionGroups={[
+        {
+          title: t("dashboard.actions.sync"),
+          disabled: syncing,
+          actions: [
+            {
+              content: t("dashboard.action.syncOrders"),
+              helpText: t("dashboard.actions.syncOrders.hint"),
+              disabled: syncing,
+              onAction: () => startSync("sync-orders"),
+            },
+            {
+              content: t("dashboard.action.checkSupplierOrders"),
+              helpText: t("dashboard.actions.checkSupplierOrders.hint"),
+              disabled: syncing,
+              onAction: () => startSync("sync-suppliers"),
+            },
+          ],
+        },
       ]}
     >
       <Layout>
+        {(syncError || syncMessage || jobRunId) && (
+          <Layout.Section>
+            <BlockStack gap="300">
+              {syncError && (
+                <Banner tone="critical">
+                  <p>{syncError}</p>
+                </Banner>
+              )}
+              {syncMessage && (
+                <Banner tone="info">
+                  <p>{syncMessage}</p>
+                </Banner>
+              )}
+              <JobProgress jobRunId={jobRunId} onDone={clearJobRun} />
+            </BlockStack>
+          </Layout.Section>
+        )}
+
         {showWelcome && (
           <Layout.Section>
-            <Banner title={t("dashboard.welcome.title")} tone="info" onDismiss={() => fetcher.submit({ intent: "dismiss-welcome" }, { method: "post" })}>
+            <Banner
+              title={t("dashboard.welcome.title")}
+              tone="info"
+              onDismiss={() => welcomeFetcher.submit({ intent: "dismiss-welcome" }, { method: "post" })}
+            >
               <BlockStack gap="200">
                 <Text as="p">{t("dashboard.welcome.body")}</Text>
-                <InlineStack gap="200">
-                  <Button url="/support" target="_blank" variant="plain">
+                <InlineStack gap="400">
+                  <Link to="/support" target="_blank" rel="noreferrer">
                     {t("dashboard.welcome.support")}
-                  </Button>
-                  <Button url="/app/settings/plan" variant="plain">
-                    {t("dashboard.welcome.plan")}
-                  </Button>
+                  </Link>
+                  <Link to="/app/settings/plan">{t("dashboard.welcome.plan")}</Link>
                 </InlineStack>
               </BlockStack>
             </Banner>
           </Layout.Section>
         )}
+
         {completed < steps.length && (
           <Layout.Section>
             <Card>
               <BlockStack gap="300">
-                <InlineStack align="space-between" blockAlign="center">
-                  <Text as="h2" variant="headingMd">
-                    {t("dashboard.getStarted")}
+                <SectionHeader title={t("dashboard.getStarted")} />
+                <BlockStack gap="150">
+                  <Text as="p" tone="subdued" variant="bodySm" numeric>
+                    {t("dashboard.onboarding.progress", { done: completed, total: steps.length })}
                   </Text>
-                  <Text as="span" tone="subdued">
-                    {completed}/{steps.length} {t("dashboard.stepsDone")}
-                  </Text>
-                </InlineStack>
-                <ProgressBar progress={(completed / steps.length) * 100} size="small" />
-                <List type="number">
-                  {steps.map((step) => (
-                    <List.Item key={step.label}>
-                      <InlineStack gap="200" blockAlign="center">
-                        {step.done ? <Badge tone="success">{t("common.done")}</Badge> : <Badge>{t("common.toDo")}</Badge>}
-                        <Link to={step.to}>{step.label}</Link>
+                  <ProgressBar progress={Math.round((completed / steps.length) * 100)} size="small" tone="primary" />
+                </BlockStack>
+                <BlockStack gap="0">
+                  {steps.map((step, index) => (
+                    <Box
+                      key={step.key}
+                      paddingBlock="300"
+                      borderBlockEndWidth={index < steps.length - 1 ? "025" : undefined}
+                      borderColor="border"
+                    >
+                      <InlineStack gap="300" blockAlign="start" wrap={false}>
+                        <Box minWidth="88px">
+                          {step.done ? (
+                            <Badge tone="success">{t("common.done")}</Badge>
+                          ) : step === nextStep ? (
+                            <Badge tone="attention">{t("dashboard.onboarding.next")}</Badge>
+                          ) : (
+                            <Badge>{t("common.toDo")}</Badge>
+                          )}
+                        </Box>
+                        <BlockStack gap="050">
+                          <Text as="p" fontWeight={step.done ? "regular" : "semibold"} tone={step.done ? "subdued" : "base"}>
+                            <Link to={step.to}>{step.label}</Link>
+                          </Text>
+                          <Text as="p" tone="subdued" variant="bodySm">
+                            {step.hint}
+                          </Text>
+                        </BlockStack>
                       </InlineStack>
-                    </List.Item>
+                    </Box>
                   ))}
-                </List>
+                </BlockStack>
               </BlockStack>
             </Card>
           </Layout.Section>
@@ -160,45 +253,39 @@ export default function Dashboard() {
         <Layout.Section>
           <InlineGrid columns={{ xs: 1, sm: 2, md: 4 }} gap="400">
             <Stat label={t("dashboard.stat.revenue7d")} value={formatMoney(stats.week.revenue, shop.currency)} />
-            <Stat label={t("dashboard.stat.profit7d")} value={formatMoney(stats.week.profit, shop.currency)} />
-            <Stat label={t("dashboard.stat.orders7d")} value={String(stats.week.orders)} />
+            <Stat
+              label={t("dashboard.stat.profit7d")}
+              value={formatMoney(stats.week.profit, shop.currency)}
+              hint={margin === null ? undefined : t("dashboard.stat.margin", { percent: formatPercent(margin) })}
+              tone={profit < 0 ? "critical" : "default"}
+            />
+            <Stat
+              label={t("dashboard.stat.orders7d")}
+              value={String(stats.week.orders)}
+              hint={stats.recentFailures > 0 ? t("dashboard.stat.failedHint", { n: stats.recentFailures }) : undefined}
+            />
             <Stat
               label={t("dashboard.stat.managedProducts")}
-              value={`${stats.products.total}`}
-              hint={`${stats.products.unmapped} ${t("dashboard.stat.unmapped")}`}
+              value={String(stats.products.total)}
+              hint={
+                stats.products.unmapped > 0
+                  ? t("dashboard.stat.unmappedHint", { n: stats.products.unmapped })
+                  : stats.products.total > 0
+                    ? t("dashboard.stat.allMapped")
+                    : undefined
+              }
             />
           </InlineGrid>
         </Layout.Section>
 
         <Layout.Section>
           <Card>
-            <InlineStack align="space-between" blockAlign="center" wrap>
-              <BlockStack gap="050">
-                <Text as="p" tone="subdued" variant="bodySm">
-                  {t("dashboard.stat.plan")}
-                </Text>
-                <Text as="p" variant="headingMd">
-                  {plan.name}
-                </Text>
-                <Text as="p" tone="subdued" variant="bodySm">
-                  {t("dashboard.stat.planUsage", { used: plan.productsUsed, limit: plan.productsLimit ?? t("plan.unlimited") })}
-                </Text>
-              </BlockStack>
-              <Button url="/app/settings/plan">{t("settings.tabs.plan")}</Button>
-            </InlineStack>
-          </Card>
-        </Layout.Section>
-
-        <Layout.Section>
-          <Card>
             <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                {t("dashboard.ordersPipeline")}
-              </Text>
+              <SectionHeader title={t("dashboard.ordersPipeline")} action={{ content: t("common.viewAll"), to: "/app/orders" }} />
               <InlineGrid columns={{ xs: 2, sm: 3, md: 4, lg: 4 }} gap="300">
                 {STAGE_ORDER.map((stage) => (
                   <Link key={stage} to={`/app/orders?stage=${stage}`} style={{ textDecoration: "none" }}>
-                    <CountTile label={t(`stage.${stage}` as never)} count={stats.stages[stage]}>
+                    <CountTile label={t(`stage.${stage}` as I18nKey)} count={stats.stages[stage]}>
                       <StatusBadge status={stage} />
                     </CountTile>
                   </Link>
@@ -206,8 +293,8 @@ export default function Dashboard() {
               </InlineGrid>
               {stats.recentFailures > 0 && (
                 <Text as="p" tone="critical">
-                  {stats.recentFailures} {t("dashboard.ordersFailedAtSupplier")}{" "}
-                  <Link to="/app/orders?stage=FAILED">{t("dashboard.reviewThem")}</Link>.
+                  {t("dashboard.pipeline.failed", { n: stats.recentFailures })}{" "}
+                  <Link to="/app/orders?stage=FAILED">{t("dashboard.reviewThem")}</Link>
                 </Text>
               )}
             </BlockStack>
@@ -217,25 +304,30 @@ export default function Dashboard() {
         <Layout.Section variant="oneHalf">
           <Card>
             <BlockStack gap="300">
-              <InlineStack align="space-between">
-                <Text as="h2" variant="headingMd">
-                  {t("common.needsAttention")}
-                </Text>
-                <Link to="/app/notifications">{t("common.viewAll")}</Link>
-              </InlineStack>
+              <SectionHeader
+                title={t("common.needsAttention")}
+                count={stats.unread}
+                action={{ content: t("common.viewAll"), to: "/app/notifications" }}
+              />
               {notifications.length === 0 ? (
-                <Text as="p" tone="subdued">
-                  {t("dashboard.nothingRightNow")}
-                </Text>
+                <EmptyScreen compact heading={t("notifications.empty")} body={t("notifications.emptyBody")} />
               ) : (
-                <BlockStack gap="200">
-                  {notifications.map((n) => (
-                    <Box key={n.id} padding="200" background={n.readAt ? undefined : "bg-surface-secondary"} borderRadius="200">
-                      <InlineStack align="space-between" blockAlign="start" gap="200">
+                <BlockStack gap="0">
+                  {notifications.map((n, index) => (
+                    <Box
+                      key={n.id}
+                      paddingBlock="200"
+                      borderBlockEndWidth={index < notifications.length - 1 ? "025" : undefined}
+                      borderColor="border"
+                    >
+                      <InlineStack align="space-between" blockAlign="start" gap="300" wrap={false}>
                         <BlockStack gap="050">
-                          <Text as="p" fontWeight={n.readAt ? "regular" : "semibold"}>
-                            {n.link ? <Link to={n.link}>{n.title}</Link> : n.title}
-                          </Text>
+                          <InlineStack gap="200" blockAlign="center">
+                            <Text as="p" fontWeight={n.readAt ? "regular" : "semibold"}>
+                              {n.link ? <Link to={n.link}>{n.title}</Link> : n.title}
+                            </Text>
+                            {severityBadge(n.severity, t)}
+                          </InlineStack>
                           {n.body && (
                             <Text as="p" tone="subdued" variant="bodySm">
                               {n.body}
@@ -257,30 +349,65 @@ export default function Dashboard() {
         <Layout.Section variant="oneHalf">
           <Card>
             <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                {t("dashboard.quickActions")}
-              </Text>
-              <BlockStack gap="200">
-                <Button url="/app/search">{t("dashboard.quick.findImport")}</Button>
-                <Button url="/app/import" disabled={stats.importCount === 0}>
-                  {stats.importCount > 0
-                    ? `${t("dashboard.quick.reviewImportList")} (${stats.importCount})`
-                    : t("dashboard.quick.importListEmpty")}
-                </Button>
-                <Button url="/app/orders?stage=AWAITING_ORDER" disabled={stats.stages.AWAITING_ORDER === 0}>
-                  {stats.stages.AWAITING_ORDER > 0
-                    ? `${t("dashboard.quick.place")} ${stats.stages.AWAITING_ORDER} ${t("dashboard.quick.readyOrders")}`
-                    : t("dashboard.quick.noOrdersReady")}
-                </Button>
-                <Button url="/app/inventory">{t("dashboard.quick.runAutoUpdate")}</Button>
-                <Button url="/app/reports">{t("dashboard.quick.openReports")}</Button>
-              </BlockStack>
+              <SectionHeader title={t("dashboard.quickActions")} />
+              <ActionList
+                items={[
+                  {
+                    content: t("dashboard.quick.findImport"),
+                    helpText: t("dashboard.quick.findImport.hint"),
+                    url: "/app/search",
+                  },
+                  {
+                    content: t("dashboard.quick.reviewImportList"),
+                    helpText: stats.importCount > 0 ? t("dashboard.quick.reviewImportList.hint") : t("dashboard.quick.importListEmpty"),
+                    suffix: stats.importCount > 0 ? <Badge>{String(stats.importCount)}</Badge> : undefined,
+                    url: "/app/import",
+                    disabled: stats.importCount === 0,
+                  },
+                  {
+                    content: t("dashboard.quick.placeReady"),
+                    helpText: readyOrders > 0 ? t("dashboard.quick.placeReady.hint") : t("dashboard.quick.noOrdersReady"),
+                    suffix: readyOrders > 0 ? <Badge tone="info">{String(readyOrders)}</Badge> : undefined,
+                    url: "/app/orders?stage=AWAITING_ORDER",
+                    disabled: readyOrders === 0,
+                  },
+                  {
+                    content: t("dashboard.quick.runAutoUpdate"),
+                    helpText: t("dashboard.quick.runAutoUpdate.hint"),
+                    url: "/app/inventory",
+                  },
+                  {
+                    content: t("dashboard.quick.openReports"),
+                    helpText: t("dashboard.quick.openReports.hint"),
+                    url: "/app/reports",
+                  },
+                ]}
+              />
               {stats.activeJobs > 0 && (
-                <Text as="p" tone="subdued">
-                  {stats.activeJobs} {t("dashboard.backgroundJobsRunning")}
+                <Text as="p" tone="subdued" variant="bodySm">
+                  {t("dashboard.jobsRunning", { n: stats.activeJobs })} · <Link to="/app/logs">{t("nav.logs")}</Link>
                 </Text>
               )}
             </BlockStack>
+          </Card>
+        </Layout.Section>
+
+        <Layout.Section>
+          <Card>
+            <InlineStack align="space-between" blockAlign="center" gap="400" wrap>
+              <InlineStack gap="300" blockAlign="baseline">
+                <Text as="p" tone="subdued" variant="bodySm">
+                  {t("dashboard.stat.plan")}
+                </Text>
+                <Text as="p" variant="headingSm">
+                  {plan.name}
+                </Text>
+                <Text as="p" tone="subdued" variant="bodySm" numeric>
+                  {t("dashboard.stat.planUsage", { used: plan.productsUsed, limit: plan.productsLimit ?? t("plan.unlimited") })}
+                </Text>
+              </InlineStack>
+              <Link to="/app/settings/plan">{t("dashboard.plan.manage")}</Link>
+            </InlineStack>
           </Card>
         </Layout.Section>
       </Layout>
