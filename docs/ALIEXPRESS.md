@@ -17,8 +17,12 @@ order, and what each piece is actually used for.
 4. Set the callback / redirect URL to exactly:
 
    ```
-   https://<your-app-domain>/app/suppliers/callback/aliexpress
+   https://<your-app-domain>/suppliers/callback/aliexpress
    ```
+
+   It is outside `/app` on purpose: AliExpress returns with no Shopify session, and a
+   route under `/app` would answer with the Shopify login page instead of saving the
+   connection.
 
 5. Optional but recommended: create an **affiliate tracking id** in the AliExpress
    Portals/affiliate console. Without one, keyword search falls back to the DS
@@ -30,7 +34,7 @@ order, and what each piece is actually used for.
 SUPPLIER_DRIVER=live
 ALIEXPRESS_APP_KEY=your-app-key
 ALIEXPRESS_APP_SECRET=your-app-secret
-ALIEXPRESS_REDIRECT_URI=https://<your-app-domain>/app/suppliers/callback/aliexpress
+ALIEXPRESS_REDIRECT_URI=https://<your-app-domain>/suppliers/callback/aliexpress
 ALIEXPRESS_API_BASE=https://api-sg.aliexpress.com/sync
 ALIEXPRESS_AUTH_BASE=https://api-sg.aliexpress.com/oauth
 ALIEXPRESS_TRACKING_ID=your-tracking-id     # optional
@@ -49,6 +53,11 @@ callback URL. The app then:
 - calls `aliexpress.ds.add.info` to register your Shopify store with the dropshipping
   programme, which AliExpress requires before its order APIs work. If that call fails
   it is recorded in Activity and the account still connects — check it before ordering.
+
+The return is safe to repeat: reloading the callback page does not exchange the used
+code again or report a failure, and reconnecting the same AliExpress buyer refreshes
+the existing account instead of adding a second one. A connection left open for more
+than 30 minutes before approving comes back to Suppliers with a message to start again.
 
 Press **Test** on the account to confirm the token works. If AliExpress later rejects
 the token, the account shows **Reconnect needed**, you get a notification, and orders
@@ -195,7 +204,8 @@ What *is* verified here:
 
 Đăng nhập <https://openservice.aliexpress.com>, tạo application và xin giải pháp
 **Dropshipping (DS)**. Lấy App Key + App Secret. Đặt redirect URL đúng bằng
-`https://<tên-miền-app>/app/suppliers/callback/aliexpress`. Nên tạo thêm
+`https://<tên-miền-app>/suppliers/callback/aliexpress` (nằm ngoài `/app`, vì AliExpress
+quay về mà không có phiên Shopify). Nên tạo thêm
 **tracking id** affiliate để dùng được tìm kiếm theo từ khoá.
 
 **2. Cấu hình**

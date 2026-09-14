@@ -164,8 +164,13 @@ export class AliExpressAdapter implements SupplierAdapter {
     this.appSecret = config.ALIEXPRESS_APP_SECRET ?? "";
     this.syncBase = config.ALIEXPRESS_API_BASE.replace(/\/(sync|rest)\/?$/, "") + "/sync";
     this.restBase = config.ALIEXPRESS_API_BASE.replace(/\/(sync|rest)\/?$/, "") + "/rest";
+    // The OAuth return lives at /suppliers/callback/:platform, outside the /app
+    // layout: under /app the layout's Shopify authentication answered the
+    // supplier's session-less redirect with the login page. The old
+    // /app/suppliers/callback/aliexpress route no longer exists, so a default
+    // still pointing there would 404 the moment OAuth is switched on.
     this.redirectUri =
-      config.ALIEXPRESS_REDIRECT_URI ?? `${config.SHOPIFY_APP_URL}/app/suppliers/callback/aliexpress`;
+      config.ALIEXPRESS_REDIRECT_URI ?? `${config.SHOPIFY_APP_URL.replace(/\/+$/, "")}/suppliers/callback/aliexpress`;
     this.trackingId = config.ALIEXPRESS_TRACKING_ID || undefined;
     this.session = credentials.accessToken ?? null;
   }

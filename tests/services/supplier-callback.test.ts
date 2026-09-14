@@ -10,13 +10,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-  parseOAuthState: vi.fn(),
+  verifyOAuthState: vi.fn(),
   connectSupplierAccount: vi.fn(),
   findShop: vi.fn(),
 }));
 
 vi.mock("~/services/supplier-accounts.server", () => ({
-  parseOAuthState: mocks.parseOAuthState,
+  verifyOAuthState: mocks.verifyOAuthState,
   connectSupplierAccount: mocks.connectSupplierAccount,
 }));
 vi.mock("~/db.server", () => ({ default: { shop: { findUnique: mocks.findShop } } }));
@@ -40,23 +40,23 @@ function expectNeverLogin(response: Response) {
 }
 
 beforeEach(() => {
-  mocks.parseOAuthState.mockReset();
+  mocks.verifyOAuthState.mockReset();
   mocks.connectSupplierAccount.mockReset();
   mocks.findShop.mockReset();
 });
 
 describe("supplier OAuth callback", () => {
   it("stores the connection and returns the merchant to Suppliers inside their admin", async () => {
-    mocks.parseOAuthState.mockReturnValue({ shopId: SHOP.id, platform: "ALIEXPRESS", nonce: "n", ts: Date.now() });
+    mocks.verifyOAuthState.mockReturnValue({ status: "valid", payload: { shopId: SHOP.id, platform: "ALIEXPRESS", nonce: "n", ts: Date.now() } });
     mocks.findShop.mockResolvedValue(SHOP);
     const response = await call("code=abc&state=signed");
     expect(response.status).toBe(302);
     expect(response.headers.get("Location")).toBe(`${ADMIN}connected=1`);
-    expect(mocks.connectSupplierAccount).toHaveBeenCalledWith({ shopId: SHOP.id, platform: "ALIEXPRESS", code: "abc", shareAcrossStores: true });
+    expect(mocks.connectSupplierAccount).toHaveBeenCalledWith({ shopId: SHOP.id, platform: "ALIEXPRESS", code: "abc", shareAcrossStores: true, oauthNonce: "n" });
   });
 
   it("does not pick a shop for a state that fails verification, and shows a page without any input", async () => {
-    mocks.parseOAuthState.mockReturnValue(null);
+    mocks.verifyOAuthState.mockReturnValue({ status: "invalid" });
     const response = await call("code=abc&state=forged");
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ reason: "invalid-state" });
@@ -65,8 +65,29 @@ describe("supplier OAuth callback", () => {
     expectNeverLogin(response);
   });
 
+  it("sends an expired but authentic state back to that shop's Suppliers page without connecting", async () => {
+    mocks.verifyOAuthState.mockReturnValue({ status: "expired", payload: { shopId: SHOP.id, platform: "ALIEXPRESS", nonce: "n", ts: Date.now() - 3_600_000 } });
+    mocks.findShop.mockResolvedValue(SHOP);
+    const response = await call("code=abc&state=signed-but-old");
+    const location = response.headers.get("Location") ?? "";
+    expect(response.status).toBe(302);
+    expect(location.startsWith(ADMIN)).toBe(true);
+    expect(new URL(location).searchParams.get("error")).toMatch(/expired/);
+    expect(mocks.findShop).toHaveBeenCalledWith({ where: { id: SHOP.id } });
+    expect(mocks.connectSupplierAccount).not.toHaveBeenCalled();
+    expectNeverLogin(response);
+  });
+
+  it("shows the static page for an expired state whose shop has since been removed", async () => {
+    mocks.verifyOAuthState.mockReturnValue({ status: "expired", payload: { shopId: "gone", platform: "ALIEXPRESS", nonce: "n", ts: 0 } });
+    mocks.findShop.mockResolvedValue(null);
+    const response = await call("code=abc&state=signed-but-old");
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ reason: "shop-not-found" });
+  });
+
   it("shows the static page when the shop has since been removed", async () => {
-    mocks.parseOAuthState.mockReturnValue({ shopId: "gone", platform: "ALIEXPRESS", nonce: "n", ts: Date.now() });
+    mocks.verifyOAuthState.mockReturnValue({ status: "valid", payload: { shopId: "gone", platform: "ALIEXPRESS", nonce: "n", ts: Date.now() } });
     mocks.findShop.mockResolvedValue(null);
     const response = await call("code=abc&state=signed");
     expect(response.status).toBe(400);
@@ -74,7 +95,7 @@ describe("supplier OAuth callback", () => {
   });
 
   it("sends a declined authorization back to the admin with the supplier's reason", async () => {
-    mocks.parseOAuthState.mockReturnValue({ shopId: SHOP.id, platform: "ALIEXPRESS", nonce: "n", ts: Date.now() });
+    mocks.verifyOAuthState.mockReturnValue({ status: "valid", payload: { shopId: SHOP.id, platform: "ALIEXPRESS", nonce: "n", ts: Date.now() } });
     mocks.findShop.mockResolvedValue(SHOP);
     const response = await call("error=access_denied&state=signed");
     const location = response.headers.get("Location") ?? "";
@@ -84,7 +105,7 @@ describe("supplier OAuth callback", () => {
   });
 
   it("takes the platform from the signed state and refuses a path that disagrees with it", async () => {
-    mocks.parseOAuthState.mockReturnValue({ shopId: SHOP.id, platform: "ALIEXPRESS", nonce: "n", ts: Date.now() });
+    mocks.verifyOAuthState.mockReturnValue({ status: "valid", payload: { shopId: SHOP.id, platform: "ALIEXPRESS", nonce: "n", ts: Date.now() } });
     mocks.findShop.mockResolvedValue(SHOP);
     const response = await call("code=abc&state=signed", "cj");
     expect(response.headers.get("Location")?.startsWith(ADMIN)).toBe(true);
@@ -92,7 +113,7 @@ describe("supplier OAuth callback", () => {
   });
 
   it("reports a failed token exchange inside the admin, never on a relative /app url", async () => {
-    mocks.parseOAuthState.mockReturnValue({ shopId: SHOP.id, platform: "ALIEXPRESS", nonce: "n", ts: Date.now() });
+    mocks.verifyOAuthState.mockReturnValue({ status: "valid", payload: { shopId: SHOP.id, platform: "ALIEXPRESS", nonce: "n", ts: Date.now() } });
     mocks.findShop.mockResolvedValue(SHOP);
     mocks.connectSupplierAccount.mockRejectedValue(new Error("AliExpress rejected the code"));
     const response = await call("code=abc&state=signed");

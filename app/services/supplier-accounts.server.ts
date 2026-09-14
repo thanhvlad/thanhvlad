@@ -67,37 +67,94 @@ function stateSecret(): string {
   return config.SHOPIFY_API_SECRET || config.ENCRYPTION_KEY || "";
 }
 
-export function parseOAuthState(state: string): { shopId: string; platform: SupplierPlatform; nonce: string; ts: number } | null {
+export interface OAuthStatePayload {
+  shopId: string;
+  platform: SupplierPlatform;
+  nonce: string;
+  ts: number;
+}
+
+/** How long a merchant has between starting a connection and the supplier sending them back. */
+export const OAUTH_STATE_TTL_MS = 30 * 60_000;
+
+/**
+ * What a returned OAuth state proves.
+ *
+ * `invalid` means the signature does not verify (or the state is malformed), so
+ * nothing in it can be trusted, least of all the shop it names. `expired` means
+ * the app did sign it, for that shop, but longer ago than the TTL: the shop is
+ * known, so the callback can send the merchant back into their own admin to
+ * start again, but the connection itself must not be completed. Before this
+ * split both cases looked the same and an expired return was stranded on a
+ * static page that could only point at admin.shopify.com.
+ */
+export type OAuthStateCheck =
+  | { status: "valid"; payload: OAuthStatePayload }
+  | { status: "expired"; payload: OAuthStatePayload }
+  | { status: "invalid" };
+
+export function verifyOAuthState(state: string, now: number = Date.now()): OAuthStateCheck {
   try {
-    const [payload, signature] = state.split(".");
-    if (!payload || !signature) return null;
+    const [payload, signature, extra] = state.split(".");
+    if (!payload || !signature || extra !== undefined) return { status: "invalid" };
     const expected = signState(payload);
     if (
       signature.length !== expected.length ||
       !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
     ) {
-      return null;
+      return { status: "invalid" };
     }
     const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-    if (!parsed.shopId || !parsed.platform) return null;
-    if (Date.now() - Number(parsed.ts) > 30 * 60_000) return null;
-    return parsed;
+    if (typeof parsed?.shopId !== "string" || !parsed.shopId || typeof parsed.platform !== "string" || !parsed.platform) {
+      return { status: "invalid" };
+    }
+    const ts = Number(parsed.ts);
+    if (!Number.isFinite(ts)) return { status: "invalid" };
+    const decoded: OAuthStatePayload = { shopId: parsed.shopId, platform: parsed.platform as SupplierPlatform, nonce: String(parsed.nonce ?? ""), ts };
+    if (now - ts > OAUTH_STATE_TTL_MS) return { status: "expired", payload: decoded };
+    return { status: "valid", payload: decoded };
   } catch {
-    return null;
+    return { status: "invalid" };
   }
 }
 
-/** OAuth step 2 / API-key connect: exchange the code and store the account. */
+/** The payload of a state that is both authentic and fresh; null otherwise. */
+export function parseOAuthState(state: string): OAuthStatePayload | null {
+  const check = verifyOAuthState(state);
+  return check.status === "valid" ? check.payload : null;
+}
+
+/**
+ * OAuth step 2 / API-key connect: exchange the code and store the account.
+ *
+ * Safe to call twice for the same return. A merchant who refreshes the callback
+ * page, or a browser that replays the redirect, used to exchange an authorization
+ * code the supplier had already consumed: the exchange failed and the merchant
+ * was told the connection did not work, although it had. Now a return whose
+ * state nonce is already recorded on an account answers with that account and
+ * calls nothing upstream, and a fresh exchange that comes back for a supplier
+ * user this account already has refreshes that row's tokens instead of adding a
+ * second connection for the same person.
+ */
 export async function connectSupplierAccount(input: {
   shopId: string;
   platform: SupplierPlatform;
   code: string;
   label?: string;
   shareAcrossStores?: boolean;
+  /** The nonce from the verified OAuth state, which makes a replayed return a no-op. */
+  oauthNonce?: string;
 }) {
   const shop = await prisma.shop.findUnique({ where: { id: input.shopId } });
   if (!shop) throw new Error("Shop not found");
   if (!shop.accountId) throw new Error("Shop has no parent account");
+
+  if (input.oauthNonce) {
+    const replayed = await prisma.supplierAccount.findFirst({
+      where: { accountId: shop.accountId, platform: input.platform, meta: { path: ["oauthNonce"], equals: input.oauthNonce } },
+    });
+    if (replayed) return replayed;
+  }
 
   const adapter = getAdapter(input.platform);
   let tokens: Awaited<ReturnType<NonNullable<typeof adapter.exchangeCode>>> | null = null;
@@ -105,27 +162,46 @@ export async function connectSupplierAccount(input: {
     tokens = await adapter.exchangeCode(input.code);
   }
 
-  const existingCount = await prisma.supplierAccount.count({ where: { accountId: shop.accountId, platform: input.platform } });
-  const label = input.label?.trim() || tokens?.meta?.account?.toString() || tokens?.externalUserId || `${input.platform} account ${existingCount + 1}`;
+  const meta = { ...(tokens?.meta ?? {}), ...(input.oauthNonce ? { oauthNonce: input.oauthNonce } : {}) } as Prisma.InputJsonValue;
+  const tokenFields = {
+    accessToken: encryptSecret(tokens?.accessToken ?? null),
+    refreshToken: encryptSecret(tokens?.refreshToken ?? null),
+    expiresAt: tokens?.expiresAt ?? null,
+    meta,
+  };
 
-  const account = await prisma.supplierAccount.create({
-    data: {
-      accountId: shop.accountId,
-      shopId: input.shareAcrossStores ? null : input.shopId,
-      platform: input.platform,
-      label,
-      externalUserId: tokens?.externalUserId ?? null,
-      accessToken: encryptSecret(tokens?.accessToken ?? null),
-      refreshToken: encryptSecret(tokens?.refreshToken ?? null),
-      expiresAt: tokens?.expiresAt ?? null,
-      meta: (tokens?.meta ?? {}) as Prisma.InputJsonValue,
-      isDefault: existingCount === 0,
-    },
-  });
+  const existing = tokens?.externalUserId
+    ? await prisma.supplierAccount.findFirst({
+        where: { accountId: shop.accountId, platform: input.platform, externalUserId: tokens.externalUserId },
+      })
+    : null;
+
+  const existingCount = existing ? 0 : await prisma.supplierAccount.count({ where: { accountId: shop.accountId, platform: input.platform } });
+  const label =
+    input.label?.trim() || existing?.label || tokens?.meta?.account?.toString() || tokens?.externalUserId || `${input.platform} account ${existingCount + 1}`;
+
+  const account = existing
+    ? await prisma.supplierAccount.update({
+        where: { id: existing.id },
+        // A reconnect is how a merchant fixes "Reconnect needed", so it clears the
+        // error state. Scope and default flag stay as the merchant set them.
+        data: { ...tokenFields, label, isActive: true, needsReauth: false, lastErrorCode: null, lastErrorAt: null },
+      })
+    : await prisma.supplierAccount.create({
+        data: {
+          accountId: shop.accountId,
+          shopId: input.shareAcrossStores ? null : input.shopId,
+          platform: input.platform,
+          label,
+          externalUserId: tokens?.externalUserId ?? null,
+          ...tokenFields,
+          isDefault: existingCount === 0,
+        },
+      });
 
   // AliExpress requires the store to be registered with the dropshipping
   // programme before its order APIs work; best effort, reported if it fails.
-  if (adapter.registerStore) {
+  if (adapter.registerStore && !account.storeRegisteredAt) {
     try {
       await adapter.registerStore(`https://${shop.domain}`);
       await prisma.supplierAccount.update({ where: { id: account.id }, data: { storeRegisteredAt: new Date() } });
@@ -141,10 +217,10 @@ export async function connectSupplierAccount(input: {
   }
 
   await logActivity(input.shopId, {
-    action: "supplier.connected",
+    action: existing ? "supplier.reconnected" : "supplier.connected",
     entity: "SupplierAccount",
     entityId: account.id,
-    message: `${input.platform} account "${label}" connected.`,
+    message: existing ? `${input.platform} account "${label}" reconnected.` : `${input.platform} account "${label}" connected.`,
   });
   await notify(input.shopId, {
     type: "supplier.auth",

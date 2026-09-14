@@ -1,11 +1,32 @@
-# DropshipHub — DSers-style dropshipping automation for Shopify
+# DropshipHub — AliExpress dropshipping for Shopify
 
-A full-featured Shopify app that does what DSers does: find and import products from
-AliExpress (and CJ Dropshipping), edit them before they hit your store, map every
-variant to supplier SKUs (Basic / Advanced / BOGO / Bundle), place supplier orders in
-bulk with automatic shipping selection, sync tracking numbers back to Shopify as
-fulfilments, keep prices and stock in step with the supplier, and report on revenue,
-cost and profit — across several stores under one account.
+A Shopify app for running a dropshipping store on AliExpress: import products, edit
+them before they hit your store, map every variant to supplier SKUs (Basic / Advanced /
+BOGO / Bundle), keep each supplier order and its tracking next to its Shopify order,
+and report on revenue, cost and profit — across several stores under one account.
+
+## How it works in production today
+
+Production runs **extension-first**: `SUPPLIER_DRIVER=mock`, no AliExpress API keys,
+no email provider.
+
+- **Products** come in through the DropshipHub Chrome extension on the AliExpress
+  product page (title, images, variants, prices, description and a specification
+  table), wait on the import list for editing, and are pushed to Shopify.
+- **Orders**: the Chrome extension lists the orders waiting to be placed and opens
+  each product on AliExpress. You place and pay for the order there, then record the
+  AliExpress order number in the extension; tracking you add there is sent to Shopify.
+  The extension never places or pays for an order by itself.
+- **Notifications** stay on the app's Notifications page. Email and the daily digest
+  need an email provider, and the settings screen disables them until one is set.
+
+Everything that talks to AliExpress through its Dropshipping API — catalogue search,
+placing orders from the app, supplier status and tracking polling, price and stock
+updates from the supplier — is implemented in
+`app/services/suppliers/aliexpress.server.ts` and kept intact, but only runs with
+`SUPPLIER_DRIVER=live` and approved AliExpress Open Platform keys. The feature table
+below marks those parts. A public App Store listing needs that path working
+(requirement 1.1.11; see `docs/PUBLISHING.md`, section 0).
 
 *Tiếng Việt: xem phần [Hướng dẫn nhanh (VI)](#hướng-dẫn-nhanh-vi) ở cuối.*
 
@@ -15,28 +36,28 @@ cost and profit — across several stores under one account.
 
 | Area | What you get |
 | --- | --- |
-| **Find products** | Keyword + image search across supplier catalogs (AliExpress DS API, CJ), sort by orders/rating/price, shipping cost per result, **Add to shop** in one click (import + price + push), paste URLs or IDs, bulk link import, CSV import, browser-extension capture. |
+| **Find products** | Browser-extension capture from the AliExpress product page (production today). With the DS API: keyword + image search across supplier catalogs (AliExpress, CJ), sort by orders/rating/price, shipping cost per result, **Add to shop** (import + price + push), paste URLs or IDs, bulk link import, CSV import. |
 | **Import list** | Staging area: edit title, description (HTML with preview), vendor/type/tags/handle/collections, images (reorder/remove/add), variants (price, compare-at, SKU, inventory, enable/disable), exclude option values, split by option, apply pricing rules, bulk push to Shopify. |
 | **My products** | Managed products mirrored from Shopify, link existing Shopify products for mapping, reprice from supplier cost, auto-update toggles, refresh/unlink/delete, resource-picker linking. |
 | **Mapping** | Basic (1:1), Advanced (ranked suppliers per destination country with in-stock fall-through), BOGO (quantity tiers), Bundle (multi-SKU components). Auto-map by option values, with an AI pass for the variants the deterministic matcher cannot place. Live "test the mapping" resolver. Supplier cost history. |
 | **Supplier comparison** | Side-by-side landed cost, shipping, delivery days, rating, order count and variant coverage for every supplier of a product, scored and ranked, with one-click switch and the saving it earns. |
 | **Orders** | Webhook ingest + backfill sync, pipeline stages (Pending → Awaiting order → Awaiting payment → Awaiting shipment → Awaiting delivery → Fulfilled / Canceled / Failed), address validation with country rules (phone, ZIP, province, CPF/RUT/PCCC/TC Kimlik…), auto-fix over-long addresses, per-line mapping resolution with clear failure reasons, bulk place, force place, ignore lines, address editor that can write back to Shopify, CSV export. |
-| **Fulfilment** | One purchase order per supplier, shipping method chosen from your carrier preferences with cost/day/tracking guard rails and cheapest/fastest fallback, idempotent placement, retry/cancel/manual link, supplier status polling that never regresses, tracking capture, Shopify fulfilment creation with customer notification, carrier-name override, custom tracking URL, order tagging, auto-cancel upstream on Shopify cancel, auto-place with delay. |
+| **Fulfilment** | Production today: orders wait to be placed through the extension flow above, and the tracking you record becomes a Shopify fulfilment (Shopify emails the customer when that store setting is on), with carrier-name override, custom tracking URL and order tagging. With the DS API: one purchase order per supplier, shipping method chosen from your carrier preferences with cost/day/tracking guard rails, idempotent placement, retry/cancel, supplier status polling, upstream cancel on Shopify cancel, and auto-place with delay. |
 | **Tracking** | All tracking numbers with sync state, failed-sync retry, delivered filter. A supplier order that ships as several parcels puts every number on the one Shopify fulfilment. |
-| **Payments** | AliExpress will not let an app charge your account, so the app never tries: it places orders unpaid and gives you the links. Every unpaid order with its total, a running total per currency, a 24-hour countdown before AliExpress cancels it, a **Pay** button per order, bulk open, automatic status polling and a manual "I paid this". |
-| **Request fulfillment from Shopify** | Register the app as a Shopify fulfilment service and the native **Request fulfillment** button on a Shopify order routes it here, which places the supplier order. Unmapped lines are rejected back to Shopify with the reason. |
-| **Auto updates** | Policy per shop: on price change (update via rule / notify / nothing) with threshold; on stock change (set 0 when out + restock, mirror capped quantity, unpublish, notify); on product removed. Dry-run preview, manual run, schedule interval, run history. |
+| **Payments** | AliExpress will not let an app charge your account, so the app never tries: you pay every order on AliExpress. With the DS API, orders the app places arrive unpaid and the Payments page lists them with totals per currency, the 24-hour countdown before AliExpress cancels an unpaid order, a **Pay** link per order, status polling and a manual "I paid this". |
+| **Request fulfillment from Shopify** | Register the app as a Shopify fulfilment service and the native **Request fulfillment** button on a Shopify order routes it here, where it waits to be placed (through the extension today, or by the DS API when live). Unmapped lines are rejected back to Shopify with the reason. |
+| **Auto updates** (DS API) | Policy per shop: on price change (update via rule / notify / nothing) with threshold; on stock change (set 0 when out + restock, mirror capped quantity, unpublish, notify); on product removed. Dry-run preview, manual run, schedule interval, run history. |
 | **Pricing rules** | Multiply / add / target margin / fixed; compare-at derived from price; cents ending; round-up-to-multiple; min/max clamps; include shipping; cost-range tiers; default rule; live preview table. |
 | **Shipping** | Ranked carriers per country (or `*`), max cost, max days, tracking required, fallback cheapest/fastest/none, global cost cap. |
-| **Suppliers** | AliExpress OAuth, CJ API-key, mock account; shared across stores on the account; default per platform; connection test; encrypted tokens; automatic refresh. |
+| **Suppliers** | AliExpress OAuth and CJ API-key (both need their platform keys), Demo supplier; shared across stores on the account; default per platform; connection test; encrypted tokens; token refresh. |
 | **Reports** | Revenue / cost / profit / margin KPIs, daily chart, top products, destinations, recalculation. |
 | **Multi-store & staff** | Several Shopify stores under one account (shared supplier connections), staff roles (Owner/Admin/Staff/Read-only). |
 | **Notifications & activity** | In-app notification feed with dedupe, full activity log, background job list with progress, queue/webhook status. |
 | **Plans & billing** | Basic (free), Advanced, Pro and Enterprise through the Shopify Billing API with a 14-day trial; caps on products, stores and staff across the account; AI mapping and auto-place on paid plans; usage meters and upgrade/downgrade under Settings → Plan. |
-| **Email** | Instant notification emails or a daily digest at 08:00 shop time, via SMTP or Resend; critical notices always go out. |
+| **Email** | Needs an email provider (`EMAIL_FROM` plus `RESEND_API_KEY` or `SMTP_URL`). With one: instant notification emails or a daily digest at 08:00 shop time. Without one (production today) notifications stay in the app and the settings screen disables email. |
 | **Privacy & retention** | Mandatory compliance webhooks: data requests produce a downloadable export, redaction erases personal fields, shop redact and a 30-day purge erase the store. |
 | **Settings** | Orders, fulfilment, products defaults, currency (live FX with buffer/manual rate), notifications, UI language (English / Tiếng Việt, auto-detected from the admin), plan, support, extension API token, system status. |
-| **Extension** | Minimal MV3 Chrome extension (`extension/`) that sends the current AliExpress/CJ product page to the import list. |
+| **Extension** | MV3 Chrome extension (`extension/`): sends the current AliExpress product page to the import list, and lists the orders waiting to be placed so you can place and pay for each on AliExpress and record its order number and tracking. |
 
 A detailed DSers feature-by-feature comparison is in [`docs/FEATURES.md`](docs/FEATURES.md).
 
@@ -105,7 +126,7 @@ It consumes the queue and owns the repeatable schedules (supplier order polling 
 **One process is enough to start.** Set `RUN_WORKER_IN_WEB=true` and the web process
 does the background work too. With Redis it consumes the queue; without Redis it runs
 the same schedule on plain timers and jobs execute inline. That is a single service and
-a database — no Redis, no second process — and everything still runs automatically.
+a database — no Redis, no second process — and the background schedule still runs.
 Move to a separate worker and Redis when order volume makes a restart losing queued
 work matter: a queued job survives a deploy only when Redis is holding it.
 
@@ -148,10 +169,10 @@ All settings are environment variables; see [`.env.example`](.env.example).
 | `DATABASE_URL` | PostgreSQL connection string. |
 | `REDIS_URL`, `QUEUE_PREFIX`, `RUN_WORKER_IN_WEB` | Queue. With Redis, a separate `npm run worker` process does the background work. Without it, set `RUN_WORKER_IN_WEB=true` and the web process runs the schedule on timers — enough for one instance, but a restart loses whatever was queued. |
 | `SUPPLIER_DRIVER` | `mock` (sample catalog) or `live`. |
-| `ALIEXPRESS_APP_KEY`, `ALIEXPRESS_APP_SECRET`, `ALIEXPRESS_REDIRECT_URI`, `ALIEXPRESS_TRACKING_ID` | AliExpress Open Platform (Dropshipping solution). Redirect URI must be `https://<app>/app/suppliers/callback/aliexpress`. |
+| `ALIEXPRESS_APP_KEY`, `ALIEXPRESS_APP_SECRET`, `ALIEXPRESS_REDIRECT_URI`, `ALIEXPRESS_TRACKING_ID` | AliExpress Open Platform (Dropshipping solution). Redirect URI must be `https://<app>/suppliers/callback/aliexpress` (the default when `ALIEXPRESS_REDIRECT_URI` is unset). |
 | `CJ_EMAIL`, `CJ_API_KEY` | Optional server-wide CJ credentials (merchants can also enter their own in the UI). |
 | `ENCRYPTION_KEY` | 32-byte base64 key (`openssl rand -base64 32`); supplier tokens are AES-256-GCM encrypted at rest. **Required in production** — the app refuses to boot without it. |
-| `EMAIL_FROM`, `SMTP_URL` or `RESEND_API_KEY`, `EMAIL_PROVIDER` | Notification emails and the daily digest. Leave unset for in-app notifications only. |
+| `EMAIL_FROM`, `SMTP_URL` or `RESEND_API_KEY`, `EMAIL_PROVIDER` | Notification emails and the daily digest. Unset (as in production today), notifications are in-app only and the email settings are disabled. |
 | `SUPPORT_EMAIL` | Shown on the public support page and used as the reply-to address. |
 | `BILLING_TEST` | Force Shopify Billing test mode on a staging deployment; automatic outside production and on development stores. |
 | `ANTHROPIC_API_KEY`, `AI_MAPPING_MODEL` | Optional. Enables the AI pass on variant matching for the variants the deterministic matcher cannot place. Without a key the deterministic matcher is used alone. |
@@ -182,21 +203,28 @@ lets anyone run the whole flow without an AliExpress account).
   independent integrations (see `docs/ALIEXPRESS.md`); the CJ adapter follows its public
   docs. Run one real order end to end after connecting your account — the parsing tests
   say exactly where to adjust if your account answers differently.
-- Supplier payment is done on the supplier site (as with DSers); the app links you to
-  the payment page and tracks status afterwards.
-- The Chrome extension is minimal (send the current supplier page to the import list);
-  it is not published to the Chrome Web Store.
+- Supplier payment is done on the supplier site (as with DSers). With the DS API the app
+  links you to the payment page and tracks status afterwards.
+- The Chrome extension imports products and lists orders for you to place on AliExpress;
+  it is loaded unpacked and not published to the Chrome Web Store.
 - Only AliExpress, CJ Dropshipping and the Demo supplier are implemented; Temu and
   others fit the adapter contract but have no adapter yet.
 
 ## Hướng dẫn nhanh (VI)
 
-DropshipHub là ứng dụng Shopify tương tự DSers: tìm & nhập sản phẩm từ AliExpress/CJ,
+DropshipHub là ứng dụng Shopify cho cửa hàng dropshipping AliExpress: nhập sản phẩm,
 chỉnh sửa trong **Import list** trước khi đẩy lên cửa hàng, **mapping** biến thể với SKU
-nhà cung cấp (Basic / Advanced theo quốc gia / BOGO / Bundle), **đặt hàng hàng loạt** lên
-nhà cung cấp với tự động chọn phương thức vận chuyển, **đồng bộ mã vận đơn** về Shopify
-(tạo fulfillment, gửi email khách), **tự động cập nhật giá/tồn kho** theo chính sách, báo
-cáo doanh thu – chi phí – lợi nhuận, quản lý nhiều cửa hàng và nhân viên.
+nhà cung cấp (Basic / Advanced theo quốc gia / BOGO / Bundle), giữ mỗi đơn nhà cung cấp
+và mã vận đơn cạnh đơn Shopify của nó, báo cáo doanh thu – chi phí – lợi nhuận, quản lý
+nhiều cửa hàng và nhân viên.
+
+**Production hiện chạy theo tiện ích Chrome.** Sản phẩm được nhập bằng tiện ích trên trang
+sản phẩm AliExpress. Tiện ích Chrome liệt kê các đơn đang chờ đặt và mở từng sản phẩm trên
+AliExpress. Bạn tự đặt và thanh toán đơn ngay trên AliExpress, rồi ghi mã đơn AliExpress
+vào tiện ích; mã vận đơn bạn thêm ở đó sẽ được gửi sang Shopify. Tiện ích không tự đặt
+hay tự thanh toán đơn. Thông báo nằm trong ứng dụng; email chỉ bật được khi đã cấu hình
+nhà cung cấp email. Tìm kiếm catalogue, đặt đơn từ ứng dụng và cập nhật giá/tồn kho theo
+nhà cung cấp cần API Dropshipping của AliExpress (`SUPPLIER_DRIVER=live`).
 
 ```bash
 npm install
@@ -216,14 +244,14 @@ từng bước bằng tiếng Việt, nằm ở `docs/ALIEXPRESS.md`.
 Anh là bản gốc, nên nếu thiếu chuỗi nào thì hiện tiếng Anh chứ không để trống.
 
 **Thanh toán.** AliExpress không cho phép ứng dụng trừ tiền tài khoản của bạn, nên app
-không bao giờ tự thanh toán: app tạo đơn ở trạng thái chưa trả rồi đưa link trực tiếp.
-Trang **Payments** liệt kê mọi đơn chưa trả, tổng tiền theo từng loại tiền tệ, đồng hồ
-đếm ngược 24 giờ trước khi AliExpress huỷ đơn, nút **Pay** mở đúng đơn đó, và nút mở
-hàng loạt để trả nhiều đơn một lần.
+không bao giờ tự thanh toán: bạn trả mọi đơn trên AliExpress. Khi dùng API DS, đơn do app
+tạo ở trạng thái chưa trả và trang **Payments** liệt kê chúng, tổng tiền theo từng loại
+tiền tệ, đồng hồ đếm ngược 24 giờ trước khi AliExpress huỷ đơn và nút **Pay** mở đúng đơn đó.
 
 **Nút Request fulfillment ngay trong Shopify.** Đăng ký app làm fulfillment service
 (Settings → Fulfilment) là mỗi đơn Shopify sẽ có nút **Request fulfillment** gửi thẳng
-sang app và app tự đặt hàng nhà cung cấp. Dòng nào chưa map thì app từ chối kèm lý do.
+sang app, nơi đơn chờ được đặt (qua tiện ích như trên, hoặc qua API DS khi bật). Dòng nào
+chưa map thì app từ chối kèm lý do.
 
 **So sánh nhà cung cấp & map bằng AI.** Trang sản phẩm hiển thị mọi nhà cung cấp của
 sản phẩm đó cạnh nhau: giá vốn đã gồm ship, số ngày giao, đánh giá, số đơn, và tỷ lệ

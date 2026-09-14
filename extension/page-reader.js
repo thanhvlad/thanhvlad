@@ -23,6 +23,16 @@
   /** The server clips descriptions at 200 000 characters; stay well inside it. */
   const MAX_DESCRIPTION_CHARS = 180000;
   const MAX_SPEC_ROWS = 40;
+  /**
+   * The most variants one capture carries. Shopify products may have up to 2048
+   * variants, but the Admin API documents a general limit of 250 elements for
+   * any input array, and productSet's documentation does not exempt its variants
+   * list from it. A capture of 251 or more therefore imports cleanly and then
+   * fails at push, after the merchant has edited it. Stopping at 250 keeps every
+   * capture pushable; `variantCount` reports how many the page offered so the
+   * panel can say that some were left out.
+   */
+  const MAX_VARIANTS = 250;
 
   /** "₫2,861,602|2861602|" -> "2861602" */
   function plainAmount(salePriceLocal, fallbackValue) {
@@ -123,7 +133,8 @@
       images: [...new Set(images)].slice(0, 30),
       currency,
       optionNames,
-      variants: variants.slice(0, 300),
+      variants: variants.slice(0, MAX_VARIANTS),
+      variantCount: variants.length,
       storeName: storeName ? storeName.trim().slice(0, 200) : null,
       categoryId: info?.categoryId != null ? String(info.categoryId) : null,
       shipsFrom: [],
@@ -266,7 +277,8 @@
       const name = String(prop?.attrName ?? "").trim();
       const value = String(prop?.attrValue ?? "").trim();
       if (!isSpecRow(name, value)) continue;
-      const key = `${name.toLowerCase()} ${value.toLowerCase()}`;
+      // A NUL separator cannot occur in either part, so two rows cannot collide.
+      const key = `${name.toLowerCase()}\u0000${value.toLowerCase()}`;
       if (seen.has(key)) continue;
       seen.add(key);
       rows.push(`<tr><th>${escapeHtml(name)}</th><td>${escapeHtml(value)}</td></tr>`);

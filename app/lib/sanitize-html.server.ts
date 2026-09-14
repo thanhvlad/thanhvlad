@@ -40,15 +40,27 @@ const ALLOWED_TAGS = [
  */
 const SAFE_CSS_VALUE = /^(?![\s\S]*(?:url|image-set|image|element|expression|attr|var|src)\s*\()(?![\s\S]*\\)[-#%.,\s\w()'"/!+*]+$/i;
 
+/**
+ * Every property the AI landing contract lists as allowed
+ * (app/domain/copy/lumora-contract.ts, section 8) must be here, or rewritten
+ * pages silently lose it: the sanitizer runs on the model's output, on every
+ * editor save and on every push, and rewritten descriptions are reused as the
+ * model's worked examples. `background`, `table-layout`, `cursor` and
+ * `overflow-x` were once missing, which stripped the tinted "Before you buy" and
+ * shipping panels and the fixed layout of the specification table. The
+ * `background` shorthand is safe only because SAFE_CSS_VALUE refuses `url(`,
+ * `image-set(` and backslash escapes, so it can carry a colour and nothing else
+ * that loads.
+ */
 const STYLE_PROPERTIES = [
-  "color", "background-color", "opacity",
+  "color", "background", "background-color", "opacity", "cursor",
   "font-size", "font-weight", "font-style", "line-height", "letter-spacing", "text-transform", "text-align", "text-decoration", "vertical-align", "white-space",
   "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
   "padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
   "width", "max-width", "min-width", "height", "max-height", "min-height",
   "display", "flex", "flex-wrap", "flex-direction", "flex-basis", "flex-grow", "flex-shrink", "gap", "row-gap", "column-gap", "align-items", "justify-content",
   "border", "border-top", "border-right", "border-bottom", "border-left", "border-color", "border-width", "border-style", "border-radius", "border-collapse",
-  "list-style", "list-style-type", "object-fit", "box-sizing", "overflow",
+  "list-style", "list-style-type", "object-fit", "box-sizing", "overflow", "overflow-x", "overflow-y", "table-layout",
 ];
 
 const allowedStyles = Object.fromEntries(STYLE_PROPERTIES.map((property) => [property, [SAFE_CSS_VALUE]]));
@@ -109,9 +121,12 @@ function buildOptions({ stripSupplierLinks = false }: SanitizeDescriptionOptions
     allowProtocolRelative: false,
     // An <img> left without a usable src (a data: URI, javascript:) is a broken
     // image on the storefront; drop it instead of shipping the empty tag.
+    // The paragraph test removes supplier domains itself because this filter sees
+    // the text before `textFilter` does: `<p><a>aliexpress.com</a></p>` would
+    // otherwise survive as an empty `<p></p>`.
     exclusiveFilter: (frame) =>
       (frame.tag === "img" && !frame.attribs.src) ||
-      (stripSupplierLinks && frame.tag === "p" && !frame.text.trim() && frame.mediaChildren.length === 0),
+      (stripSupplierLinks && frame.tag === "p" && !frame.text.replace(SUPPLIER_DOMAINS, "").trim() && frame.mediaChildren.length === 0),
     transformTags: {
       img: (tagName, attribs) => ({ tagName, attribs: { ...attribs, src: imageSource(attribs.src) } }),
       a: (tagName, attribs) => {

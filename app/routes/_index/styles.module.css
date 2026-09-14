@@ -58,6 +58,11 @@
   background: #006e52;
 }
 
+.note {
+  font-size: 0.9rem;
+  color: #6d7175;
+}
+
 .list {
   margin: 0;
   padding-left: 1.25rem;
