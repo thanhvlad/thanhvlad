@@ -15,3 +15,4 @@ export * as notifications from "./notifications";
 export * as logs from "./logs";
 export * as settings from "./settings";
 export * as shared from "./shared";
+export * as billing from "./billing";
