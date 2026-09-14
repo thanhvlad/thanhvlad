@@ -19,3 +19,4 @@ coverage
 .idea
 __pycache__/
 *.pyc
+tools/shopify/ops/product_snapshot.json
