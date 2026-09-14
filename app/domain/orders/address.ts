@@ -368,3 +368,17 @@ export const ADDRESS_RULES = {
   MAX_ADDRESS2,
   MAX_NAME,
 };
+
+/**
+ * Whether an address carries enough to be sent to Shopify as the order's address.
+ *
+ * Orders the app does not fulfil keep only a country code once their customer
+ * data is minimised. The edit form is pre-filled from what is stored, so for
+ * such an order every field but country is blank, and pushing it replaced the
+ * real shipping address on the live Shopify order with empty strings. A street,
+ * a city and a country are the least a real address has. Exported for the test.
+ */
+export function addressIsCompleteForShopify(address: ShippingAddress | null | undefined): boolean {
+  const filled = (value: unknown) => typeof value === "string" && value.trim().length > 0;
+  return Boolean(address && filled(address.address1) && filled(address.city) && (filled(address.countryCode) || filled(address.country)));
+}

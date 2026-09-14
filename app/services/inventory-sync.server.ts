@@ -4,6 +4,7 @@ import { planVariantSync, type InventoryPolicyInput, type SyncAction } from "~/d
 import { AppError, errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
 import { logActivity } from "./activity.server";
+import { convertToShopCurrency } from "./currency.server";
 import { notify } from "./notifications.server";
 import { resolvePricingRule } from "./pricing.server";
 import type { ShopWithSettings } from "./shop.server";
@@ -73,6 +74,21 @@ function toPolicyInput(row: Awaited<ReturnType<typeof getInventoryPolicy>>): Inv
     maxInventoryPushed: row.maxInventoryPushed,
     onProductRemoved: row.onProductRemoved,
   };
+}
+
+/**
+ * The supplier price in the currency the variant's cost was stored in.
+ *
+ * Import converts the supplier price into the shop's currency before storing
+ * the cost; the sync compared the raw supplier price against that cost. A
+ * capture from a page priced in another currency then looked like a large price
+ * move and produced cost and price actions from nothing. A variant with no
+ * currency recorded is taken as already in the shop's currency. Exported for the test.
+ */
+export async function supplierPriceInShopCurrency(shop: ShopWithSettings, sv: { price: Prisma.Decimal | string | number; currency?: string | null }) {
+  const from = sv.currency || shop.currency;
+  if (!from || !shop.currency || from.toUpperCase() === shop.currency.toUpperCase()) return sv.price;
+  return convertToShopCurrency(sv.price as never, from, shop.currency, shop.parsedSettings.currency);
 }
 
 /**
@@ -185,7 +201,7 @@ export async function runInventorySync(
           previousSupplierCost: variant.cost?.toString() ?? null,
           supplier: supplierProductRemoved || !sv
             ? { found: false }
-            : { found: true, price: sv.price.toString(), stock: sv.stock, isAvailable: sv.isAvailable },
+            : { found: true, price: (await supplierPriceInShopCurrency(shop, sv)).toString(), stock: sv.stock, isAvailable: sv.isAvailable },
         },
         policy,
         pricingRule,

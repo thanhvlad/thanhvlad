@@ -825,11 +825,20 @@ export default function OrderDetailPage() {
                     </Text>
                   )}
                 </BlockStack>
-                <InlineStack>
-                  <Button size="slim" onClick={() => setEditing(true)}>
-                    {t("orders.detail.editAddress")}
-                  </Button>
-                </InlineStack>
+                {/* An order DropshipHub does not fulfil keeps only its country here.
+                    Editing it would start from blank fields, and pushing those to
+                    Shopify wiped the real address on the live order. */}
+                {order.address?.address1 ? (
+                  <InlineStack>
+                    <Button size="slim" onClick={() => setEditing(true)}>
+                      {t("orders.detail.editAddress")}
+                    </Button>
+                  </InlineStack>
+                ) : (
+                  <Text as="p" tone="subdued" variant="bodySm">
+                    {t("orders.detail.addressNotStored")}
+                  </Text>
+                )}
               </BlockStack>
             </Card>
 

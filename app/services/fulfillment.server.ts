@@ -1636,8 +1636,12 @@ export class ExtensionApiError extends Error {
  * rate-limit bucket, so a spoofed one costs the spoofer their own budget.
  */
 function clientAddress(request: Request): string {
+  // Only headers the reverse proxy in front of the app sets. Caddy writes
+  // X-Forwarded-For from the connection's own address and does not trust a
+  // client's copy; Fly-Client-IP is passed through untouched, so reading it
+  // first let any caller pick a fresh address per request and walk past the
+  // per-address rate limit.
   return (
-    request.headers.get("fly-client-ip") ??
     request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
     request.headers.get("x-real-ip") ??
     "unknown"

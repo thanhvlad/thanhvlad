@@ -131,6 +131,7 @@ export const en = {
   "settings.advanced.rates.emptyBody": "Refresh now to fetch today's rates, or they arrive on their own the first time a price is converted.",
   "settings.advanced.webhooks.latest": "Latest events",
   "settings.advanced.webhooks.emptyBody": "Shopify sends an event here whenever an order, product or fulfilment changes. The first one appears after your next change in Shopify.",
+  "settings.advanced.tokenAdminOnly": "— only admins can view the token —",
 } as const;
 
 export const vi: Partial<Record<keyof typeof en, string>> = {
@@ -261,4 +262,5 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   "settings.advanced.rates.emptyBody": "Bấm Cập nhật ngay để lấy tỷ giá hôm nay, hoặc tỷ giá sẽ tự về khi lần đầu có giá cần quy đổi.",
   "settings.advanced.webhooks.latest": "Sự kiện mới nhất",
   "settings.advanced.webhooks.emptyBody": "Shopify gửi sự kiện về đây mỗi khi đơn hàng, sản phẩm hoặc fulfillment thay đổi. Sự kiện đầu tiên sẽ hiện sau lần thay đổi kế tiếp trên Shopify.",
+  "settings.advanced.tokenAdminOnly": "— chỉ quản trị viên xem được token —",
 };

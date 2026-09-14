@@ -31,7 +31,7 @@ vi.mock("~/services/suppliers/catalog.server", () => ({ refreshSupplierProduct }
 vi.mock("~/services/suppliers/index.server", () => ({ SUPPLIER_API_UNAVAILABLE: "SUPPLIER_API_UNAVAILABLE" }));
 vi.mock("~/services/shopify/products.server", () => ({ setInventoryQuantities, setProductStatus: vi.fn(), updateVariantPrices: vi.fn() }));
 
-const { captureIsNewerThanSync, isNoSupplierApiError, runInventorySync, REFRESH_BY_RECAPTURE_REASON } = await import("~/services/inventory-sync.server");
+const { captureIsNewerThanSync, isNoSupplierApiError, runInventorySync, supplierPriceInShopCurrency, REFRESH_BY_RECAPTURE_REASON } = await import("~/services/inventory-sync.server");
 
 const shop = { id: "shop1", primaryLocationId: "gid://shopify/Location/1", fulfillmentLocationId: null, parsedSettings: { notifications: {} } } as never;
 const client = vi.fn() as never;
@@ -155,5 +155,23 @@ describe("an extension capture newer than the product's last sync", () => {
     expect(captureIsNewerThanSync(null, new Date())).toBe(false);
     expect(captureIsNewerThanSync(new Date("2026-09-14T12:00:00Z"), synced)).toBe(true);
     expect(captureIsNewerThanSync(synced, synced)).toBe(false);
+  });
+});
+
+describe("supplierPriceInShopCurrency", () => {
+  const usdShop = { currency: "USD", parsedSettings: { currency: { manualRate: 0.14, bufferPercent: 0 } } } as never;
+
+  it("converts a capture priced in another currency before it is compared with the stored cost", async () => {
+    // 20 CNY at 0.14 is 2.80 USD. Compared raw, "20" against a 2.80 cost looked
+    // like a sevenfold price rise.
+    expect(String(await supplierPriceInShopCurrency(usdShop, { price: "20", currency: "CNY" }))).toBe("2.8");
+  });
+
+  it("leaves a price already in the shop's currency alone", async () => {
+    expect(String(await supplierPriceInShopCurrency(usdShop, { price: "4.00", currency: "usd" }))).toBe("4.00");
+  });
+
+  it("treats a variant with no recorded currency as the shop's", async () => {
+    expect(String(await supplierPriceInShopCurrency(usdShop, { price: "4.00", currency: null }))).toBe("4.00");
   });
 });

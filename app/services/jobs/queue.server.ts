@@ -190,6 +190,9 @@ const SCHEDULE_TICKS: Array<{ kind: JobPayloads["scheduler-tick"]["kind"]; every
   { kind: "email-digest", every: 60 * 60_000 },
 ];
 
+/** How long after boot the daily jobs first run: past the startup rush, well inside a day. */
+export const BOOT_DAILY_DELAY_MS = 5 * 60_000;
+
 const GLOBAL_TICKS: Array<{ id: string; every: number; run: () => Promise<unknown> }> = [
   { id: "refresh-rates-usd", every: 12 * 60 * 60_000, run: () => enqueue("refresh-rates", { base: "USD" }) },
   { id: "purge-uninstalled", every: 24 * 60 * 60_000, run: () => enqueue("purge-uninstalled", {}) },
@@ -240,6 +243,17 @@ export function startInlineSchedules(): boolean {
     timer.unref?.();
     timers.push(timer);
   }
+  // The daily jobs also run once shortly after boot. A 24-hour interval starts
+  // over on every restart, and this deployment restarts on each release, so a
+  // day without uptime meant retention - which the privacy policy promises -
+  // never ran at all. Both jobs are idempotent, so an extra run is harmless.
+  const bootRun = setTimeout(() => {
+    for (const tick of GLOBAL_TICKS) {
+      void tick.run().catch((error) => logger.error("Boot-time run of a daily job failed", { id: tick.id, error }));
+    }
+  }, BOOT_DAILY_DELAY_MS);
+  bootRun.unref?.();
+  timers.push(bootRun);
   globalThis.__dropshipInlineTimers = timers;
   logger.info("Repeatable schedules registered", { mode: "timers", ticks: SCHEDULE_TICKS.length + GLOBAL_TICKS.length });
   return true;

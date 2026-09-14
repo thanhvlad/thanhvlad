@@ -1,6 +1,6 @@
 import type { Order, OrderLineItem, OrderStage, Prisma, PurchaseOrder } from "@prisma/client";
 import prisma from "~/db.server";
-import { applySuggestions, validateAddress, type ShippingAddress } from "~/domain/orders/address";
+import { addressIsCompleteForShopify, applySuggestions, validateAddress, type ShippingAddress } from "~/domain/orders/address";
 import { evaluateOrder as evaluatePipeline, type OrderIssue, type PurchaseOrderStatus } from "~/domain/orders/pipeline";
 import type { ResolveResult } from "~/domain/mapping/types";
 import { logger } from "~/lib/logger.server";
@@ -588,6 +588,9 @@ export async function updateOrderAddress(shop: ShopWithSettings, client: Graphql
   const order = await prisma.order.findFirst({ where: { id: orderId, shopId: shop.id } });
   if (!order) throw new Error("Order not found");
   const merged: ShippingAddress = { ...(order.shippingAddress as ShippingAddress), ...address };
+  if (options.pushToShopify && !addressIsCompleteForShopify(merged)) {
+    throw new Error("This address is incomplete, so it was not sent to Shopify: that would replace the order's real address with blank fields. Edit the address in Shopify instead.");
+  }
   await prisma.order.update({ where: { id: orderId }, data: { shippingAddress: merged as Prisma.InputJsonValue, countryCode: merged.countryCode ?? order.countryCode, phone: merged.phone ?? order.phone } });
   if (options.pushToShopify && client) {
     await updateOrderShippingAddress(client, order.shopifyOrderId, {

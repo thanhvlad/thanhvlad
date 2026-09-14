@@ -9,6 +9,7 @@ import { EmptyScreen } from "~/components/EmptyScreen";
 import { SectionHeader } from "~/components/SectionHeader";
 import { useSettingsPageAction } from "~/components/settings-page-action";
 import prisma from "~/db.server";
+import { atLeast } from "~/lib/access.server";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { encryptionConfigured } from "~/lib/crypto.server";
 import { env } from "~/lib/env.server";
@@ -22,7 +23,10 @@ import { logActivity } from "~/services/activity.server";
 import { WEBHOOK_ABANDONED_PREFIX } from "~/services/webhooks.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { shop } = await requireShop(request);
+  const { shop, role } = await requireShop(request);
+  // The token now authorises the extension's order list, which carries customer
+  // addresses, so a read-only or staff member must not be able to copy it.
+  const canSeeToken = atLeast(role, "ADMIN");
   const [queue, rates, webhooks, abandoned] = await Promise.all([
     queueStats(),
     listRates(shop.parsedSettings.currency.supplierCurrency),
@@ -38,7 +42,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }),
   ]);
   return {
-    apiToken: shop.apiToken,
+    apiToken: canSeeToken ? shop.apiToken : null,
+    tokenHidden: !canSeeToken && Boolean(shop.apiToken),
     appUrl: env().SHOPIFY_APP_URL,
     supplierDriver: env().SUPPLIER_DRIVER,
     encryption: encryptionConfigured(),
@@ -153,7 +158,7 @@ export default function AdvancedSettings() {
             />
             <TextField
               label={t("settings.advanced.token")}
-              value={data.apiToken ?? t("settings.advanced.tokenNotGenerated")}
+              value={data.apiToken ?? (data.tokenHidden ? t("settings.advanced.tokenAdminOnly") : t("settings.advanced.tokenNotGenerated"))}
               readOnly
               autoComplete="off"
               monospaced={hasToken}
