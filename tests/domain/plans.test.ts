@@ -3,6 +3,11 @@ import {
   PAID_PLANS,
   PLANS,
   PLAN_ORDER,
+  MAX_AI_REWRITE_BATCH,
+  aiRewriteAllowance,
+  aiUsagePeriod,
+  aiUsageResetsAt,
+  checkAiRewriteRequest,
   checkLimit,
   cheapestPlanWith,
   entitledPlan,
@@ -89,5 +94,42 @@ describe("features and entitlement", () => {
     expect(usageFraction("FREE", "products", 1500)).toBe(0.5);
     expect(usageFraction("FREE", "products", 9000)).toBe(1);
     expect(usageFraction("ENTERPRISE", "staff", 40)).toBe(0);
+  });
+});
+
+describe("AI rewrite allowance", () => {
+  it("grows with the plan and keeps the free tier to a trial", () => {
+    for (let i = 1; i < PLAN_ORDER.length; i += 1) {
+      expect(PLANS[PLAN_ORDER[i]].limits.aiRewritesPerMonth).toBeGreaterThan(PLANS[PLAN_ORDER[i - 1]].limits.aiRewritesPerMonth);
+    }
+    expect(PLANS.FREE.limits.aiRewritesPerMonth).toBeLessThanOrEqual(5);
+  });
+
+  it("keeps a month of typical spend under half of each paid plan's price", () => {
+    // US$0.40 is the typical Opus-class cost of one rewrite; see PlanLimits.
+    for (const id of PAID_PLANS) {
+      expect(PLANS[id].limits.aiRewritesPerMonth * 0.4).toBeLessThanOrEqual(PLANS[id].monthlyPrice * 0.5);
+    }
+  });
+
+  it("reports what is left and the cheapest plan with more", () => {
+    expect(aiRewriteAllowance("FREE", 1)).toEqual({ plan: "FREE", limit: 3, used: 1, remaining: 2, upgradeTo: "ADVANCED" });
+    expect(aiRewriteAllowance("ADVANCED", 50).remaining).toBe(0);
+    expect(aiRewriteAllowance("ENTERPRISE", 0).upgradeTo).toBeNull();
+  });
+
+  it("refuses an empty, oversized or unaffordable batch, in that order", () => {
+    const fresh = aiRewriteAllowance("PRO", 0);
+    expect(checkAiRewriteRequest(fresh, 0)).toBe("none-selected");
+    expect(checkAiRewriteRequest(fresh, MAX_AI_REWRITE_BATCH + 1)).toBe("batch-too-large");
+    expect(checkAiRewriteRequest(aiRewriteAllowance("FREE", 3), 1)).toBe("quota-exhausted");
+    expect(checkAiRewriteRequest(aiRewriteAllowance("FREE", 1), 3)).toBe("quota-short");
+    expect(checkAiRewriteRequest(aiRewriteAllowance("FREE", 1), 2)).toBeNull();
+  });
+
+  it("counts by UTC calendar month and resets on the first", () => {
+    expect(aiUsagePeriod(new Date("2026-09-30T23:59:59Z"))).toBe("2026-09");
+    expect(aiUsagePeriod(new Date("2026-10-01T00:00:00Z"))).toBe("2026-10");
+    expect(aiUsageResetsAt(new Date("2026-12-15T12:00:00Z")).toISOString()).toBe("2027-01-01T00:00:00.000Z");
   });
 });

@@ -26,13 +26,17 @@ import { Paginator } from "~/components/Paginator";
 import { SectionHeader } from "~/components/SectionHeader";
 import { PlatformBadge, StatusBadge } from "~/components/StatusBadge";
 import { Thumb } from "~/components/Thumb";
+import { MAX_AI_REWRITE_BATCH, PLANS, aiUsageResetsAt, checkAiRewriteRequest, type AiRewriteRefusal } from "~/domain/billing/plans";
 import { readForm, requireShop } from "~/lib/auth.server";
-import { aiLandingAvailable } from "~/services/ai-landing.server";
-import { errorMessage } from "~/lib/errors";
+import { aiEndpointStatus, aiLandingAvailable } from "~/services/ai-landing.server";
+import { actionFailure, errorMessage } from "~/lib/errors";
 import { formatMoney, pageParam } from "~/lib/format";
+import type { I18nKey } from "~/lib/i18n";
+import { logger } from "~/lib/logger.server";
 import { useJobRun } from "~/lib/use-job-run";
-import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
+import { useErrorMessage, useLocale, useMessage, useT } from "~/lib/use-t";
 import { applyPricingRuleToImport, listImportList, removeFromImportList, summarizeMargins, addToImportList } from "~/services/import.server";
+import { getAiRewriteAllowance } from "~/services/landing-rewrite.server";
 import { createJobRun } from "~/services/jobs.server";
 import { enqueue } from "~/services/jobs/index.server";
 import { listPricingRules } from "~/services/pricing.server";
@@ -46,14 +50,45 @@ const TABS: Array<ImportStatus | "ALL"> = ["ALL", "DRAFT", "FAILED", "PUSHED"];
 /** Intents that act on the selected rows, so the table shows the wait. */
 const BULK_INTENTS = new Set(["push", "rewrite", "remove", "apply-rule"]);
 
+/** Why a rewrite batch was refused, in the merchant's language. */
+const REWRITE_REFUSAL_KEYS: Record<AiRewriteRefusal, I18nKey> = {
+  "none-selected": "import.list.rewrite.refused.noneSelected",
+  "batch-too-large": "import.list.rewrite.refused.batchTooLarge",
+  "quota-exhausted": "import.list.rewrite.refused.quotaExhausted",
+  "quota-short": "import.list.rewrite.refused.quotaShort",
+};
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
   const url = new URL(request.url);
   const status = (url.searchParams.get("status") ?? "ALL") as ImportStatus | "ALL";
   const search = url.searchParams.get("q") ?? "";
   const page = pageParam(url.searchParams.get("page"));
-  const [list, rules] = await Promise.all([listImportList(shop.id, { status, search, page, pageSize: 25 }), listPricingRules(shop.id)]);
+  const available = aiLandingAvailable();
+  const [list, rules, allowance] = await Promise.all([
+    listImportList(shop.id, { status, search, page, pageSize: 25 }),
+    listPricingRules(shop.id),
+    // The list must still open if the allowance cannot be read (say, the usage
+    // table has not been migrated yet); the rewrite is then simply not offered.
+    available
+      ? getAiRewriteAllowance(shop).catch((error: unknown) => {
+          logger.warn("Could not read the AI rewrite allowance", { shopId: shop.id, error: errorMessage(error) });
+          return null;
+        })
+      : Promise.resolve(null),
+  ]);
   return {
+    // Without a key the rewrite cannot run, so the action is not offered at all
+    // rather than offered and answered with an environment-variable error.
+    ai: allowance
+      ? {
+          ...allowance,
+          planName: PLANS[allowance.plan].displayName,
+          upgradeName: allowance.upgradeTo ? PLANS[allowance.upgradeTo].displayName : null,
+          resetsAt: aiUsageResetsAt().toISOString(),
+          viaGateway: !aiEndpointStatus().direct,
+        }
+      : null,
     currency: shop.currency,
     status,
     search,
@@ -93,8 +128,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         return { ok: true, jobRunId: job.id };
       }
       case "rewrite": {
-        if (ids.length === 0) return { ok: false, error: "Select at least one product." };
-        if (!aiLandingAvailable()) return { ok: false, error: "Add an ANTHROPIC_API_KEY to use the AI rewrite." };
+        if (!aiLandingAvailable()) return { ok: false, error: "AI rewrite is not available.", errorKey: "import.list.rewrite.unavailable" };
+        // The confirmation is where the merchant is told their product data
+        // goes to an AI provider and that each product uses an allowance. A
+        // request that did not come through it has not been told either.
+        if (get("disclosed") !== "yes") return { ok: false, error: "Confirm the AI rewrite first.", errorKey: "import.list.rewrite.notConfirmed" };
+        const allowance = await getAiRewriteAllowance(shop);
+        const refusal = checkAiRewriteRequest(allowance, ids.length);
+        if (refusal) {
+          return {
+            ok: false,
+            error: `AI rewrite refused: ${refusal}.`,
+            errorKey: REWRITE_REFUSAL_KEYS[refusal],
+            errorVars: { n: ids.length, max: MAX_AI_REWRITE_BATCH, remaining: allowance.remaining, limit: allowance.limit, plan: PLANS[allowance.plan].displayName },
+          };
+        }
         const job = await createJobRun({ shopId: shop.id, type: "rewrite-landing", total: ids.length, payload: { ids } });
         await enqueue("rewrite-landing", { shopId: shop.id, importedProductIds: ids, jobRunId: job.id, actor, pushAfter: true });
         return { ok: true, jobRunId: job.id };
@@ -138,14 +186,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         return { ok: false, error: "Unknown action" };
     }
   } catch (e) {
-    return { ok: false, error: errorMessage(e) };
+    return actionFailure(e);
   }
 };
 
-type ModalName = "add" | "rule" | "remove";
+type ModalName = "add" | "rule" | "remove" | "rewrite";
 
 export default function ImportListPage() {
   const t = useT();
+  const locale = useLocale();
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const actionMessage = useMessage(fetcher.data as Parameters<typeof useMessage>[0]);
@@ -209,9 +258,15 @@ export default function ImportListPage() {
   // A message that arrived with a job id announces work that has only started,
   // so it reads as information, not as a result.
   const messageTone = fetcher.data && "jobRunId" in fetcher.data && fetcher.data.jobRunId ? "info" : "success";
-  const modalFailure = failureMessage && (lastIntent === "add" || lastIntent === "import-csv") ? failureMessage : undefined;
+  const modalFailure = failureMessage && (lastIntent === "add" || lastIntent === "import-csv" || lastIntent === "rewrite") ? failureMessage : undefined;
 
   const listIsEmpty = allCount === 0 && !data.search && data.status === "ALL";
+
+  // Checked here as well as on the server so the confirmation can say what is
+  // wrong before the merchant presses anything; the server's answer still rules.
+  const ai = data.ai;
+  const rewriteRefusal = ai ? checkAiRewriteRequest(ai, selectedCount) : null;
+  const resetsOn = ai ? new Intl.DateTimeFormat(locale === "vi" ? "vi-VN" : "en-US", { dateStyle: "medium", timeZone: "UTC" }).format(new Date(ai.resetsAt)) : "";
 
   const table = (
     <IndexTable
@@ -224,8 +279,12 @@ export default function ImportListPage() {
         { content: t("import.list.bulk.push"), onAction: () => submit("push"), disabled: busy },
         // Rewrites and publishes in one go: the merchant has already decided
         // what the finished form looks like, so a review step in between
-        // would only be a step.
-        { content: t("import.list.bulk.rewrite"), onAction: () => submit("rewrite"), disabled: busy },
+        // would only be a step. It spends money and sends product data to an
+        // AI provider, though, so it goes through a confirmation that says so
+        // and shows what is left of the month's allowance.
+        ...(ai
+          ? [{ content: t("import.list.bulk.rewriteLeft", { n: ai.remaining }), onAction: () => setModal("rewrite"), disabled: busy }]
+          : []),
         { content: t("action.remove"), onAction: () => setModal("remove"), disabled: busy },
       ]}
       bulkActions={[{ content: t("import.list.bulk.applyRule"), onAction: () => setModal("rule"), disabled: busy }]}
@@ -467,6 +526,58 @@ export default function ImportListPage() {
           </BlockStack>
         </Modal.Section>
       </Modal>
+
+      {ai && (
+        <Modal
+          open={modal === "rewrite"}
+          onClose={() => setModal(null)}
+          title={t("import.list.rewriteModal.title", { n: selectedCount })}
+          primaryAction={{
+            content: t("import.list.rewriteModal.confirm", { n: selectedCount }),
+            onAction: () => submit("rewrite", { disclosed: "yes" }),
+            loading: pendingIntent === "rewrite",
+            disabled: rewriteRefusal !== null,
+          }}
+          secondaryActions={[{ content: t("action.cancel"), onAction: () => setModal(null) }]}
+        >
+          {modalFailure && lastIntent === "rewrite" && (
+            <Modal.Section>
+              <Banner tone="critical">
+                <p>{modalFailure}</p>
+              </Banner>
+            </Modal.Section>
+          )}
+          {rewriteRefusal && (
+            <Modal.Section>
+              <Banner tone="warning">
+                <p>
+                  {t(REWRITE_REFUSAL_KEYS[rewriteRefusal], { n: selectedCount, max: MAX_AI_REWRITE_BATCH, remaining: ai.remaining, limit: ai.limit, plan: ai.planName })}
+                  {ai.upgradeName && (rewriteRefusal === "quota-exhausted" || rewriteRefusal === "quota-short") ? ` ${t("import.list.rewrite.upgradeHint", { upgrade: ai.upgradeName })}` : ""}
+                </p>
+              </Banner>
+            </Modal.Section>
+          )}
+          <Modal.Section>
+            <BlockStack gap="300">
+              <SectionHeader title={t("import.list.rewriteModal.dataTitle")} />
+              <Text as="p">{t("import.list.rewriteModal.dataBody")}</Text>
+              {ai.viaGateway && <Text as="p">{t("import.list.rewriteModal.gateway")}</Text>}
+              <Text as="p">{t("import.list.rewriteModal.publish")}</Text>
+            </BlockStack>
+          </Modal.Section>
+          <Modal.Section>
+            <BlockStack gap="200">
+              <SectionHeader title={t("import.list.rewriteModal.allowanceTitle")} />
+              <Text as="p" numeric>
+                {t("import.list.rewriteModal.allowance", { remaining: ai.remaining, limit: ai.limit, plan: ai.planName })}
+              </Text>
+              <Text as="p" tone="subdued">
+                {t("import.list.rewriteModal.allowanceHelp", { date: resetsOn })}
+              </Text>
+            </BlockStack>
+          </Modal.Section>
+        </Modal>
+      )}
 
       <Modal
         open={modal === "remove"}

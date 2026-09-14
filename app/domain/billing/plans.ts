@@ -33,6 +33,24 @@ export interface PlanLimits {
   supplierOptimizer: boolean;
   /** Auto-place supplier orders on a delay. */
   autoPlaceOrders: boolean;
+  /**
+   * AI landing-page rewrites per account per calendar month (UTC).
+   *
+   * Unlike every other limit this one is a running cost, not a count of rows:
+   * one rewrite is one Claude call carrying the writing contract, the shop's
+   * worked examples, the supplier text and up to eight images, and it answers
+   * with a 900-2,100 word page plus thinking. At Opus-class list prices that is
+   * roughly US$0.25-0.50 per product. Before this existed the rewrite had no
+   * plan gate at all, so a free store could bulk-rewrite its whole 3,000
+   * product cap - hundreds of dollars of model spend with no revenue behind it.
+   *
+   * The allowances are sized so a month of typical use costs about 40% of the
+   * plan's price at US$0.40 a rewrite (rewrites ~= price / 2.5), which leaves
+   * room for the expensive tail. The free tier gets three: enough to see the
+   * feature on real products, small enough that an abandoned free install
+   * costs about a dollar.
+   */
+  aiRewritesPerMonth: number;
 }
 
 export interface PlanDefinition {
@@ -53,28 +71,28 @@ export const PLANS: Record<PlanId, PlanDefinition> = {
     displayName: "Basic",
     monthlyPrice: 0,
     trialDays: 0,
-    limits: { products: 3000, stores: 3, staff: 1, aiMapping: false, supplierOptimizer: true, autoPlaceOrders: false },
+    limits: { products: 3000, stores: 3, staff: 1, aiMapping: false, supplierOptimizer: true, autoPlaceOrders: false, aiRewritesPerMonth: 3 },
   },
   ADVANCED: {
     id: "ADVANCED",
     displayName: "Advanced",
     monthlyPrice: 19.9,
     trialDays: 14,
-    limits: { products: 20000, stores: 10, staff: 5, aiMapping: true, supplierOptimizer: true, autoPlaceOrders: true },
+    limits: { products: 20000, stores: 10, staff: 5, aiMapping: true, supplierOptimizer: true, autoPlaceOrders: true, aiRewritesPerMonth: 20 },
   },
   PRO: {
     id: "PRO",
     displayName: "Pro",
     monthlyPrice: 49.9,
     trialDays: 14,
-    limits: { products: 75000, stores: 25, staff: 10, aiMapping: true, supplierOptimizer: true, autoPlaceOrders: true },
+    limits: { products: 75000, stores: 25, staff: 10, aiMapping: true, supplierOptimizer: true, autoPlaceOrders: true, aiRewritesPerMonth: 50 },
   },
   ENTERPRISE: {
     id: "ENTERPRISE",
     displayName: "Enterprise",
     monthlyPrice: 499,
     trialDays: 14,
-    limits: { products: 100000, stores: 50, staff: null, aiMapping: true, supplierOptimizer: true, autoPlaceOrders: true },
+    limits: { products: 100000, stores: 50, staff: null, aiMapping: true, supplierOptimizer: true, autoPlaceOrders: true, aiRewritesPerMonth: 500 },
   },
 };
 
@@ -161,4 +179,58 @@ export function usageFraction(plan: PlanId, resource: LimitedResource, current: 
   const limit = PLANS[plan].limits[resource];
   if (limit === null || limit === 0) return 0;
   return Math.min(1, Math.max(0, current) / limit);
+}
+
+/**
+ * The most products one rewrite request may carry.
+ *
+ * The job runs one model call per product, one after another, so a large batch
+ * both spends the month's allowance in a single click and holds the inline
+ * queue for an hour. Twenty-five is one page of the import list, which is all a
+ * merchant can select at once anyway.
+ */
+export const MAX_AI_REWRITE_BATCH = 25;
+
+/** The usage period a moment falls in: its UTC calendar month, "2026-09". */
+export function aiUsagePeriod(at: Date = new Date()): string {
+  return `${at.getUTCFullYear()}-${String(at.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+/** When the allowance for the period containing `at` starts over. */
+export function aiUsageResetsAt(at: Date = new Date()): Date {
+  return new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth() + 1, 1));
+}
+
+export interface AiRewriteAllowance {
+  plan: PlanId;
+  limit: number;
+  used: number;
+  remaining: number;
+  /** The cheapest plan with a larger allowance, for the upgrade hint. */
+  upgradeTo: PlanId | null;
+}
+
+/** What is left of a plan's monthly rewrite allowance after `used` of it. */
+export function aiRewriteAllowance(plan: PlanId, used: number): AiRewriteAllowance {
+  const limit = PLANS[plan].limits.aiRewritesPerMonth;
+  const spent = Math.max(0, Math.floor(used));
+  const upgradeTo = PLAN_ORDER.find((id) => planRank(id) > planRank(plan) && PLANS[id].limits.aiRewritesPerMonth > limit) ?? null;
+  return { plan, limit, used: spent, remaining: Math.max(0, limit - spent), upgradeTo };
+}
+
+export type AiRewriteRefusal = "none-selected" | "batch-too-large" | "quota-exhausted" | "quota-short";
+
+/**
+ * Whether a batch of `requested` rewrites may be queued, and if not, why.
+ *
+ * Checked before queueing so the merchant is told at the click rather than
+ * after half a batch has run; the per-product reservation in the job is what
+ * actually holds the line when two batches race.
+ */
+export function checkAiRewriteRequest(allowance: AiRewriteAllowance, requested: number): AiRewriteRefusal | null {
+  if (requested <= 0) return "none-selected";
+  if (requested > MAX_AI_REWRITE_BATCH) return "batch-too-large";
+  if (allowance.remaining === 0) return "quota-exhausted";
+  if (requested > allowance.remaining) return "quota-short";
+  return null;
 }

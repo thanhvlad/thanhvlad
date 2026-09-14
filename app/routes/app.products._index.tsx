@@ -34,16 +34,18 @@ import { PlatformBadge, StatusBadge } from "~/components/StatusBadge";
 import { Thumb } from "~/components/Thumb";
 import prisma from "~/db.server";
 import { readForm, requireShop } from "~/lib/auth.server";
-import { errorMessage } from "~/lib/errors";
+import { actionFailure } from "~/lib/errors";
 import { formatMoney, pageParam, relativeTime } from "~/lib/format";
 import type { I18nKey } from "~/lib/i18n";
 import { useJobRun } from "~/lib/use-job-run";
-import { useMessage, useT } from "~/lib/use-t";
+import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
 import { createJobRun } from "~/services/jobs.server";
 import { enqueue } from "~/services/jobs/index.server";
+import { assertWithinPlan } from "~/services/billing.server";
 import { listPricingRules } from "~/services/pricing.server";
 import {
   countProducts,
+  countUnmanagedShopifyProducts,
   deleteProducts,
   importExistingShopifyProduct,
   listProducts,
@@ -208,6 +210,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         const gids = getAll("shopifyProductIds")
           .flatMap((v) => v.split(","))
           .filter(Boolean);
+        // Checked for the whole selection first, so a pick that would cross the
+        // cap links nothing rather than stopping halfway through with some of
+        // it managed and some not. Each link checks again on its own.
+        const adding = await countUnmanagedShopifyProducts(shop.id, gids);
+        if (adding > 0) await assertWithinPlan(shop, "products", adding);
         let n = 0;
         for (const gid of gids) {
           await importExistingShopifyProduct(shop, graphql, gid, actor);
@@ -219,7 +226,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         return { ok: false, error: "Unknown action" };
     }
   } catch (e) {
-    return { ok: false, error: errorMessage(e) };
+    return actionFailure(e);
   }
 };
 
@@ -249,10 +256,15 @@ export default function ProductsPage() {
         error?: string;
         messageKey?: string;
         messageVars?: Record<string, string | number>;
+        errorKey?: string;
+        errorVars?: Record<string, string | number>;
         jobRunId?: string;
       }
     | undefined;
   const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
+  // A plan limit carries a translation key, so the merchant reads it in their
+  // own language instead of the English the service raised it in.
+  const failureMessage = useErrorMessage(result);
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const shopify = useAppBridge();
@@ -355,9 +367,9 @@ export default function ProductsPage() {
                 <p>{actionMessage}</p>
               </Banner>
             )}
-            {result?.error && (
+            {failureMessage && (
               <Banner tone="critical">
-                <p>{result.error}</p>
+                <p>{failureMessage}</p>
               </Banner>
             )}
             <InlineGrid columns={{ xs: 2, md: 4 }} gap="400">

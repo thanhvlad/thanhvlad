@@ -17,6 +17,7 @@ function input(over: Partial<Parameters<typeof checkRewrite>[0]> = {}) {
     tags: ["fan", "water bottle", "commuter", "summer", "usb-c", "travel", "gym", "festival"],
     heroImageIndex: 0,
     imageCount: 6,
+    supportEmail: "help@example-store.com" as string | null,
     ...over,
   };
 }
@@ -58,21 +59,33 @@ describe("title rules", () => {
 
 describe("html rules", () => {
   it("rejects a tag the store never uses", () => {
-    expect(checkHtml("<div><span>hello</span></div>").some((f) => f.includes("<span>"))).toBe(true);
+    expect(checkHtml("<div><span>hello</span></div>", null).some((f) => f.includes("<span>"))).toBe(true);
   });
 
   it("rejects class, id and event handlers", () => {
-    expect(checkHtml('<div class="wrap"></div>').some((f) => f.includes("Forbidden attribute"))).toBe(true);
-    expect(checkHtml('<img src="a" alt="b" onerror="x()">').some((f) => f.includes("Forbidden attribute"))).toBe(true);
+    expect(checkHtml('<div class="wrap"></div>', null).some((f) => f.includes("Forbidden attribute"))).toBe(true);
+    expect(checkHtml('<img src="a" alt="b" onerror="x()">', null).some((f) => f.includes("Forbidden attribute"))).toBe(true);
   });
 
-  it("rejects any href but the support address", () => {
-    expect(checkHtml('<a href="https://evil.example">x</a>').some((f) => f.includes("only permitted href"))).toBe(true);
-    expect(checkHtml('<a href="mailto:support@lumoraloves.com">x</a>')).toEqual([]);
+  it("rejects any href but the store's own support address", () => {
+    const email = "help@example-store.com";
+    expect(checkHtml('<a href="https://evil.example">x</a>', email).some((f) => f.includes("only permitted href"))).toBe(true);
+    expect(checkHtml('<a href="mailto:help@example-store.com">x</a>', email)).toEqual([]);
+  });
+
+  it("rejects another store's support address on this store's page", () => {
+    // Every merchant's pages used to be told to link to the owner's store.
+    const failures = checkHtml('<a href="mailto:support@lumoraloves.com">x</a>', "help@example-store.com");
+    expect(failures.some((f) => f.includes("only permitted href is mailto:help@example-store.com"))).toBe(true);
+  });
+
+  it("permits no link at all for a store with no support address", () => {
+    expect(checkHtml('<a href="mailto:support@lumoraloves.com">x</a>', null).some((f) => f.includes("no link is permitted"))).toBe(true);
+    expect(checkHtml("<a>x</a>", null).some((f) => f.includes("no link is permitted"))).toBe(true);
   });
 
   it("rejects an image with no alt", () => {
-    expect(checkHtml('<img src="https://x/1.jpg">').some((f) => f.includes("no descriptive alt"))).toBe(true);
+    expect(checkHtml('<img src="https://x/1.jpg">', null).some((f) => f.includes("no descriptive alt"))).toBe(true);
   });
 });
 

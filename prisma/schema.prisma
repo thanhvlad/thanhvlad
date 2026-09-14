@@ -1221,3 +1221,24 @@ model SupplierCandidate {
   @@unique([productId, supplierProductId])
   @@index([productId, score])
 }
+
+/// AI landing-page rewrites used per account per UTC calendar month.
+///
+/// Each rewrite is a paid model call, so the plan allowance
+/// (`aiRewritesPerMonth` in app/domain/billing/plans.ts) is enforced against
+/// this counter at the moment of the call, not against a cached figure. Keyed
+/// by a plain string rather than a relation so a store not yet attached to an
+/// account still has a counter ("shop:<id>"), and so the row carries no
+/// personal data and needs no cascade.
+model AiRewriteUsage {
+  id        String   @id @default(cuid())
+  /// The account id, or "shop:<shop id>" for a store without an account.
+  ownerKey  String
+  /// "2026-09" - see aiUsagePeriod().
+  period    String
+  used      Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([ownerKey, period])
+}

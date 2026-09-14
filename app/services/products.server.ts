@@ -3,6 +3,7 @@ import prisma, { chunkedTransaction } from "~/db.server";
 import { computePrice } from "~/domain/pricing/engine";
 import { money } from "~/lib/money";
 import { logActivity } from "./activity.server";
+import { assertWithinPlan } from "./billing.server";
 import { resolvePricingRule } from "./pricing.server";
 import type { ShopWithSettings } from "./shop.server";
 import type { GraphqlClient } from "./shopify/graphql.server";
@@ -111,8 +112,25 @@ export async function handleProductDeleted(shopId: string, shopifyProductId: str
   await logActivity(shopId, { action: "product.deleted_in_shopify", entity: "Product", entityId: local.id, message: `"${local.title}" was deleted in Shopify; local mapping removed.` });
 }
 
+/**
+ * How many of these Shopify products the app does not manage yet - the number
+ * that would count against the plan's product cap if they were all linked.
+ */
+export async function countUnmanagedShopifyProducts(shopId: string, shopifyProductIds: string[]): Promise<number> {
+  const unique = [...new Set(shopifyProductIds)];
+  if (unique.length === 0) return 0;
+  const managed = await prisma.product.count({ where: { shopId, shopifyProductId: { in: unique } } });
+  return unique.length - managed;
+}
+
 /** Bring an existing Shopify product under management so it can be mapped. */
 export async function importExistingShopifyProduct(shop: ShopWithSettings, client: GraphqlClient, shopifyProductId: string, actor?: string) {
+  // Linking creates a Product row exactly as a push does, and the cap counts
+  // those rows, but only the push path ever checked it: a free store could link
+  // its whole catalogue past the 3,000 cap from the resource picker. Refreshing
+  // a product already managed adds nothing, so only a new row is checked.
+  const existing = await prisma.product.findUnique({ where: { shopId_shopifyProductId: { shopId: shop.id, shopifyProductId } }, select: { id: true } });
+  if (!existing) await assertWithinPlan(shop, "products", 1);
   const remote = await fetchProduct(client, shopifyProductId);
   if (!remote) throw new Error("Product not found in Shopify");
   const row = await prisma.product.upsert({
