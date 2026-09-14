@@ -3,7 +3,7 @@ import { useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { useFetcher, useLoaderData } from "@remix-run/react";
 import { useAppBridge } from "@shopify/app-bridge-react";
-import { Badge, Banner, BlockStack, Box, Button, Card, DataTable, DescriptionList, FormLayout, InlineStack, Layout, Modal, Text, TextField, Tooltip } from "@shopify/polaris";
+import { Badge, Banner, BlockStack, Box, Button, Card, DataTable, DescriptionList, FormLayout, InlineStack, Layout, List, Modal, Text, TextField, Tooltip } from "@shopify/polaris";
 import { ClipboardIcon } from "@shopify/polaris-icons";
 import { EmptyScreen } from "~/components/EmptyScreen";
 import { SectionHeader } from "~/components/SectionHeader";
@@ -19,13 +19,23 @@ import { listRates, refreshRates } from "~/services/currency.server";
 import { emailProvider } from "~/services/email.server";
 import { queueStats } from "~/services/jobs/index.server";
 import { logActivity } from "~/services/activity.server";
+import { WEBHOOK_ABANDONED_PREFIX } from "~/services/webhooks.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
-  const [queue, rates, webhooks] = await Promise.all([
+  const [queue, rates, webhooks, abandoned] = await Promise.all([
     queueStats(),
     listRates(shop.parsedSettings.currency.supplierCurrency),
     prisma.webhookEvent.findMany({ where: { shopId: shop.id }, orderBy: { createdAt: "desc" }, take: 15 }),
+    // Listed on their own, not only in the recent table: an event is given up on
+    // two days (or, for a privacy request, 30 days) after it arrived, by which
+    // time it has long scrolled out of the latest fifteen.
+    prisma.webhookEvent.findMany({
+      where: { shopId: shop.id, processedAt: null, error: { startsWith: WEBHOOK_ABANDONED_PREFIX } },
+      orderBy: { createdAt: "desc" },
+      take: 10,
+      select: { id: true, topic: true, createdAt: true, attempts: true, error: true },
+    }),
   ]);
   return {
     apiToken: shop.apiToken,
@@ -35,7 +45,16 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     emailProvider: emailProvider(),
     queue,
     rates: rates.filter((r) => ["USD", "EUR", "GBP", "VND", "CNY", "AUD", "CAD", shop.currency].includes(r.quote)).map((r) => ({ quote: r.quote, rate: r.rate.toString(), fetchedAt: r.fetchedAt })),
-    webhooks: webhooks.map((w) => ({ id: w.id, topic: w.topic, createdAt: w.createdAt, processedAt: w.processedAt, error: w.error })),
+    webhooks: webhooks.map((w) => ({
+      id: w.id,
+      topic: w.topic,
+      createdAt: w.createdAt,
+      processedAt: w.processedAt,
+      error: w.error,
+      attempts: w.attempts,
+      abandoned: !w.processedAt && Boolean(w.error?.startsWith(WEBHOOK_ABANDONED_PREFIX)),
+    })),
+    abandonedWebhooks: abandoned,
     shopCurrency: shop.currency,
     supplierCurrency: shop.parsedSettings.currency.supplierCurrency,
   };
@@ -234,18 +253,50 @@ export default function AdvancedSettings() {
             <Box padding="400">
               <SectionHeader title={t("settings.advanced.webhooks.latest")} count={data.webhooks.length} />
             </Box>
+            {data.abandonedWebhooks.length > 0 && (
+              <Box paddingInline="400" paddingBlockEnd="400">
+                <Banner tone="critical" title={t("billing.webhooks.abandoned.title")}>
+                  <BlockStack gap="200">
+                    <p>{t("billing.webhooks.abandoned.body")}</p>
+                    <List>
+                      {data.abandonedWebhooks.map((w) => (
+                        <List.Item key={w.id}>
+                          <Tooltip content={w.error}>
+                            <Text as="span">{t("billing.webhooks.abandoned.item", { topic: w.topic, date: formatDate(w.createdAt, dateLocale), attempts: w.attempts })}</Text>
+                          </Tooltip>
+                        </List.Item>
+                      ))}
+                    </List>
+                  </BlockStack>
+                </Banner>
+              </Box>
+            )}
             {data.webhooks.length === 0 ? (
               <EmptyScreen compact heading={t("settings.advanced.webhooks.empty")} body={t("settings.advanced.webhooks.emptyBody")} />
             ) : (
               <DataTable
-                columnContentTypes={["text", "text", "text"]}
-                headings={[t("settings.advanced.webhooks.topic"), t("settings.advanced.webhooks.received"), t("common.status")]}
+                columnContentTypes={["text", "text", "numeric", "text"]}
+                headings={[t("settings.advanced.webhooks.topic"), t("settings.advanced.webhooks.received"), t("billing.webhooks.attempts"), t("common.status")]}
                 rows={data.webhooks.map((w) => [
                   <Text as="span" key={`${w.id}-topic`} fontWeight="semibold">
                     {w.topic}
                   </Text>,
                   formatDate(w.createdAt, dateLocale),
-                  w.error ? (
+                  <Text as="span" key={`${w.id}-attempts`} numeric>
+                    {w.attempts}
+                  </Text>,
+                  // Three failure states read differently to the merchant: still being
+                  // retried is not yet a problem, given up on is, and a finished event
+                  // with a note (skipped, unknown store) keeps the plain error badge.
+                  w.abandoned ? (
+                    <Tooltip key={`${w.id}-status`} content={w.error}>
+                      <Badge tone="critical">{t("billing.webhooks.gaveUp")}</Badge>
+                    </Tooltip>
+                  ) : w.error && !w.processedAt ? (
+                    <Tooltip key={`${w.id}-status`} content={w.error}>
+                      <Badge tone="warning">{t("billing.webhooks.retrying")}</Badge>
+                    </Tooltip>
+                  ) : w.error ? (
                     <Tooltip key={`${w.id}-status`} content={w.error}>
                       <Badge tone="critical">{t("common.error")}</Badge>
                     </Tooltip>

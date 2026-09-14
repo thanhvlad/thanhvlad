@@ -10,8 +10,7 @@ import { readForm, requireShop } from "~/lib/auth.server";
 import { env } from "~/lib/env.server";
 import { errorMessage } from "~/lib/errors";
 import { formatDate, formatMoney, formatNumber } from "~/lib/format";
-import type { I18nKey, I18nVars } from "~/lib/i18n";
-import * as billingStrings from "~/lib/i18n-modules/billing";
+import type { I18nKey } from "~/lib/i18n";
 import { useErrorMessage, useLocale, useMessage, useT } from "~/lib/use-t";
 import { billingReturnUrl, cancelSubscription, getAccountBilling, remainingTrialDays, syncSubscription } from "~/services/billing.server";
 
@@ -85,25 +84,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
 const RESOURCES: LimitedResource[] = ["products", "stores", "staff"];
 
-/**
- * Strings from the billing module. app/lib/i18n.ts spreads each module into the
- * typed dictionary by hand and does not include this one yet, so until it does
- * these are looked up here, with the same English fallback and placeholders.
- */
-function useBillingT() {
-  const locale = useLocale();
-  return (key: keyof typeof billingStrings.en, vars?: I18nVars) => {
-    const raw = (locale === "vi" ? billingStrings.vi[key] : undefined) ?? billingStrings.en[key];
-    return vars ? raw.replace(/\{(\w+)\}/g, (match, name: string) => (name in vars ? String(vars[name]) : match)) : raw;
-  };
-}
-
 export default function PlanSettings() {
   const { account, syncError, trialDaysLeft } = useLoaderData<typeof loader>();
   const [params] = useSearchParams();
   const fetcher = useFetcher<typeof action>();
   const t = useT();
-  const bt = useBillingT();
   const locale = useLocale();
   const result = fetcher.data as { ok?: boolean; error?: string; errorKey?: string; errorVars?: Record<string, string | number>; messageKey?: string } | undefined;
   const successMessage = useMessage(result as Parameters<typeof useMessage>[0]);
@@ -252,13 +237,19 @@ export default function PlanSettings() {
                         )}
                       </InlineStack>
                       <Text as="p" tone="subdued" variant="bodySm">
-                        {trialDaysLeft[id] > 0 ? t("plan.trialDays", { days: trialDaysLeft[id] }) : plan.trialDays > 0 ? bt("billing.plan.trialUsed") : t("settings.plan.noTrial")}
+                        {trialDaysLeft[id] > 0 ? t("plan.trialDays", { days: trialDaysLeft[id] }) : plan.trialDays > 0 ? t("billing.plan.trialUsed") : t("settings.plan.noTrial")}
                       </Text>
                     </BlockStack>
                     <List>
                       <List.Item>{t("plan.limit.products", { n: limitText(plan.limits.products) })}</List.Item>
                       <List.Item>{t("plan.limit.stores", { n: limitText(plan.limits.stores) })}</List.Item>
                       <List.Item>{t("plan.limit.staff", { n: limitText(plan.limits.staff) })}</List.Item>
+                      {/* The AI page rewrite is the one feature with a real per-use cost, so its
+                          monthly allowance is part of what each plan buys and is shown here
+                          rather than discovered at the limit on the import list. */}
+                      <List.Item>
+                        {plan.limits.aiRewritesPerMonth === 1 ? t("billing.plan.aiRewritesOne") : t("billing.plan.aiRewrites", { n: formatNumber(plan.limits.aiRewritesPerMonth, numberLocale) })}
+                      </List.Item>
                       <List.Item>{t("plan.limit.orders")}</List.Item>
                       <List.Item>{plan.limits.aiMapping ? t("plan.feature.aiMapping") : t("plan.feature.noAiMapping")}</List.Item>
                       <List.Item>{plan.limits.autoPlaceOrders ? t("plan.feature.autoPlace") : t("plan.feature.noAutoPlace")}</List.Item>

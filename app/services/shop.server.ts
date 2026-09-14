@@ -174,21 +174,33 @@ async function backfillOrdersOnInstall(shopId: string) {
 }
 
 /**
- * Slack between Shopify's clock and ours when comparing an uninstall's trigger
- * time with a later token exchange. A real reinstall takes far longer than
- * this — the merchant has to find the app and approve it again — and an auth
- * that only looks later because of clock skew must not cancel an uninstall.
+ * How much later than an uninstall's trigger time a token exchange must be to
+ * prove a reinstall, once the measured clock lead has been taken off.
+ *
+ * lastAuthAt is stamped on this server's clock and X-Shopify-Triggered-At on
+ * Shopify's. A fixed 30 seconds was the whole allowance before, so a server
+ * clock running a minute fast turned the merchant's last visit before
+ * uninstalling into a "reinstall" and the real uninstall was ignored. The lead
+ * is now measured from recent deliveries (estimateClockLeadMs in
+ * webhooks.server), and because that measurement includes delivery delay it can
+ * only overstate the lead, never understate it. What the margin still has to
+ * cover is Shopify's own clock jitter between the event and our sample, which
+ * is sub-second on NTP-disciplined hosts. Sixty seconds covers that many times
+ * over and stays below the fastest real reinstall, which needs the merchant to
+ * open the listing again and approve the app.
  */
-const REAUTH_MARGIN_MS = 30_000;
+export const REAUTH_MARGIN_MS = 60_000;
 
 /**
  * Whether the store authenticated after the uninstall was triggered, which
  * proves it reinstalled: Shopify refuses a token exchange for an app that is
- * not installed. Exported for the test.
+ * not installed. `clockLeadMs` is how far this server's clock may run ahead of
+ * Shopify's; a negative value is treated as none, since running behind makes a
+ * sign-in look earlier and so can only apply an uninstall. Exported for the test.
  */
-export function reauthenticatedSince(lastAuthAt: Date | null | undefined, triggeredAt: Date | null | undefined): boolean {
+export function reauthenticatedSince(lastAuthAt: Date | null | undefined, triggeredAt: Date | null | undefined, clockLeadMs = 0): boolean {
   if (!lastAuthAt || !triggeredAt) return false;
-  return lastAuthAt.getTime() > triggeredAt.getTime() + REAUTH_MARGIN_MS;
+  return lastAuthAt.getTime() - Math.max(0, clockLeadMs) > triggeredAt.getTime() + REAUTH_MARGIN_MS;
 }
 
 /**
@@ -202,14 +214,25 @@ export function reauthenticatedSince(lastAuthAt: Date | null | undefined, trigge
  * erased it 30 days later. An uninstall triggered before the store's latest
  * token exchange is therefore ignored. Returns whether the store was uninstalled.
  */
-export async function markShopUninstalled(domain: string, options: { triggeredAt?: Date | null; now?: Date } = {}): Promise<boolean> {
+export async function markShopUninstalled(domain: string, options: { triggeredAt?: Date | null; now?: Date; clockLeadMs?: number } = {}): Promise<boolean> {
   const shop = await prisma.shop.findUnique({ where: { domain } });
   if (!shop) return false;
   const now = options.now ?? new Date();
   const triggeredAt = options.triggeredAt ?? now;
+  const clockLeadMs = Math.max(0, options.clockLeadMs ?? 0);
+  const reinstalled = reauthenticatedSince(shop.lastAuthAt, triggeredAt, clockLeadMs);
+  // Logged either way with every input, so a disputed decision can be checked
+  // against the clocks afterwards instead of guessed at.
+  logger.info("app/uninstalled decision", {
+    shop: domain,
+    decision: reinstalled ? "ignored: store authenticated after the uninstall" : "applied",
+    triggeredAt,
+    lastAuthAt: shop.lastAuthAt,
+    clockLeadMs,
+    marginMs: REAUTH_MARGIN_MS,
+  });
 
-  if (reauthenticatedSince(shop.lastAuthAt, triggeredAt)) {
-    logger.info("Ignoring an uninstall older than the store's latest install", { shop: domain, triggeredAt, lastAuthAt: shop.lastAuthAt });
+  if (reinstalled) {
     // Shopify deleted the store's shop-level webhook subscriptions with the
     // uninstall, so the next afterAuth must register them again.
     await prisma.shop.update({ where: { id: shop.id }, data: { webhooksCheckedAt: null } });

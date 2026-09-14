@@ -10,12 +10,9 @@ import prisma from "~/db.server";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { actionFailure } from "~/lib/errors";
 import { formatDate } from "~/lib/format";
-import type { I18nVars } from "~/lib/i18n";
-import * as billingStrings from "~/lib/i18n-modules/billing";
+import { translate, type I18nVars } from "~/lib/i18n";
 import { useErrorMessage, useLocale, useMessage, useT } from "~/lib/use-t";
 import { createAccountInvite, joinAccountWithInvite, leaveAccount, listAccountShops } from "~/services/shop.server";
-
-type BillingKey = keyof typeof billingStrings.en;
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop, role } = await requireShop(request);
@@ -40,7 +37,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   // Linking decides which plan a store runs on and who pays for it, so it is
   // the owner's call on both sides: the owner of the account creates the code,
   // and the owner of the joining store redeems it.
-  const ownerOnly = { ok: false as const, error: billingStrings.en["billing.stores.ownerOnly"], errorKey: "billing.stores.ownerOnly" };
+  const ownerOnly = { ok: false as const, error: translate("en", "billing.stores.ownerOnly"), errorKey: "billing.stores.ownerOnly" };
   try {
     switch (intent) {
       case "rename": {
@@ -52,7 +49,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         if (role !== "OWNER") return ownerOnly;
         if (!shop.accountId) return { ok: false, error: "No account" };
         await createAccountInvite(shop.accountId);
-        return { ok: true, messageKey: "billing.stores.inviteCreated", message: billingStrings.en["billing.stores.inviteCreated"] };
+        return { ok: true, messageKey: "billing.stores.inviteCreated", message: translate("en", "billing.stores.inviteCreated") };
       }
       case "join": {
         // Move this store under another store's account (share suppliers, pricing rules are per-store).
@@ -73,21 +70,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 };
 
-/**
- * Strings from the billing module. app/lib/i18n.ts spreads each module into the
- * typed dictionary by hand and does not include this one yet, so until it does
- * these are looked up here, with the same English fallback and placeholders.
- */
-function useBillingT() {
-  const locale = useLocale();
-  const bt = (key: BillingKey, vars?: I18nVars) => {
-    const raw = (locale === "vi" ? billingStrings.vi[key] : undefined) ?? billingStrings.en[key];
-    return vars ? raw.replace(/\{(\w+)\}/g, (match, name: string) => (name in vars ? String(vars[name]) : match)) : raw;
-  };
-  const has = (key: string | null | undefined): key is BillingKey => Boolean(key && key in billingStrings.en);
-  return { bt, has };
-}
-
 type ActionResult = { ok?: boolean; message?: string; messageKey?: string; messageVars?: I18nVars; error?: string; errorKey?: string; errorVars?: I18nVars } | undefined;
 
 export default function StoresSettings() {
@@ -95,12 +77,9 @@ export default function StoresSettings() {
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
   const result = fetcher.data as ActionResult;
-  const { bt, has } = useBillingT();
   const locale = useLocale();
-  const genericMessage = useMessage(result as Parameters<typeof useMessage>[0]);
-  const genericFailure = useErrorMessage(result as Parameters<typeof useErrorMessage>[0]);
-  const actionMessage = has(result?.messageKey) ? bt(result.messageKey, result.messageVars) : genericMessage;
-  const failureMessage = !result?.ok && has(result?.errorKey) ? bt(result.errorKey, result.errorVars) : genericFailure;
+  const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
+  const failureMessage = useErrorMessage(result as Parameters<typeof useErrorMessage>[0]);
   const [name, setName] = useState(data.account?.name ?? "");
   const [code, setCode] = useState("");
   const [confirm, setConfirm] = useState<"join" | "leave" | null>(null);
@@ -115,7 +94,7 @@ export default function StoresSettings() {
     if (!data.invite) return;
     try {
       await navigator.clipboard.writeText(data.invite.code);
-      shopify.toast.show(bt("billing.stores.inviteCopied"));
+      shopify.toast.show(t("billing.stores.inviteCopied"));
     } catch {
       shopify.toast.show(t("settings.stores.copyFailed"), { isError: true });
     }
@@ -147,39 +126,39 @@ export default function StoresSettings() {
         </Layout.Section>
       )}
 
-      <Layout.AnnotatedSection title={t("settings.stores.account")} description={t("settings.stores.accountHelp")}>
+      <Layout.AnnotatedSection title={t("settings.stores.account")} description={t("billing.stores.accountHelp")}>
         <Card>
           <FormLayout>
             <TextField label={t("settings.stores.accountName")} value={name} onChange={setName} autoComplete="off" disabled={!data.account} helpText={t("settings.stores.accountName.help")} />
             {!data.isOwner ? (
               <Text as="p" tone="subdued">
-                {bt("billing.stores.ownerOnly")}
+                {t("billing.stores.ownerOnly")}
               </Text>
             ) : data.invite ? (
               <BlockStack gap="200">
                 <TextField
-                  label={bt("billing.stores.inviteLabel")}
+                  label={t("billing.stores.inviteLabel")}
                   value={data.invite.code}
                   readOnly
                   autoComplete="off"
                   monospaced
-                  connectedRight={<Button icon={ClipboardIcon} onClick={copyCode} accessibilityLabel={bt("billing.stores.inviteCopy")} />}
-                  helpText={bt("billing.stores.inviteHelp", { date: formatDate(data.invite.expiresAt, dateLocale) })}
+                  connectedRight={<Button icon={ClipboardIcon} onClick={copyCode} accessibilityLabel={t("billing.stores.inviteCopy")} />}
+                  helpText={t("billing.stores.inviteHelp", { date: formatDate(data.invite.expiresAt, dateLocale) })}
                 />
                 <InlineStack>
                   <Button onClick={createInvite} loading={busyIntent === "createInvite"} disabled={!data.account || (busy && busyIntent !== "createInvite")}>
-                    {bt("billing.stores.inviteReplace")}
+                    {t("billing.stores.inviteReplace")}
                   </Button>
                 </InlineStack>
               </BlockStack>
             ) : (
               <BlockStack gap="200">
                 <Text as="p" tone="subdued">
-                  {bt("billing.stores.inviteNone")}
+                  {t("billing.stores.inviteNone")}
                 </Text>
                 <InlineStack>
                   <Button onClick={createInvite} loading={busyIntent === "createInvite"} disabled={!data.account || (busy && busyIntent !== "createInvite")}>
-                    {bt("billing.stores.inviteCreate")}
+                    {t("billing.stores.inviteCreate")}
                   </Button>
                 </InlineStack>
               </BlockStack>
@@ -194,18 +173,18 @@ export default function StoresSettings() {
         </Card>
       </Layout.AnnotatedSection>
 
-      <Layout.AnnotatedSection title={t("settings.stores.linkTitle")} description={t("settings.stores.linkDescription")}>
+      <Layout.AnnotatedSection title={t("settings.stores.linkTitle")} description={t("billing.stores.linkDescription")}>
         <Card>
           <FormLayout>
             <TextField
-              label={bt("billing.stores.inviteLabel")}
+              label={t("billing.stores.inviteLabel")}
               value={code}
               onChange={setCode}
               autoComplete="off"
               monospaced
               disabled={!data.isOwner}
-              placeholder={t("settings.stores.accountCode.placeholder")}
-              helpText={data.isOwner ? undefined : bt("billing.stores.ownerOnly")}
+              placeholder={t("billing.stores.codePlaceholder")}
+              helpText={data.isOwner ? undefined : t("billing.stores.ownerOnly")}
             />
             <InlineStack gap="200">
               <Button variant="primary" disabled={!data.isOwner || !code.trim() || (busy && busyIntent !== "join")} loading={busyIntent === "join"} onClick={() => setConfirm("join")}>
@@ -280,7 +259,7 @@ export default function StoresSettings() {
         secondaryActions={[{ content: t("action.cancel"), onAction: () => setConfirm(null) }]}
       >
         <Modal.Section>
-          <Text as="p">{confirm === "leave" ? t("settings.stores.leaveConfirm.body") : t("settings.stores.joinConfirm.body", { code: code.trim() })}</Text>
+          <Text as="p">{confirm === "leave" ? t("settings.stores.leaveConfirm.body") : t("billing.stores.joinConfirmBody", { code: code.trim() })}</Text>
         </Modal.Section>
       </Modal>
     </Layout>
