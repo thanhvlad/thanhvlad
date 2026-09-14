@@ -22,7 +22,17 @@ const ALLOWED_TAGS = new Set([
  * copied from somewhere else, and a theme cannot be relied on to style them. */
 const FORBIDDEN_ATTRS = /\s(class|id|onclick|onerror|onload|srcset|data-[a-z-]+)\s*=/i;
 
-const ALLOWED_HREF = "mailto:support@lumoraloves.com";
+/**
+ * The one link a page may carry: the shop's own public contact address.
+ *
+ * This was a constant naming the Lumora Loves support address, so every other
+ * merchant's page either linked to Lumora or was rejected for linking to its
+ * own inbox. It is now the store's address, and a store without one gets no
+ * link at all rather than someone else's.
+ */
+export function allowedHref(supportEmail: string | null | undefined): string | null {
+  return supportEmail ? `mailto:${supportEmail}` : null;
+}
 
 /**
  * The supplier register. Each entry is a phrase measured at zero uses across the
@@ -61,6 +71,8 @@ export interface RewriteCheckInput {
   tags: string[];
   heroImageIndex: number;
   imageCount: number;
+  /** The shop's public contact address; null when it has none. */
+  supportEmail: string | null;
 }
 
 export interface RewriteCheck {
@@ -111,7 +123,7 @@ export function checkTitle(title: string): string[] {
   return failures;
 }
 
-export function checkHtml(html: string): string[] {
+export function checkHtml(html: string, supportEmail: string | null): string[] {
   const failures: string[] = [];
 
   const used = new Set<string>();
@@ -122,8 +134,11 @@ export function checkHtml(html: string): string[] {
 
   if (FORBIDDEN_ATTRS.test(html)) failures.push("Forbidden attribute (class, id, data-*, or an event handler).");
 
-  for (const m of html.matchAll(/<a[^>]*href\s*=\s*["']([^"']*)["']/gi)) {
-    if (m[1] !== ALLOWED_HREF) failures.push(`Link to ${m[1]}; the only permitted href is ${ALLOWED_HREF}.`);
+  const permitted = allowedHref(supportEmail);
+  for (const m of html.matchAll(/<a\b[^>]*>/gi)) {
+    const href = /href\s*=\s*["']([^"']*)["']/i.exec(m[0])?.[1] ?? "";
+    if (!permitted) failures.push(`Link to ${href || "nowhere"}; this store has no support address, so no link is permitted.`);
+    else if (href.toLowerCase() !== permitted.toLowerCase()) failures.push(`Link to ${href || "nowhere"}; the only permitted href is ${permitted}.`);
   }
 
   for (const m of html.matchAll(/<img\b[^>]*>/gi)) {
@@ -139,7 +154,7 @@ export function checkRewrite(input: RewriteCheckInput): RewriteCheck {
   const warnings: string[] = [];
 
   failures.push(...checkTitle(input.title));
-  failures.push(...checkHtml(input.descriptionHtml));
+  failures.push(...checkHtml(input.descriptionHtml, input.supportEmail));
 
   const text = visibleText(input.descriptionHtml);
   const wordCount = text ? text.split(/\s+/).length : 0;

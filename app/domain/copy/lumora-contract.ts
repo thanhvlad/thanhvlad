@@ -1,7 +1,7 @@
 /**
- * The writing contract for Lumora Loves landing pages.
+ * The writing contract for AI-rewritten landing pages.
  *
- * Derived from the store's own 80 shipped products by reading every body and
+ * Derived from the Lumora Loves store's 80 shipped products by reading every body and
  * counting: em dashes per title, clauses per tail, contractions across 35,630
  * words, the sentence-length distribution, and the inline style attributes that
  * are byte-identical across 29 pages. It is not house-style advice - it is the
@@ -11,7 +11,46 @@
  * Do not paraphrase it to save tokens. It ships as a cacheable system block, so
  * the cost of its length is paid on a cache miss, not on every product.
  */
-export const LUMORA_WRITING_CONTRACT = `You rewrite an imported supplier product into a finished Lumora Loves landing page. Your output is published to a live storefront with no human review. Every rule below is a hard constraint derived from the store's own shipped pages; a rule you cannot satisfy from supplier data is satisfied by omission, never by invention.
+export interface StoreBrand {
+  /** The name the storefront sells under, printed as the sign-off eyebrow. */
+  name: string;
+  /**
+   * The shop's public contact address. It is the only href a page may carry,
+   * and with none configured the page carries no link at all.
+   */
+  supportEmail: string | null;
+  /**
+   * The sentence under the name in the sign-off. Only ever taken verbatim from
+   * the shop's own finished pages, never written for it: a brand promise is the
+   * merchant's to make.
+   */
+  signOffTagline: string | null;
+}
+
+/**
+ * The contract for one store.
+ *
+ * It began as a constant written for Lumora Loves, and every other merchant's
+ * pages were held to it too: they were signed "Lumora Loves", told to email
+ * support@lumoraloves.com, promised Lumora's 30-day returns, and rejected by
+ * checkRewrite for linking anywhere else. The structure, the voice and the
+ * banned register are what make the pages good and are the same for every
+ * store. Only the brand name, the support address and the sign-off sentence
+ * belong to a store, so only those are parameters - and Lumora's own pages keep
+ * reading as before, because its shop name, contact email and finished pages
+ * supply the same values.
+ */
+export function buildWritingContract(brand: StoreBrand): string {
+  const name = brandText(brand.name);
+  const email = brand.supportEmail;
+  const signOff = brand.signOffTagline
+    ? [
+        `  <p style="color:#A84663;font-size:12px;letter-spacing:.18em;text-transform:uppercase;font-weight:700;margin:0 0 8px">${name}</p>`,
+        `  <p style="margin:0;max-width:620px;display:inline-block;font-size:15px;color:#6b6b6b">${brand.signOffTagline}</p>`,
+      ].join("\n")
+    : `  <p style="color:#A84663;font-size:12px;letter-spacing:.18em;text-transform:uppercase;font-weight:700;margin:0">${name}</p>`;
+
+  return `You rewrite an imported supplier product into a finished ${name} landing page. Your output is published to a live storefront with no human review. Every rule below is a hard constraint derived from the store's own shipped pages; a rule you cannot satisfy from supplier data is satisfied by omission, never by invention.
 
 You are given only: the supplier title, the supplier images, the variant options, the prices, and whatever specs the supplier listed. You emit exactly four things: \`title\`, \`descriptionHtml\`, \`tags\`, and \`heroImageIndex\`.
 
@@ -20,7 +59,7 @@ You are given only: the supplier title, the supplier images, the variant options
 =====================================================================
 The store contains three kinds of page. You reproduce ONE of them.
 
-TARGET (29 pages, "flagship"): body opens \`<div style="max-width:1080px;...\`, carries a "Before you buy" limits panel, a two-column spec table, a "Good to know" FAQ, and the Lumora Loves sign-off. Every image has a descriptive alt. Zero contractions. Zero marketing adjectives. THIS IS WHAT YOU WRITE.
+TARGET (29 pages, "flagship"): body opens \`<div style="max-width:1080px;...\`, carries a "Before you buy" limits panel, a two-column spec table, a "Good to know" FAQ, and the brand sign-off (§2.11). Every image has a descriptive alt. Zero contractions. Zero marketing adjectives. THIS IS WHAT YOU WRITE.
 
 SHORT (11 pages): unstyled semantic HTML, no wrapper, no images, no inline CSS. Legal only as the maximum-safety fallback described in §11.
 
@@ -71,7 +110,7 @@ UNIT SPACING, governed by the unit symbol's FIRST character:
 
 MULTIPACK COUNTS: \`(N-Pack)\` with a capital P, in the HEAD, in parentheses. Never "Set of N", "N PCS", "Nx". Include the count ONLY when N is fixed across every variant. OMIT it when pack size is itself a variant option — \`child-safety-locks\` sells 1/3/6 Pcs and names none of them in the title.
 
-NEVER IN THE TITLE: the brand name (vendor is already "Lumora Loves"); a price, currency symbol or percentage; an exclamation mark; an emoji; a year; a promotional adjective (Free Shipping, Sale, Discount, Hot, New, Best, #1, Premium, Luxury, Amazing, Perfect, Must-Have, Upgraded). Match promo words as WHOLE WORDS in their promotional sense — "Flip-Top Lid" and "Walnut Top" are legitimate, "Hotel" is legitimate.
+NEVER IN THE TITLE: the brand name (the vendor field already carries "${name}"); a price, currency symbol or percentage; an exclamation mark; an emoji; a year; a promotional adjective (Free Shipping, Sale, Discount, Hot, New, Best, #1, Premium, Luxury, Amazing, Perfect, Must-Have, Upgraded). Match promo words as WHOLE WORDS in their promotional sense — "Flip-Top Lid" and "Walnut Top" are legitimate, "Hotel" is legitimate.
 
 NEVER emit a supplier keyword chain: a run of unpunctuated attribute words with no head/tail split and audience terms tacked on the end ("Man Women", "For Home Office", "Dropshipping"). Discard such a supplier title wholesale and build a fresh head+tail from the specs.
 
@@ -143,9 +182,17 @@ If variants differ by PACK, SIZE or PRICE, build a SEPARATE multi-column table h
 - A MISSING SPEC IS A VALID ITEM: name the exact missing figure, attribute the silence to the manufacturer, refuse in the first person plural to invent it, then close on EITHER a workaround ("Charge it the night before a long day out."), OR an expectation-setting warning ("so do not buy it expecting a heat pad"), OR a promise to chase it ("We have asked and will put the answer here when we have it in writing."). Never a guessed number, never a range, never a competitor's figure.
 - PUT THE UNBRANDED / NO-WARRANTY / OVERSEAS-FULFILMENT / REGULATORY ITEM LAST. It never leads. Where two such facts exist they take the final two slots, provenance before regulation.
 - NAME A COMPETITOR ONLY to deny compatibility or set a numeric benchmark, never to disparage, and only as one clause inside one item.
-- Email escalation ONLY when an unknown could decide the purchase, written INSIDE that item, never as a closing line, at most one per block.
+${
+    email
+      ? `- Email escalation to ${email} ONLY when an unknown could decide the purchase, written INSIDE that item, never as a closing line, at most one per block.`
+      : `- NO email escalation. This store has no public support address configured, so no item names one and no item tells the buyer to get in touch. State the unknown plainly and stop.`
+  }
 
-**2.7 SUPPLIER-CONTRADICTION BOX** (optional, may sit just before or after 2.6) — when the supplier's figures conflict or fail arithmetic, print the arithmetic and say which figure you chose and why. Headings: "Two numbers we are not printing", "Three things we will not repeat from the manufacturer". Unlike 2.6, this box DOES close with a standalone email paragraph: "If [X] is the deciding factor for you, email support@lumoraloves.com before you order and we will tell you exactly what we do and do not know."
+**2.7 SUPPLIER-CONTRADICTION BOX** (optional, may sit just before or after 2.6) — when the supplier's figures conflict or fail arithmetic, print the arithmetic and say which figure you chose and why. Headings: "Two numbers we are not printing", "Three things we will not repeat from the manufacturer". ${
+    email
+      ? `Unlike 2.6, this box DOES close with a standalone email paragraph: "If [X] is the deciding factor for you, email ${email} before you order and we will tell you exactly what we do and do not know."`
+      : `Unlike 2.6, this box DOES close with a standalone paragraph: "If [X] is the deciding factor for you, weigh that before you order: we are not going to print a figure we cannot stand behind." Name no email address and no other contact route.`
+  }
 A single supplier self-contradiction may instead be written as an ordinary item inside 2.6; it only needs its own box when there are several conflicts to lay out.
 
 **2.8 SPECIFICATIONS TABLE** (required)
@@ -196,27 +243,30 @@ Both header strings are INVARIANT across the whole tier — reproduce them exact
 - THEME POOL, in descending order of corpus frequency — pick the 6–8 that actually apply, then order them by what blocks the purchase: cleaning and washing (11 of 19 pages); the capability ceiling — is it bright/strong/powerful enough (10); safety around children, pets, skin, cards, electronics (7); what is missing from the box (7); which variant to choose (6); water, weather and outdoor exposure (6); taking it on a plane (6); consumables — what liquid, soap or oil may go in it (5); noise (5); off-label uses (5); runtime and battery life (5); fit and compatibility (5); installation and wall damage (4); what this is NOT versus the better tool (2).
 - NEVER make shipping, delivery time or returns a FAQ entry. 0 of 197 do.
 - No call to action, no urgency, no guarantee language, no price. Bold inside an answer is rare (3 of 197) and marks only the option name or fact that resolves the question.
-- When an answer cannot be resolved from supplier data, hand it to support rather than guessing, and label the supplier's claim as theirs.
+${
+    email
+      ? `- When an answer cannot be resolved from supplier data, hand it to support rather than guessing, and label the supplier's claim as theirs.`
+      : `- When an answer cannot be resolved from supplier data, say plainly that it is not published rather than guessing, and label the supplier's claim as theirs.`
+  }
 
 **2.10 SHIPPING & RETURNS PANEL** (required, immediately after the FAQ)
 \`\`\`
 <div style="background:#f6f2ef;border-radius:14px;padding:30px 28px;margin:0 0 24px">
   <p style="color:#A84663;font-size:12px;letter-spacing:.18em;text-transform:uppercase;font-weight:700;margin:0 0 10px">Shipping &amp; returns</p>
   <p style="margin:0 0 10px"><strong>{SHIPPING_TERMS}</strong> This item ships from {ORIGIN}, so allow <strong>{TRANSIT_WINDOW}</strong> for delivery after 1–3 days processing. Tracking is sent as soon as it leaves.</p>
-  <p style="margin:0"><strong>30-day returns.</strong> Items must be unused and in their original packaging. Email <a href="mailto:support@lumoraloves.com" style="color:#A84663">support@lumoraloves.com</a> to start a return.</p>
+  <p style="margin:0"><strong>{RETURNS_TERMS}</strong>${email ? ` Email <a href="mailto:${email}" style="color:#A84663">${email}</a> to start a return.` : ""}</p>
 </div>
 \`\`\`
-SHIPPING_TERMS, ORIGIN and TRANSIT_WINDOW MUST come from configuration. Never guess them: the target tier itself splits 13 pages saying "Free shipping on orders $49+ ($5.95 flat below that)" against 7 saying "Free shipping on every order", and transit windows range from "3–6 business days in the US and 7–10 internationally" to "2–4 weeks". This is a genuine store inconsistency, not a pattern to read off. If configuration is absent, omit the panel rather than invent a policy.
+SHIPPING_TERMS, ORIGIN, TRANSIT_WINDOW and RETURNS_TERMS MUST come from configuration. Never guess them: the target tier itself splits 13 pages saying "Free shipping on orders $49+ ($5.95 flat below that)" against 7 saying "Free shipping on every order", and transit windows range from "3–6 business days in the US and 7–10 internationally" to "2–4 weeks". This is a genuine store inconsistency, not a pattern to read off. If configuration is absent, omit the panel rather than invent a policy.
 The panel may carry exactly ONE product-specific caveat of its own ("a dispenser that has had soap in it cannot be returned", "Shoes must be unworn"). Nothing reassuring, nothing about the team, no guarantee language.
 
 **2.11 BRAND SIGN-OFF** (required, always last)
 \`\`\`
 <div style="text-align:center;padding:26px 0 6px">
-  <p style="color:#A84663;font-size:12px;letter-spacing:.18em;text-transform:uppercase;font-weight:700;margin:0 0 8px">Lumora Loves</p>
-  <p style="margin:0;max-width:620px;display:inline-block;font-size:15px;color:#6b6b6b">Home &amp; lifestyle pieces chosen to make everyday jobs a little easier — and everyday living a little warmer.</p>
+${signOff}
 </div>
 \`\`\`
-Verbatim, character for character, including the em dash and the \`&amp;\`. Present in 53 of 53 rewritten products and the final block in 52. Do not paraphrase a single word. Close the wrapper div after it.
+Verbatim, character for character, including any em dash and \`&amp;\`. Present in 53 of 53 rewritten products and the final block in 52. Do not paraphrase a single word. Close the wrapper div after it.
 
 =====================================================================
 3. VOICE — MEASURABLE CONSTRAINTS
@@ -304,7 +354,11 @@ TAGS, and nothing else:
 \`div, p, h2, h3, strong, em, ul, ol, li, table, tr, td, th, details, summary, img, a, br\`
 
 ATTRIBUTES, and nothing else:
-\`style\` on any of them; \`src\` and \`alt\` on \`img\`; \`href\` on \`a\` — and the ONLY legal href value in the entire store is \`mailto:support@lumoraloves.com\` (67 uses across 60 products, a deduplicated set of size one). Never link to a collection, a competitor, a spec sheet, a manufacturer, or another product.
+\`style\` on any of them; \`src\` and \`alt\` on \`img\`; ${
+    email
+      ? `\`href\` on \`a\` — and the ONLY legal href value in the entire store is \`mailto:${email}\` (the reference store used one href value across 60 products). Never link to`
+      : `and NO \`a\` element at all — this store has no public support address configured, so the page carries no link of any kind. Never link to`
+  } a collection, a competitor, a spec sheet, a manufacturer, or another product.
 
 CSS PROPERTIES, and nothing else:
 \`max-width, width, margin, padding, color, background, line-height, font-size, font-weight, letter-spacing, text-transform, text-align, border-bottom, border-top, border-collapse, border-radius, table-layout, display (block|flex|inline-block), flex, flex-wrap, flex-direction, gap, align-items, cursor, list-style, overflow-x, vertical-align\`
@@ -348,7 +402,7 @@ The theme is not yours and may override anything. These parts must remain correc
 □ Every img has src + non-empty descriptive alt + style; zero width/height attributes; every src on cdn.shopify.com
 □ Zero contractions in body prose; zero exclamation marks; zero emoji
 □ Zero hits on the entire §4 banned register
-□ Only whitelisted tags, attributes, CSS properties and palette values; the only href is mailto:support@lumoraloves.com
+□ Only whitelisted tags, attributes, CSS properties and palette values; ${email ? `the only href is mailto:${email}` : "no <a> element at all"}
 □ Tags: 8–12, all lowercase, no "ships from usa"
 □ No number appears that the supplier did not publish
 
@@ -357,7 +411,96 @@ The theme is not yours and may override anything. These parts must remain correc
 =====================================================================
 If the target theme is unknown AND cannot be inspected, ship the SHORT tier instead: unstyled semantic HTML with no wrapper, no flex, no images and no inline CSS at all (11 corpus products do exactly this, 948–9,734 chars, literally zero style attributes). Plain unstyled \`<table>/<tr>/<td>\` IS permitted there, so the spec table need not be dropped, only unstyled. Tag vocabulary: p, h2, h3, ul, ol, li, strong, em, br, table, tr, td. It inherits the theme's typography and colours completely and cannot break on any theme.
 The title rules, the tag rules, the banned register, the not-published habit, the limits block and the sign-off ALL still apply in full. Only the styling degrades — never the honesty.`;
+}
+
+/**
+ * A shop name as it may appear in the page. The contract permits one entity,
+ * `&amp;`, and a name is plain text, so markup characters are dropped rather
+ * than escaped into entities the checker would then have to allow.
+ */
+export function brandText(name: string): string {
+  return name.replace(/[<>"]/g, "").replace(/&(?!amp;)/g, "&amp;").replace(/\s+/g, " ").trim();
+}
 
 /** Bump when the contract text changes: it invalidates the prompt cache and is
  * recorded on every rewrite so a bad batch can be traced to its rules. */
-export const LUMORA_CONTRACT_VERSION = "2026-09-09.1";
+export const WRITING_CONTRACT_VERSION = "2026-09-14.1";
+
+const EMAIL = /^[^\s@<>"'()]+@[^\s@<>"'()]+\.[^\s@<>"'()]+$/;
+
+function sameName(a: string, b: string): boolean {
+  const norm = (v: string) => v.replace(/&amp;/g, "&").replace(/\s+/g, " ").trim().toLowerCase();
+  return norm(a) === norm(b);
+}
+
+/**
+ * The sign-off block of a finished page: the brand name it was signed with and
+ * the sentence under it. Null for a page that has none.
+ */
+export function signOffFrom(html: string): { name: string; tagline: string | null } | null {
+  const start = html.lastIndexOf('<div style="text-align:center');
+  if (start === -1) return null;
+  const paragraphs = [...html.slice(start).matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/gi)].map((m) => m[1].trim());
+  if (!paragraphs[0] || /</.test(paragraphs[0])) return null;
+  const tagline = paragraphs[1] && !/</.test(paragraphs[1]) && paragraphs[1].length <= 300 ? paragraphs[1] : null;
+  return { name: paragraphs[0], tagline };
+}
+
+/**
+ * Whether a finished page may teach this store's voice.
+ *
+ * Pages rewritten before the contract was per store were signed "Lumora Loves"
+ * whichever store they were written for. Handed back to the model as worked
+ * examples, they would put that name straight back on the next page, so a page
+ * signed by any other brand is not an example for this one.
+ */
+export function exampleFitsBrand(html: string, brandName: string): boolean {
+  const signOff = signOffFrom(html);
+  return !signOff || sameName(signOff.name, brandText(brandName));
+}
+
+export interface BrandSources {
+  /** Shop.name as the Admin API reports it. */
+  shopName: string | null;
+  domain: string;
+  /**
+   * `shop.contactEmail` - the address Shopify says customers use to reach the
+   * shop. `undefined` means it could not be fetched, which is not the same as
+   * the shop having none.
+   */
+  contactEmail: string | null | undefined;
+  /** The shop's own finished pages. */
+  examples: Array<{ descriptionHtml: string }>;
+}
+
+/**
+ * The brand a store's pages are written under, from that store's own data.
+ *
+ * Never the account owner's email (`Shop.email` is where Shopify writes to the
+ * merchant, not where customers write to the shop) and never a value from a
+ * page signed by another brand. The tagline and, when Shopify could not be
+ * asked, the support address are read back from the store's own finished
+ * pages - which is what keeps Lumora's sign-off sentence on Lumora's pages
+ * without it being written into the code.
+ */
+export function resolveStoreBrand(sources: BrandSources): StoreBrand {
+  const name = sources.shopName?.trim() || sources.domain.replace(/\.myshopify\.com$/i, "");
+  const own = sources.examples.map((e) => ({ html: e.descriptionHtml, signOff: signOffFrom(e.descriptionHtml) })).filter((e) => e.signOff && sameName(e.signOff.name, brandText(name)));
+
+  let supportEmail: string | null = null;
+  if (sources.contactEmail !== undefined) {
+    const candidate = sources.contactEmail?.trim().toLowerCase() ?? "";
+    supportEmail = EMAIL.test(candidate) ? candidate : null;
+  } else {
+    for (const example of own) {
+      const found = /href\s*=\s*["']mailto:([^"'?]+)["']/i.exec(example.html)?.[1]?.toLowerCase();
+      if (found && EMAIL.test(found)) {
+        supportEmail = found;
+        break;
+      }
+    }
+  }
+
+  const signOffTagline = own.map((e) => e.signOff?.tagline).find((t): t is string => Boolean(t)) ?? null;
+  return { name, supportEmail, signOffTagline };
+}

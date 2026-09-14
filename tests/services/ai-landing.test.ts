@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { extractResult, mightBeTheImages } from "~/services/ai-landing.server";
+import Anthropic from "@anthropic-ai/sdk";
+import { afterEach, describe, expect, it } from "vitest";
+import { aiEndpointStatus, extractResult, mightBeTheImages, rewriteWasNotBilled } from "~/services/ai-landing.server";
 
 /**
  * These two helpers exist because the app can be pointed at an
@@ -67,5 +68,52 @@ describe("mightBeTheImages", () => {
   it("survives an error with no status", () => {
     expect(mightBeTheImages(new Error("socket hang up"))).toBe(false);
     expect(mightBeTheImages(null)).toBe(false);
+  });
+});
+
+describe("aiEndpointStatus", () => {
+  const saved = { base: process.env.ANTHROPIC_BASE_URL, key: process.env.ANTHROPIC_API_KEY };
+  afterEach(() => {
+    if (saved.base === undefined) delete process.env.ANTHROPIC_BASE_URL;
+    else process.env.ANTHROPIC_BASE_URL = saved.base;
+    if (saved.key === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = saved.key;
+  });
+
+  it("reports Anthropic's own API when no base url is set", () => {
+    delete process.env.ANTHROPIC_BASE_URL;
+    expect(aiEndpointStatus()).toMatchObject({ host: "api.anthropic.com", direct: true });
+  });
+
+  it("names a third-party gateway instead of hiding it", () => {
+    // Production runs exactly like this; the SDK would follow it silently.
+    process.env.ANTHROPIC_BASE_URL = "https://gateway.example.net/v1";
+    process.env.ANTHROPIC_API_KEY = "sk-test";
+    expect(aiEndpointStatus()).toEqual({ configured: true, host: "gateway.example.net", direct: false });
+  });
+
+  it("does not mistake a lookalike host for Anthropic", () => {
+    process.env.ANTHROPIC_BASE_URL = "https://api.anthropic.com.evil.example";
+    expect(aiEndpointStatus().direct).toBe(false);
+  });
+
+  it("survives a base url that is not a url", () => {
+    process.env.ANTHROPIC_BASE_URL = "not a url";
+    expect(aiEndpointStatus().direct).toBe(false);
+  });
+});
+
+describe("rewriteWasNotBilled", () => {
+  it("refunds a request the endpoint answered with an error status", () => {
+    expect(rewriteWasNotBilled(new Anthropic.APIError(403, undefined, "blocked", new Headers()))).toBe(true);
+    expect(rewriteWasNotBilled(new Anthropic.APIError(529, undefined, "overloaded", new Headers()))).toBe(true);
+  });
+
+  it("charges a dropped connection, where the model may have finished anyway", () => {
+    expect(rewriteWasNotBilled(new Anthropic.APIConnectionError({ message: "socket hang up" }))).toBe(false);
+  });
+
+  it("charges an answer that came back and would not parse", () => {
+    expect(rewriteWasNotBilled(new Error("The endpoint returned no JSON object."))).toBe(false);
   });
 });

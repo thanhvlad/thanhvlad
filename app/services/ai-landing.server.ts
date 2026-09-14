@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { jsonSchemaOutputFormat } from "@anthropic-ai/sdk/helpers/json-schema";
-import { LUMORA_CONTRACT_VERSION, LUMORA_WRITING_CONTRACT } from "~/domain/copy/lumora-contract";
+import { WRITING_CONTRACT_VERSION, buildWritingContract, type StoreBrand } from "~/domain/copy/lumora-contract";
 import { env } from "~/lib/env.server";
 import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
@@ -21,6 +21,13 @@ import { logger } from "~/lib/logger.server";
  *
  * With no ANTHROPIC_API_KEY the feature is simply unavailable, matching how
  * ai-mapping.server.ts already behaves.
+ *
+ * What leaves the app on each call - the supplier title, description, variant
+ * options and prices, the supplier store name and up to eight image urls - goes
+ * to whatever ANTHROPIC_BASE_URL names. The merchant is told so before a
+ * rewrite is queued (the import list's confirmation), and an endpoint that is
+ * not Anthropic's own is logged at warn level and reported by `aiEndpointStatus`
+ * so the operator can see who else receives it.
  */
 
 export interface RewriteInput {
@@ -32,6 +39,8 @@ export interface RewriteInput {
   variants: Array<{ attributes: Array<{ name: string; value: string }>; price: string; stock: number }>;
   currency: string;
   storeName?: string | null;
+  /** Whose store the page is for: its name, support address and sign-off. */
+  brand: StoreBrand;
   /** Two or three of the shop's own finished pages, as worked examples. */
   examples?: Array<{ title: string; descriptionHtml: string }>;
 }
@@ -93,7 +102,76 @@ const REWRITE_SCHEMA = {
 } as const;
 
 export function aiLandingAvailable(): boolean {
-  return Boolean(process.env.ANTHROPIC_API_KEY);
+  const available = Boolean(process.env.ANTHROPIC_API_KEY);
+  if (available) warnAboutGatewayOnce();
+  return available;
+}
+
+export interface AiEndpointStatus {
+  configured: boolean;
+  /** Host the SDK sends requests to. */
+  host: string;
+  /** False when ANTHROPIC_BASE_URL points somewhere other than Anthropic. */
+  direct: boolean;
+}
+
+/**
+ * Where model calls actually go.
+ *
+ * The SDK reads ANTHROPIC_BASE_URL itself, silently. Production was pointed at
+ * a third-party gateway that way, which means merchant product data reaches an
+ * operator the privacy policy does not name, and nothing in the logs said so.
+ * This makes the endpoint a fact the operator can read (logs, health check)
+ * rather than one they have to remember.
+ */
+export function aiEndpointStatus(): AiEndpointStatus {
+  const raw = process.env.ANTHROPIC_BASE_URL?.trim();
+  let host = "api.anthropic.com";
+  if (raw) {
+    try {
+      host = new URL(raw).host.toLowerCase();
+    } catch {
+      host = raw;
+    }
+  }
+  const direct = host === "anthropic.com" || host.endsWith(".anthropic.com");
+  return { configured: Boolean(process.env.ANTHROPIC_API_KEY), host, direct };
+}
+
+let gatewayWarned = false;
+
+function warnAboutGatewayOnce() {
+  if (gatewayWarned) return;
+  gatewayWarned = true;
+  const status = aiEndpointStatus();
+  if (status.direct) return;
+  try {
+    logger.warn("AI rewrites are sent through a non-Anthropic endpoint", {
+      host: status.host,
+      note: "Merchant product text and image urls reach this operator; name it as a sub-processor or unset ANTHROPIC_BASE_URL.",
+    });
+  } catch {
+    // A log line is never worth failing a request or the boot over.
+  }
+}
+
+// Said once when the server loads this module, which the import list route
+// does at boot, so the operator sees it in the startup log rather than only
+// after the first merchant opens the page.
+if (process.env.ANTHROPIC_API_KEY) warnAboutGatewayOnce();
+
+/**
+ * True when a failed rewrite never produced a billable answer.
+ *
+ * An error status from the endpoint - a refusal of the request's shape, an
+ * auth or rate-limit answer, a server fault - means no completion was produced,
+ * so it should not use up the merchant's monthly allowance. A dropped
+ * connection or a timeout carries no status and is counted: the model may well
+ * have run to the end on the other side. So is anything else, such as an answer
+ * that would not parse, which came back after the model ran and was paid for.
+ */
+export function rewriteWasNotBilled(error: unknown): boolean {
+  return error instanceof Anthropic.APIError && typeof error.status === "number";
 }
 
 /** Vision needs a reachable http(s) url, and a long tail of images costs tokens
@@ -250,6 +328,10 @@ export async function rewriteLandingPage(input: RewriteInput): Promise<RewriteRe
   const facts = [
     `SUPPLIER TITLE: ${input.supplierTitle}`,
     input.storeName ? `SUPPLIER STORE: ${input.storeName}` : "",
+    // The contract's shipping panel is filled from configuration, and the app
+    // has none to give it. Saying so outright stops the model from reading a
+    // policy off the worked examples and promising it for this product.
+    `SHIPPING & RETURNS CONFIGURATION: none supplied - omit the shipping & returns panel (§2.10).`,
     `CURRENCY: ${input.currency}`,
     input.optionNames.length ? `OPTION AXES: ${input.optionNames.join(", ")}` : "OPTION AXES: none",
     ``,
@@ -277,12 +359,12 @@ export async function rewriteLandingPage(input: RewriteInput): Promise<RewriteRe
       ].join("\n")
     : "";
 
-  // Two cache breakpoints, both stable. The contract never varies, and the
-  // worked examples are identical for every product in a batch. Leaving the
-  // examples in the user turn meant paying full price for the same ~10k
+  // Two cache breakpoints, both stable. The contract only varies by store, and
+  // the worked examples are identical for every product in a batch. Leaving
+  // the examples in the user turn meant paying full price for the same ~10k
   // tokens on every single product.
   const system = [
-    { type: "text" as const, text: LUMORA_WRITING_CONTRACT, cache_control: { type: "ephemeral" as const } },
+    { type: "text" as const, text: buildWritingContract(input.brand), cache_control: { type: "ephemeral" as const } },
     ...(exampleBlock
       ? [{ type: "text" as const, text: exampleBlock, cache_control: { type: "ephemeral" as const } }]
       : []),
@@ -330,6 +412,7 @@ export async function rewriteLandingPage(input: RewriteInput): Promise<RewriteRe
   logger.info("Landing page rewritten", {
     supplierTitle: input.supplierTitle.slice(0, 80),
     imagesAssessed,
+    endpoint: aiEndpointStatus().host,
     inputTokens: usage?.input_tokens,
     cacheRead: usage?.cache_read_input_tokens,
     outputTokens: usage?.output_tokens,
@@ -343,6 +426,6 @@ export async function rewriteLandingPage(input: RewriteInput): Promise<RewriteRe
     heroImageIndex: Number(parsed.heroImageIndex),
     imageVerdicts: verdicts.filter((v) => v && typeof v === "object" && typeof v.index === "number"),
     imagesAssessed,
-    contractVersion: LUMORA_CONTRACT_VERSION,
+    contractVersion: WRITING_CONTRACT_VERSION,
   };
 }
