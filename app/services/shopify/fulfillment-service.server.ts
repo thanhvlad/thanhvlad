@@ -1,6 +1,5 @@
-import { createHash } from "node:crypto";
 import { errorMessage } from "~/lib/errors";
-import { assertNoUserErrors, gql, type GraphqlClient, type UserError } from "./graphql.server";
+import { assertNoUserErrors, gql, operationIdempotencyKey, type GraphqlClient, type UserError } from "./graphql.server";
 
 /**
  * Shopify fulfilment service registration.
@@ -263,15 +262,8 @@ export async function rejectCancellationRequest(client: GraphqlClient, fulfillme
 // The @idempotent key is REQUIRED on this mutation from Admin API 2026-04
 // onwards, and this app pins 2026-07. Without it every assignment is rejected -
 // which is why assigning products to the fulfilment service could never succeed.
-/**
- * A stable idempotency key. Shopify requires one on the inventory mutations from
- * API 2026-04; deriving it from the payload means a genuine retry of the same
- * write reuses it, which is the entire point. A fresh uuid per attempt would
- * satisfy the API and protect nothing.
- */
-function idempotencyKey(...parts: unknown[]): string {
-  return createHash("sha256").update(JSON.stringify(parts)).digest("hex").slice(0, 36);
-}
+// How the key is chosen, and why it is no longer a hash of the payload alone,
+// is explained on operationIdempotencyKey.
 
 const INVENTORY_ACTIVATE = `#graphql
   mutation DropshipInventoryActivate($inventoryItemId: ID!, $locationId: ID!, $available: Int, $key: String!) {
@@ -329,12 +321,17 @@ export async function assignVariantToLocation(
   locationId: string,
   available: number,
   releaseLocationIds: string[] = [],
+  options: { operationId?: string | null } = {},
 ): Promise<AssignVariantResult> {
   const data = await gql<{ inventoryActivate: { userErrors: UserError[] } }>(client, INVENTORY_ACTIVATE, {
     inventoryItemId,
     locationId,
     available: Math.max(0, available),
-    key: idempotencyKey("inventoryActivate", inventoryItemId, locationId, available),
+    // A payload-only key made a second assignment within 24 hours (assign,
+    // unassign, assign again with the same stock) come back from Shopify's
+    // cache without activating anything, leaving the variant unstocked at the
+    // app's location while the screen reported success.
+    key: operationIdempotencyKey("inventoryActivate", options.operationId, inventoryItemId, locationId, available),
   });
   assertNoUserErrors(data.inventoryActivate.userErrors, "inventoryActivate");
 

@@ -57,7 +57,19 @@ function toPolicyInput(row: Awaited<ReturnType<typeof getInventoryPolicy>>): Inv
 export async function runInventorySync(
   shop: ShopWithSettings,
   client: GraphqlClient,
-  options: { productIds?: string[]; dryRun?: boolean; onProgress?: (n: number) => Promise<unknown>; actor?: string } = {},
+  options: {
+    productIds?: string[];
+    dryRun?: boolean;
+    onProgress?: (n: number) => Promise<unknown>;
+    actor?: string;
+    /**
+     * Stable across attempts of the same run (the job id). It goes into the
+     * Shopify idempotency key of each stock write, so a retried attempt that
+     * computes the same quantities is recognised as the same write, while the
+     * next scheduled run is a new one even when the numbers match.
+     */
+    operationId?: string;
+  } = {},
 ): Promise<InventorySyncSummary & { plannedActions: SyncAction[] }> {
   const policyRow = await getInventoryPolicy(shop.id);
   const policy = toPolicyInput(policyRow);
@@ -126,7 +138,7 @@ export async function runInventorySync(
     if (options.dryRun || actions.length === 0) continue;
 
     try {
-      await applyActions(shop, client, product.id, product.shopifyProductId, product.title, actions, summary);
+      await applyActions(shop, client, product.id, product.shopifyProductId, product.title, actions, summary, options.operationId);
       await prisma.product.update({ where: { id: product.id }, data: { lastSyncedAt: new Date() } });
     } catch (error) {
       summary.errors.push(`${product.title}: ${errorMessage(error)}`);
@@ -146,7 +158,7 @@ export async function runInventorySync(
   return { ...summary, plannedActions: planned };
 }
 
-async function applyActions(shop: ShopWithSettings, client: GraphqlClient, productId: string, shopifyProductId: string, title: string, actions: SyncAction[], summary: InventorySyncSummary) {
+async function applyActions(shop: ShopWithSettings, client: GraphqlClient, productId: string, shopifyProductId: string, title: string, actions: SyncAction[], summary: InventorySyncSummary, operationId?: string) {
   const priceUpdates = actions.filter((a) => a.type === "UPDATE_PRICE");
   const costUpdates = actions.filter((a) => a.type === "UPDATE_COST");
   const inventoryUpdates = actions.filter((a) => a.type === "UPDATE_INVENTORY");
@@ -184,7 +196,15 @@ async function applyActions(shop: ShopWithSettings, client: GraphqlClient, produ
       summary.errors.push(`${title}: no fulfilment or primary location configured; cannot update inventory.`);
     } else {
       const withItems = inventoryUpdates.filter((a) => a.inventoryItemId);
-      await setInventoryQuantities(client, locationId, withItems.map((a) => ({ inventoryItemId: a.inventoryItemId!, quantity: a.quantity ?? 0 })));
+      await setInventoryQuantities(
+        client,
+        locationId,
+        withItems.map((a) => ({ inventoryItemId: a.inventoryItemId!, quantity: a.quantity ?? 0 })),
+        // Without an operation id each call gets a fresh key. A key derived from
+        // the payload alone made the next hour's identical "set to 10" come back
+        // from Shopify's 24-hour idempotency cache, unwritten.
+        { operationId: operationId ? `${operationId}:${productId}` : null },
+      );
       await chunkedTransaction(withItems.map((a) => prisma.productVariant.update({ where: { id: a.productVariantId }, data: { inventoryQuantity: a.quantity ?? 0 } })));
       summary.inventoryUpdates += withItems.length;
       const outOfStock = withItems.filter((a) => (a.quantity ?? 0) === 0);
