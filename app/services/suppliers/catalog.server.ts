@@ -231,7 +231,16 @@ export async function refreshSupplierProduct(
     const product = await cacheSupplierProduct({ ...detail, platform: existing.platform }, account?.id ?? existing.supplierAccountId);
     return { product, detail };
   } catch (error) {
-    logger.warn("Supplier refresh failed", { supplierProductId, error });
+    // A product with no supplier API behind it is the normal state for anything
+    // the extension captured, and the hourly sync asks about every one of them.
+    // Logging each as a warning with a stack trace buried real failures under
+    // the expected ones; the caller already records it as a skip.
+    const code = (error as { code?: unknown } | null)?.code;
+    if (code === "SUPPLIER_API_UNAVAILABLE" || code === "SUPPLIER_NOT_CONFIGURED") {
+      logger.debug("Supplier product not refreshable without an API", { supplierProductId, code });
+    } else {
+      logger.warn("Supplier refresh failed", { supplierProductId, error });
+    }
     throw error;
   }
 }
