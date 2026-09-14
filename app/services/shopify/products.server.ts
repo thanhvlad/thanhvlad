@@ -1,3 +1,5 @@
+import { AppError, errorMessage } from "~/lib/errors";
+import { logger } from "~/lib/logger.server";
 import { assertNoUserErrors, gql, operationIdempotencyKey, type GraphqlClient, type UserError } from "./graphql.server";
 
 // ---------------------------------------------------------------------------
@@ -55,6 +57,14 @@ export interface PushedProduct {
   failedMedia: Array<{ id: string; alt: string | null; message: string }>;
   /** Media still being fetched when the push returned; its outcome is not known yet. */
   processingMediaCount: number;
+  /**
+   * True when Shopify created or updated the product but the variants beyond
+   * the first page could not be read back. `variants` then lists only the
+   * first 250. The product exists all the same, and its id must be kept: a
+   * push that threw here lost the id, and the retry created a second listing.
+   * A later push (an upsert on the saved id) or fetchProduct reads them all.
+   */
+  variantsIncomplete: boolean;
   variants: Array<{
     id: string;
     title: string;
@@ -188,10 +198,22 @@ export async function createProduct(
   assertNoUserErrors(data.productSet.userErrors, "productSet");
   const product = data.productSet.product;
   if (!product) throw new Error("productSet returned no product");
+  let variantsIncomplete = false;
   if (product.variants.pageInfo?.hasNextPage) {
-    product.variants.nodes.push(...(await readRemainingVariants(client, product.id, product.variants.pageInfo.endCursor)));
+    try {
+      product.variants.nodes.push(...(await readRemainingVariants(client, product.id, product.variants.pageInfo.endCursor)));
+    } catch (error) {
+      // From here on the product exists in the merchant's store. Throwing would
+      // drop its id with the error, and the next push would create a copy.
+      variantsIncomplete = true;
+      logger.warn("Pushed product, but could not read back all of its variants", {
+        productId: product.id,
+        readVariants: product.variants.nodes.length,
+        error: errorMessage(error),
+      });
+    }
   }
-  return normalizeProduct(product);
+  return { ...normalizeProduct(product), variantsIncomplete };
 }
 
 const PRODUCT_VARIANTS_PAGE_QUERY = `#graphql
@@ -224,7 +246,15 @@ async function readRemainingVariants(client: GraphqlClient, productId: string, a
       id: productId,
       after: cursor,
     });
-    if (!data.product) break;
+    // A product that vanishes between pages is not "no more variants". Stopping
+    // here returned a partial list, and syncProductFromShopify prunes every
+    // local variant missing from that list, mappings included.
+    if (!data.product) {
+      throw new AppError("SHOPIFY_PRODUCT_VANISHED", `Product ${productId} disappeared while its variants were being read`, {
+        retryable: true,
+        details: { productId, read: nodes.length },
+      });
+    }
     nodes.push(...data.product.variants.nodes);
     cursor = data.product.variants.pageInfo?.hasNextPage ? data.product.variants.pageInfo.endCursor : null;
   }
@@ -291,8 +321,9 @@ export async function fetchProduct(client: GraphqlClient, id: string) {
       ...(await readRemainingVariants(client, data.product.id, data.product.variants.pageInfo.endCursor)),
     );
   }
+  const { variantsIncomplete: _complete, ...product } = normalizeProduct(data.product);
   return {
-    ...normalizeProduct(data.product),
+    ...product,
     vendor: data.product.vendor,
     variants: data.product.variants.nodes.map((v) => ({
       id: v.id,
@@ -590,6 +621,8 @@ export function summariseMedia(nodes: RawMedia[]) {
 }
 
 function normalizeProduct(raw: RawProduct): PushedProduct {
+  // Complete unless createProduct says otherwise: everywhere else a failed page
+  // read throws instead of returning what it had so far.
   return {
     id: raw.id,
     handle: raw.handle,
@@ -597,6 +630,7 @@ function normalizeProduct(raw: RawProduct): PushedProduct {
     status: raw.status,
     featuredImage: raw.featuredMedia?.preview?.image?.url ?? null,
     ...summariseMedia(raw.media?.nodes ?? []),
+    variantsIncomplete: false,
     variants: raw.variants.nodes.map((v) => ({
       id: v.id,
       title: v.title,

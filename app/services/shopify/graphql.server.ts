@@ -49,6 +49,20 @@ export interface GqlOptions {
    * own; everything else defaults to "tell the caller, do not guess".
    */
   replaySafe?: boolean;
+  /**
+   * Accept a response in which Shopify withheld some fields, and return the
+   * rest with the withheld paths listed in `deniedPaths`.
+   *
+   * Off by default, because Shopify reports two very different things with the
+   * same ACCESS_DENIED code: protected customer data the app is not approved
+   * for, and an access scope the app does not have. Treating every denial as
+   * "partial data" turned a missing scope into a silent null, and callers read
+   * null as "gone": a product was deleted locally, a fulfilment order list came
+   * back empty and tracking was retired. Only a caller that knows which fields
+   * may legitimately be redacted opts in, and a function narrows it further to
+   * exactly those paths. A missing scope is never accepted either way.
+   */
+  allowRedacted?: boolean | ((path: Array<string | number>) => boolean);
 }
 
 export interface GqlResult<T> {
@@ -84,14 +98,18 @@ export async function gql<T>(
   client: GraphqlClient,
   query: string,
   variables?: Record<string, unknown>,
-  options: GqlOptions = {},
+  options: Omit<GqlOptions, "allowRedacted"> = {},
 ): Promise<T> {
-  return (await gqlResult<T>(client, query, variables, options)).data;
+  // Always strict: `gql` has nowhere to report withheld paths, so accepting a
+  // redaction here would hand the caller nulls with no way to tell why.
+  return (await gqlResult<T>(client, query, variables, { ...options, allowRedacted: false })).data;
 }
 
 /**
  * As `gql`, but also reports which fields Shopify redacted for lack of
  * protected-customer-data approval, so a caller can record why they are empty.
+ * Redaction is only accepted with `options.allowRedacted`; without it an access
+ * denial throws SHOPIFY_ACCESS_DENIED exactly as `gql` does.
  */
 export async function gqlResult<T>(
   client: GraphqlClient,
@@ -169,16 +187,23 @@ export async function gqlResult<T>(
       continue;
     }
 
-    // Protected customer data: "unapproved fields will be redacted", with the
-    // reason in `errors` and everything else in `data`. Throwing here turned an
-    // unapproved phone number into an order that never synced at all.
-    if (!mutation && envelope.data && envelope.errors.every(isAccessDeniedError)) {
+    if (envelope.errors.every(isAccessDeniedError)) {
+      // Protected customer data: "unapproved fields will be redacted", with the
+      // reason in `errors` and everything else in `data`. Throwing here turned an
+      // unapproved phone number into an order that never synced at all, so a
+      // caller that expects it (see GqlOptions.allowRedacted) gets the rest.
       const deniedPaths = envelope.errors.map((e) => e.path ?? []);
-      logger.warn("Shopify redacted protected customer data", {
-        operation,
-        paths: [...new Set(deniedPaths.map(pathKey))],
+      if (!mutation && envelope.data && redactionAccepted(envelope.errors, options.allowRedacted)) {
+        logger.warn("Shopify redacted protected customer data", {
+          operation,
+          paths: [...new Set(deniedPaths.map(pathKey))],
+        });
+        return { data: envelope.data, deniedPaths };
+      }
+      throw new AppError("SHOPIFY_ACCESS_DENIED", `Shopify denied access in ${operation}: ${envelope.errors.map((e) => e.message).join("; ")}`, {
+        retryable: false,
+        details: { operation, errors: envelope.errors },
       });
-      return { data: envelope.data, deniedPaths };
     }
 
     throw new AppError("SHOPIFY_GRAPHQL", envelope.errors.map((e) => e.message).join("; "), {
@@ -311,6 +336,28 @@ export function isThrottleError(error: GraphqlError): boolean {
 
 export function isAccessDeniedError(error: GraphqlError): boolean {
   return error.extensions?.code === "ACCESS_DENIED" || /not approved to access|access denied/i.test(error.message);
+}
+
+/**
+ * A denial caused by an access scope the app was not granted, as opposed to
+ * protected customer data it is not approved for. Shopify words the first as
+ * "Required access: `read_x` access scope"; that is a configuration fault to
+ * surface, never a field to leave empty.
+ */
+export function isMissingScopeError(error: GraphqlError): boolean {
+  return /access scope|required access/i.test(error.message);
+}
+
+/** Whether every denial in a response is a redaction the caller said it can live with. */
+export function redactionAccepted(errors: GraphqlError[], allow: GqlOptions["allowRedacted"]): boolean {
+  if (!allow || errors.length === 0) return false;
+  return errors.every((e) => {
+    if (isMissingScopeError(e)) return false;
+    if (allow === true) return true;
+    // A denial with no path withheld something unnamed; nothing narrower than
+    // "accept anything" can vouch for it.
+    return Array.isArray(e.path) && e.path.length > 0 && allow(e.path);
+  });
 }
 
 /**

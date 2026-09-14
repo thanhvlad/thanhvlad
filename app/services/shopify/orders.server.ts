@@ -20,6 +20,13 @@ export interface ShopifyOrderSnapshot {
   totalShipping: string;
   totalTax: string;
   totalDiscounts: string;
+  /**
+   * Always null from the fetchers here. The order query no longer reads the
+   * Customer object: that needs the read_customers scope, and the order itself
+   * already carries what a shipment needs (shippingAddress.name, email, and
+   * shippingAddress.phone or phone). Kept on the type for snapshots built by
+   * hand and for the upsert's fallback, which simply finds nothing.
+   */
   customer: { firstName: string | null; lastName: string | null; email: string | null; phone: string | null } | null;
   shippingAddress: {
     firstName: string | null;
@@ -54,7 +61,7 @@ export interface ShopifyOrderSnapshot {
   /**
    * Fields Shopify withheld because the app is not approved for that protected
    * customer data, as dotted paths relative to the order ("shippingAddress",
-   * "customer.defaultPhoneNumber"). Those fields read as null above; this is
+   * "phone"). Those fields read as null above; this is
    * how the order screen can tell "Shopify would not share the address" apart
    * from "the customer gave no address". Always set by the fetchers here;
    * optional only so a snapshot built by hand (fixtures, the demo script) need
@@ -82,7 +89,6 @@ const ORDER_FIELDS = `#graphql
     totalShippingPriceSet { shopMoney { amount } }
     totalTaxSet { shopMoney { amount } }
     totalDiscountsSet { shopMoney { amount } }
-    customer { firstName lastName defaultEmailAddress { emailAddress } defaultPhoneNumber { phoneNumber } }
     customAttributes { key value }
     shippingAddress {
       firstName lastName name company address1 address2 city province provinceCode zip country countryCodeV2 phone
@@ -147,16 +153,8 @@ function normalizeOrder(raw: any): Omit<ShopifyOrderSnapshot, "redactedFields"> 
     totalShipping: raw.totalShippingPriceSet?.shopMoney?.amount ?? "0",
     totalTax: raw.totalTaxSet?.shopMoney?.amount ?? "0",
     totalDiscounts: raw.totalDiscountsSet?.shopMoney?.amount ?? "0",
-    customer: raw.customer
-      ? {
-          firstName: raw.customer.firstName,
-          lastName: raw.customer.lastName,
-          // Customer.email and Customer.phone are deprecated; the address
-          // objects are where they live now.
-          email: raw.customer.defaultEmailAddress?.emailAddress ?? null,
-          phone: raw.customer.defaultPhoneNumber?.phoneNumber ?? null,
-        }
-      : null,
+    // Not queried any more; see ShopifyOrderSnapshot.customer.
+    customer: null,
     shippingAddress: raw.shippingAddress ?? null,
     customAttributes: raw.customAttributes ?? [],
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -181,8 +179,37 @@ function rank(level: string): number {
   return level === "HIGH" ? 3 : level === "MEDIUM" ? 2 : level === "LOW" ? 1 : 0;
 }
 
+/**
+ * The order fields Shopify may withhold for protected customer data, and so the
+ * only denials an order fetch accepts as "sync without them". Anything else - a
+ * line item, the order itself, a field behind a missing access scope - still
+ * throws, because a null there means something is misconfigured, not private.
+ */
+export const REDACTABLE_ORDER_FIELDS: ReadonlySet<string> = new Set(["email", "phone", "shippingAddress"]);
+
+/**
+ * Accepts a denied path only when it names a protected field of an order under
+ * `prefix` (["order"] for one order, ["orders", "nodes"] for a page, where the
+ * next segment is the node's index).
+ */
+export function redactableOrderPath(prefix: string[]) {
+  const indexed = prefix.length > 1;
+  return (path: Array<string | number>): boolean => {
+    if (!prefix.every((segment, i) => path[i] === segment)) return false;
+    let at = prefix.length;
+    if (indexed) {
+      if (typeof path[at] !== "number") return false;
+      at += 1;
+    }
+    const field = path[at];
+    return typeof field === "string" && REDACTABLE_ORDER_FIELDS.has(field);
+  };
+}
+
 export async function fetchOrder(client: GraphqlClient, id: string) {
-  const { data, deniedPaths } = await gqlResult<{ order: unknown }>(client, ORDER_QUERY, { id });
+  const { data, deniedPaths } = await gqlResult<{ order: unknown }>(client, ORDER_QUERY, { id }, {
+    allowRedacted: redactableOrderPath(["order"]),
+  });
   const redacted = redactedFieldsByNode(deniedPaths, ["order"]);
   if (!data.order) {
     // The order itself was withheld, not just some of its fields. Returning
@@ -203,12 +230,15 @@ export async function fetchOrdersPage(
     first: options.first ?? 50,
     after: options.after ?? null,
     query: options.query ?? null,
-  });
+  }, { allowRedacted: redactableOrderPath(["orders", "nodes"]) });
   const redacted = redactedFieldsByNode(deniedPaths, ["orders", "nodes"]);
   if (!data.orders) {
     if (redacted.whole) throw accessDenied();
     return { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } };
   }
+  // A withheld node is refused by redactableOrderPath already; this keeps a
+  // null that slipped through from surfacing as a TypeError inside normalizeOrder.
+  if (data.orders.nodes.some((node) => !node)) throw accessDenied();
   return {
     nodes: data.orders.nodes.map((node, index) => ({ ...normalizeOrder(node), redactedFields: redacted.forNode(index) })),
     pageInfo: data.orders.pageInfo,
@@ -327,7 +357,7 @@ const FULFILLMENT_ORDERS_QUERY = `#graphql
           id
           status
           requestStatus
-          assignedLocation { location { id } }
+          assignedLocation { location { id fulfillmentService { id } } }
           lineItems(first: 100) {
             nodes { id remainingQuantity lineItem { id } }
           }
@@ -340,7 +370,10 @@ const FULFILLMENT_ORDERS_QUERY = `#graphql
 export interface FulfillmentOrderInfo {
   id: string;
   status: string;
+  requestStatus: string;
   locationId: string | null;
+  /** True when the assigned location belongs to a fulfilment service (this app's or another's). */
+  atServiceLocation: boolean;
   lineItems: Array<{ id: string; remainingQuantity: number; lineItemId: string }>;
 }
 
@@ -351,7 +384,8 @@ export async function fetchFulfillmentOrders(client: GraphqlClient, orderId: str
         nodes: Array<{
           id: string;
           status: string;
-          assignedLocation: { location: { id: string } | null } | null;
+          requestStatus: string;
+          assignedLocation: { location: { id: string; fulfillmentService: { id: string } | null } | null } | null;
           lineItems: { nodes: Array<{ id: string; remainingQuantity: number; lineItem: { id: string } }> };
         }>;
       };
@@ -360,7 +394,9 @@ export async function fetchFulfillmentOrders(client: GraphqlClient, orderId: str
   return (data.order?.fulfillmentOrders.nodes ?? []).map((fo) => ({
     id: fo.id,
     status: fo.status,
+    requestStatus: fo.requestStatus,
     locationId: fo.assignedLocation?.location?.id ?? null,
+    atServiceLocation: Boolean(fo.assignedLocation?.location?.fulfillmentService),
     lineItems: fo.lineItems.nodes.map((li) => ({
       id: li.id,
       remainingQuantity: li.remainingQuantity,
@@ -397,6 +433,13 @@ export interface CreateFulfillmentInput {
    * notification for goods that were only sent once.
    */
   idempotencyKey: string;
+  /**
+   * The app's own fulfilment-service location, when registered. Fulfilment
+   * orders there are fulfilled only after the merchant's request was accepted.
+   * Locations of any fulfilment service are recognised from Shopify's answer as
+   * well, so this is a second check on top of that one rather than the only one.
+   */
+  fulfillmentServiceLocationId?: string | null;
 }
 
 export interface CreateFulfillmentResult {
@@ -405,6 +448,61 @@ export interface CreateFulfillmentResult {
   reason: string | null;
   /** What Shopify actually accepted, per Shopify line item id. */
   fulfilled: Record<string, number>;
+}
+
+/** Request states in which a fulfilment service has been asked to fulfil and said yes. */
+const ACCEPTED_REQUEST_STATUSES = new Set(["ACCEPTED", "CANCELLATION_REJECTED"]);
+
+/**
+ * Which fulfilment-order line items to fulfil for the wanted quantities.
+ *
+ * Two rules, both of which the Shopify call alone did not enforce:
+ * - A fulfilment order at a fulfilment-service location is used only when its
+ *   request was accepted (a rejected cancellation leaves the acceptance
+ *   standing). Built for Shopify 5.8.4 lets a fulfilment service fulfil only
+ *   after the merchant asks.
+ * - The wanted quantity is consumed as it is allocated. A line split across two
+ *   fulfilment orders used to be offered in full to each, so a line of 3 split
+ *   2 + 1 with only 2 wanted was fulfilled as 2 + 1.
+ *
+ * Quantities that can only come from a fulfilment order still waiting on its
+ * request are listed in `awaitingRequest`; the whole shipment then waits,
+ * because a partial fulfilment would leave those lines behind for good.
+ */
+export function planFulfillment(
+  fulfillmentOrders: FulfillmentOrderInfo[],
+  items: Array<{ lineItemId: string; quantity: number }>,
+  appLocationId?: string | null,
+) {
+  const wanted = new Map<string, number>();
+  for (const item of items) wanted.set(item.lineItemId, (wanted.get(item.lineItemId) ?? 0) + Math.max(0, item.quantity));
+
+  const open = fulfillmentOrders.filter((fo) => ["OPEN", "IN_PROGRESS"].includes(fo.status));
+  const held = (fo: FulfillmentOrderInfo) =>
+    (fo.atServiceLocation || (Boolean(appLocationId) && fo.locationId === appLocationId)) && !ACCEPTED_REQUEST_STATUSES.has(fo.requestStatus);
+
+  const fulfilled: Record<string, number> = {};
+  const lineItemsByFulfillmentOrder: Array<{ fulfillmentOrderId: string; fulfillmentOrderLineItems: Array<{ id: string; quantity: number }> }> = [];
+  for (const fo of open.filter((candidate) => !held(candidate))) {
+    const lines: Array<{ id: string; quantity: number }> = [];
+    for (const li of fo.lineItems) {
+      const left = wanted.get(li.lineItemId) ?? 0;
+      const quantity = Math.min(li.remainingQuantity, left);
+      if (quantity <= 0) continue;
+      wanted.set(li.lineItemId, left - quantity);
+      fulfilled[li.lineItemId] = (fulfilled[li.lineItemId] ?? 0) + quantity;
+      lines.push({ id: li.id, quantity });
+    }
+    if (lines.length > 0) lineItemsByFulfillmentOrder.push({ fulfillmentOrderId: fo.id, fulfillmentOrderLineItems: lines });
+  }
+
+  const awaitingRequest = new Set<string>();
+  for (const fo of open.filter(held)) {
+    for (const li of fo.lineItems) {
+      if (li.remainingQuantity > 0 && (wanted.get(li.lineItemId) ?? 0) > 0) awaitingRequest.add(li.lineItemId);
+    }
+  }
+  return { lineItemsByFulfillmentOrder, fulfilled, awaitingRequest: [...awaitingRequest] };
 }
 
 /**
@@ -420,24 +518,20 @@ export async function createFulfillmentWithTracking(
   input: CreateFulfillmentInput,
 ): Promise<CreateFulfillmentResult> {
   const fulfillmentOrders = await fetchFulfillmentOrders(client, input.orderId);
-  const wanted = new Map(input.items.map((i) => [i.lineItemId, i.quantity]));
-  const fulfilled: Record<string, number> = {};
+  const plan = planFulfillment(fulfillmentOrders, input.items, input.fulfillmentServiceLocationId);
 
-  const lineItemsByFulfillmentOrder = fulfillmentOrders
-    .filter((fo) => ["OPEN", "IN_PROGRESS"].includes(fo.status))
-    .map((fo) => ({
-      fulfillmentOrderId: fo.id,
-      fulfillmentOrderLineItems: fo.lineItems
-        .filter((li) => wanted.has(li.lineItemId) && li.remainingQuantity > 0)
-        .map((li) => {
-          const quantity = Math.min(li.remainingQuantity, wanted.get(li.lineItemId) ?? 0);
-          if (quantity > 0) fulfilled[li.lineItemId] = (fulfilled[li.lineItemId] ?? 0) + quantity;
-          return { id: li.id, quantity };
-        })
-        .filter((li) => li.quantity > 0),
-    }))
-    .filter((fo) => fo.fulfillmentOrderLineItems.length > 0);
-
+  if (plan.awaitingRequest.length > 0) {
+    // Thrown rather than reported as skipped: a skipped result tells the caller
+    // the goods were fulfilled elsewhere, and it retires the tracking numbers.
+    // These have not shipped through Shopify yet; they are waiting for the
+    // merchant to request fulfilment, so the next attempt should try again.
+    throw new AppError(
+      "SHOPIFY_FULFILLMENT_NOT_REQUESTED",
+      "These items sit at a fulfilment-service location whose request has not been accepted, so Shopify does not allow fulfilling them yet.",
+      { retryable: true, details: { orderId: input.orderId, lineItemIds: plan.awaitingRequest } },
+    );
+  }
+  const { lineItemsByFulfillmentOrder, fulfilled } = plan;
   if (lineItemsByFulfillmentOrder.length === 0) {
     return { id: null, skipped: true, reason: "Nothing left to fulfil for these items.", fulfilled: {} };
   }

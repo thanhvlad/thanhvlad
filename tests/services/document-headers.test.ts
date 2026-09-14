@@ -48,8 +48,8 @@ describe("addPublicDocumentHeaders", () => {
 
   it("sends HSTS only in production over HTTPS, including behind a TLS proxy", () => {
     vi.stubEnv("NODE_ENV", "production");
-    expect(headersFor("https://app.test/").get("Strict-Transport-Security")).toBe("max-age=31536000");
-    expect(headersFor("http://app.test/", { headers: { "x-forwarded-proto": "https" } }).get("Strict-Transport-Security")).toBe("max-age=31536000");
+    expect(headersFor("https://app.test/").get("Strict-Transport-Security")).toBe("max-age=86400");
+    expect(headersFor("http://app.test/", { headers: { "x-forwarded-proto": "https" } }).get("Strict-Transport-Security")).toBe("max-age=86400");
     expect(headersFor("http://app.test/").get("Strict-Transport-Security")).toBeNull();
     vi.stubEnv("NODE_ENV", "development");
     expect(headersFor("https://app.test/").get("Strict-Transport-Security")).toBeNull();

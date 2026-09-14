@@ -17,8 +17,10 @@ import {
   gqlInternals,
   gqlResult,
   hasIdempotencyKey,
+  isMissingScopeError,
   isMutation,
   operationIdempotencyKey,
+  redactionAccepted,
   throttleWaitMs,
   type GraphqlClient,
 } from "~/services/shopify/graphql.server";
@@ -249,15 +251,72 @@ describe("protected customer data", () => {
       ],
     });
 
-  it("keeps the data Shopify did return and reports what it withheld", async () => {
+  it("keeps the data Shopify did return and reports what it withheld, when the caller opts in", async () => {
     const { client, calls } = scripted([() => Promise.reject(redacted())]);
-    const result = await gqlResult<{ order: { name: string } }>(client, QUERY);
+    const result = await gqlResult<{ order: { name: string } }>(client, QUERY, undefined, { allowRedacted: true });
     expect(result.data.order.name).toBe("#1001");
     expect(result.deniedPaths).toEqual([
       ["order", "shippingAddress"],
       ["order", "phone"],
     ]);
     expect(calls).toHaveLength(1);
+  });
+
+  it("throws SHOPIFY_ACCESS_DENIED without the opt-in, so a denied field never reads as null", async () => {
+    const { client } = scripted([() => Promise.reject(redacted())]);
+    const error = await gqlResult(client, QUERY).catch((e) => e);
+    expect(error).toBeInstanceOf(AppError);
+    expect((error as AppError).code).toBe("SHOPIFY_ACCESS_DENIED");
+  });
+
+  it("keeps gql strict even when a caller passes the opt-in through", async () => {
+    const { client } = scripted([() => Promise.reject(redacted())]);
+    const options = { allowRedacted: true } as unknown as Parameters<typeof gql>[3];
+    const error = await gql(client, QUERY, undefined, options).catch((e) => e);
+    expect((error as AppError).code).toBe("SHOPIFY_ACCESS_DENIED");
+  });
+
+  it("throws on a denial returned in the body as well as a thrown one", async () => {
+    const { client } = scripted([
+      () =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: { product: null },
+              errors: [{ message: "Access denied for product field.", path: ["product"], extensions: { code: "ACCESS_DENIED" } }],
+            }),
+          ),
+        ),
+    ]);
+    const error = await gql(client, QUERY).catch((e) => e);
+    expect((error as AppError).code).toBe("SHOPIFY_ACCESS_DENIED");
+  });
+
+  it("never accepts a missing access scope as redaction, even with the opt-in", async () => {
+    const scope = new FakeGraphqlQueryError({
+      data: { order: { name: "#1001", customer: null } },
+      errors: [
+        {
+          message: "Access denied for customer field. Required access: `read_customers` access scope.",
+          path: ["order", "customer"],
+          extensions: { code: "ACCESS_DENIED" },
+        },
+      ],
+    });
+    const { client } = scripted([() => Promise.reject(scope)]);
+    const error = await gqlResult(client, QUERY, undefined, { allowRedacted: true }).catch((e) => e);
+    expect((error as AppError).code).toBe("SHOPIFY_ACCESS_DENIED");
+  });
+
+  it("accepts only the paths a narrowing predicate allows", async () => {
+    const onlyShipping = (path: Array<string | number>) => path[1] === "shippingAddress";
+    const { client } = scripted([() => Promise.reject(redacted())]);
+    const error = await gqlResult(client, QUERY, undefined, { allowRedacted: onlyShipping }).catch((e) => e);
+    expect((error as AppError).code).toBe("SHOPIFY_ACCESS_DENIED");
+    expect(redactionAccepted([{ message: "not approved to access", path: ["order", "shippingAddress"] }], onlyShipping)).toBe(true);
+    expect(redactionAccepted([{ message: "not approved to access" }], onlyShipping)).toBe(false);
+    expect(isMissingScopeError({ message: "Required access: `read_orders` access scope." })).toBe(true);
+    expect(isMissingScopeError({ message: "This app is not approved to access the Order object." })).toBe(false);
   });
 
   it("still throws when a denial comes with another kind of error", async () => {
