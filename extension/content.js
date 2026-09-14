@@ -112,15 +112,27 @@ function build() {
 
 const READ_REQUEST = "dropshiphub:read";
 const READ_RESPONSE = "dropshiphub:product";
+const READ_ACK = "dropshiphub:reading";
 
-/** Ask the main-world reader for this page's product. null when it cannot. */
-function requestProduct(timeoutMs = 2000) {
+/**
+ * Ask the main-world reader for this page's product. null when it cannot.
+ *
+ * Two clocks. The reader acknowledges at once, and until it does only
+ * `ackTimeoutMs` is allowed: no acknowledgement means page-reader.js never
+ * loaded, and the button should fall back to sending the link without making
+ * the merchant wait. Once acknowledged, the reader is fetching the product's
+ * description over the network, which it bounds at four seconds itself, so the
+ * longer `readTimeoutMs` only guards against it never answering at all.
+ */
+function requestProduct(ackTimeoutMs = 2000, readTimeoutMs = 8000) {
   return new Promise((resolve) => {
     let settled = false;
+    let timer = null;
     const finish = (value) => {
       if (settled) return;
       settled = true;
       window.removeEventListener(READ_RESPONSE, onResult);
+      window.removeEventListener(READ_ACK, onAck);
       clearTimeout(timer);
       resolve(value);
     };
@@ -133,10 +145,13 @@ function requestProduct(timeoutMs = 2000) {
         finish(null);
       }
     };
-    // No reader present (page-reader.js failed to inject) means no answer ever
-    // arrives, so the timeout is what keeps the button from hanging.
-    const timer = setTimeout(() => finish(null), timeoutMs);
+    const onAck = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => finish(null), readTimeoutMs);
+    };
+    timer = setTimeout(() => finish(null), ackTimeoutMs);
     window.addEventListener(READ_RESPONSE, onResult);
+    window.addEventListener(READ_ACK, onAck);
     window.dispatchEvent(new CustomEvent(READ_REQUEST));
   });
 }
@@ -162,6 +177,7 @@ async function send(button, msg) {
     return;
   }
   const endpoint = `${base}${ENDPOINT}`;
+  msg.textContent = "Reading this page…";
   const captured = await requestProduct();
   msg.textContent = captured ? "Sending this page's product…" : "Could not read this page; sending the link…";
 

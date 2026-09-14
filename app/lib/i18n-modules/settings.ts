@@ -17,6 +17,12 @@ export const en = {
   "settings.general.saveFailed": "Settings were not saved",
   "settings.general.products.defaultTags.help": "Comma-separated.",
   "settings.general.currency.supplierCurrency.help": "Three-letter code, e.g. USD or CNY.",
+  "settings.products.defaultWeight.label": "Default shipping weight per variant",
+  "settings.products.defaultWeight.suffix": "g",
+  "settings.products.defaultWeight.help": "Given to imported variants whose supplier states no weight. AliExpress pages never do, and Shopify's weight-based shipping rates treat a missing weight as 0. Enter 0 to leave variants without a weight.",
+  "settings.notifications.email.help": "Leave empty to keep notifications in the app only.",
+  "settings.notifications.emailOff.title": "Email notifications are not available yet",
+  "settings.notifications.emailOff.body": "The app cannot send email at the moment, so every notification appears on the Notifications page instead. The email address and daily digest become available here once email delivery is switched on.",
 
   // ---- Fulfilment service ---------------------------------------------------
   "settings.fulfillmentService.requests.emptyBody": "Once the service is registered and products are routed, every Request fulfillment pressed in Shopify shows up here.",
@@ -137,6 +143,12 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   "settings.general.saveFailed": "Chưa lưu được cài đặt",
   "settings.general.products.defaultTags.help": "Cách nhau bằng dấu phẩy.",
   "settings.general.currency.supplierCurrency.help": "Mã 3 chữ, ví dụ USD hoặc CNY.",
+  "settings.products.defaultWeight.label": "Cân nặng giao hàng mặc định mỗi biến thể",
+  "settings.products.defaultWeight.suffix": "g",
+  "settings.products.defaultWeight.help": "Áp cho biến thể nhập về mà nhà cung cấp không ghi cân nặng. Trang AliExpress không bao giờ ghi, và phí vận chuyển theo cân nặng của Shopify sẽ tính thiếu cân nặng là 0. Nhập 0 nếu muốn để trống.",
+  "settings.notifications.email.help": "Để trống nếu chỉ muốn nhận thông báo trong ứng dụng.",
+  "settings.notifications.emailOff.title": "Chưa gửi được thông báo qua email",
+  "settings.notifications.emailOff.body": "Hiện ứng dụng chưa gửi được email, nên mọi thông báo đều hiện ở trang Thông báo. Ô email và bản tin hằng ngày sẽ dùng được ở đây khi tính năng gửi email được bật.",
 
   // ---- Fulfilment service ---------------------------------------------------
   "settings.fulfillmentService.requests.emptyBody": "Sau khi đăng ký dịch vụ và chuyển sản phẩm về ứng dụng, mỗi lần bấm Request fulfillment trong Shopify sẽ hiện ở đây.",

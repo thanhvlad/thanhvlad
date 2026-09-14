@@ -30,29 +30,21 @@
   color: #6d7175;
 }
 
-.form {
+.actions {
   display: flex;
-  gap: 0.75rem;
-  align-items: flex-end;
-  margin-bottom: 2rem;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.25rem;
+  align-items: center;
+  margin: 0 0 2rem;
 }
 
-.label {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-  flex: 1;
-  font-size: 0.875rem;
-}
-
-.input {
-  padding: 0.6rem 0.75rem;
-  border: 1px solid #c9cccf;
-  border-radius: 8px;
-  font-size: 1rem;
+.actions a:not(.button) {
+  color: #005bd3;
 }
 
 .button {
+  display: inline-block;
+  text-decoration: none;
   padding: 0.65rem 1.25rem;
   border: none;
   border-radius: 8px;
@@ -74,6 +66,12 @@
 
 .list li + li {
   margin-top: 0.5rem;
+}
+
+.footer {
+  margin: 2rem 0 0;
+  font-size: 0.9rem;
+  color: #6d7175;
 }
 
 .prose {

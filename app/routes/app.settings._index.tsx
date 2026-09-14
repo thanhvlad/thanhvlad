@@ -9,11 +9,15 @@ import { actionFailure } from "~/lib/errors";
 import { SUPPORTED_LOCALES, localeCoverage } from "~/lib/i18n";
 import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
 import { requireFeature } from "~/services/billing.server";
+import { emailConfigured } from "~/services/email.server";
 import { updateShopSettings } from "~/services/shop.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
-  return { settings: shop.parsedSettings, currency: shop.currency, country: shop.country };
+  // Production can run with no email provider at all. The email field and the
+  // digest used to stay editable anyway, so a merchant turned on a daily email
+  // that was silently dropped; they are only offered when mail can go out.
+  return { settings: shop.parsedSettings, currency: shop.currency, country: shop.country, emailDelivery: emailConfigured() };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -35,7 +39,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function GeneralSettings() {
-  const { settings, currency } = useLoaderData<typeof loader>();
+  const { settings, currency, emailDelivery } = useLoaderData<typeof loader>();
   const t = useT();
   const fetcher = useFetcher<typeof action>();
   const result = fetcher.data as { ok?: boolean; message?: string; error?: string } | undefined;
@@ -128,6 +132,16 @@ export default function GeneralSettings() {
             </FormLayout.Group>
             <Checkbox label={t("settings.products.publishOnPush.label")} checked={s.products.publishOnPush} onChange={(v) => set("products", { publishOnPush: v })} />
             <Checkbox label={t("settings.products.trackInventory.label")} checked={s.products.trackInventory} onChange={(v) => set("products", { trackInventory: v })} />
+            <TextField
+              label={t("settings.products.defaultWeight.label")}
+              type="number"
+              min={0}
+              value={String(s.products.defaultWeightGrams)}
+              onChange={(v) => set("products", { defaultWeightGrams: Math.max(0, Number(v) || 0) })}
+              autoComplete="off"
+              suffix={t("settings.products.defaultWeight.suffix")}
+              helpText={t("settings.products.defaultWeight.help")}
+            />
             <FormLayout.Group>
               <TextField label={t("settings.products.initialInventory.label")} type="number" min={0} value={String(s.products.initialInventory)} onChange={(v) => set("products", { initialInventory: Number(v) })} autoComplete="off" />
               <TextField label={t("settings.products.maxImages.label")} type="number" min={1} value={String(s.products.maxImages)} onChange={(v) => set("products", { maxImages: Number(v) })} autoComplete="off" />
@@ -158,13 +172,26 @@ export default function GeneralSettings() {
       <Layout.AnnotatedSection title={t("settings.notifications.title")} description={t("settings.notifications.description")}>
         <Card>
           <FormLayout>
-            <TextField label={t("settings.notifications.email.label")} type="email" value={s.notifications.email} onChange={(v) => set("notifications", { email: v })} autoComplete="off" helpText={t("settings.notifications.email.help")} />
+            {!emailDelivery && (
+              <Banner tone="info" title={t("settings.notifications.emailOff.title")}>
+                <p>{t("settings.notifications.emailOff.body")}</p>
+              </Banner>
+            )}
+            <TextField
+              label={t("settings.notifications.email.label")}
+              type="email"
+              value={s.notifications.email}
+              onChange={(v) => set("notifications", { email: v })}
+              autoComplete="off"
+              disabled={!emailDelivery}
+              helpText={emailDelivery ? t("settings.notifications.email.help") : undefined}
+            />
             <Checkbox label={t("settings.notifications.onOrderFailed.label")} checked={s.notifications.onOrderFailed} onChange={(v) => set("notifications", { onOrderFailed: v })} />
             <Checkbox label={t("settings.notifications.onPriceChange.label")} checked={s.notifications.onPriceChange} onChange={(v) => set("notifications", { onPriceChange: v })} />
             <Checkbox label={t("settings.notifications.onOutOfStock.label")} checked={s.notifications.onOutOfStock} onChange={(v) => set("notifications", { onOutOfStock: v })} />
             <Checkbox label={t("settings.notifications.onProductRemoved.label")} checked={s.notifications.onProductRemoved} onChange={(v) => set("notifications", { onProductRemoved: v })} />
             <Checkbox label={t("settings.notifications.onTrackingSynced.label")} checked={s.notifications.onTrackingSynced} onChange={(v) => set("notifications", { onTrackingSynced: v })} />
-            <Checkbox label={t("settings.notifications.digest.label")} checked={s.notifications.digest} onChange={(v) => set("notifications", { digest: v })} />
+            <Checkbox label={t("settings.notifications.digest.label")} checked={emailDelivery && s.notifications.digest} onChange={(v) => set("notifications", { digest: v })} disabled={!emailDelivery} />
           </FormLayout>
         </Card>
       </Layout.AnnotatedSection>

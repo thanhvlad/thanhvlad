@@ -8,7 +8,7 @@ import { logger } from "~/lib/logger.server";
 import { logActivity } from "./activity.server";
 import { aiLandingAvailable, rewriteLandingPage, rewriteWasNotBilled, type RewriteInput } from "./ai-landing.server";
 import { currentPlan } from "./billing.server";
-import { getImportedProduct } from "./import.server";
+import { cleanDescription, getImportedProduct } from "./import.server";
 import type { ShopWithSettings } from "./shop.server";
 import { gql, offlineClient } from "./shopify/graphql.server";
 
@@ -243,7 +243,7 @@ export async function rewriteImportedProduct(
     where: { id: product.id },
     data: {
       title: result.title.slice(0, 255),
-      description: result.descriptionHtml,
+      description: cleanDescription(result.descriptionHtml, false),
       tags: result.tags,
       images,
       pushError: null,

@@ -339,7 +339,17 @@ export default function ImportEditPage() {
                     {t("import.preview")}
                   </Text>
                   <Box borderColor="border" borderWidth="025" borderRadius="200" padding="300">
-                    <div dangerouslySetInnerHTML={{ __html: form.description }} />
+                    {/*
+                      A sandboxed frame, not dangerouslySetInnerHTML. The preview
+                      shows the textarea as typed, before the server sanitizes it,
+                      and a description once ran `<img onerror>` straight in the
+                      app's origin, where script can ask App Bridge for a session
+                      token. With an empty sandbox (no allow-scripts, no
+                      allow-same-origin) the frame is a unique origin that runs no
+                      script, submits no form and navigates nothing, whatever the
+                      HTML says.
+                    */}
+                    <iframe title={t("import.preview")} sandbox="" srcDoc={previewDocument(form.description)} width="100%" height="480" frameBorder="0" loading="lazy" />
                   </Box>
                 </BlockStack>
               </BlockStack>
@@ -639,6 +649,20 @@ export default function ImportEditPage() {
         </Modal.Section>
       </Modal>
     </Page>
+  );
+}
+
+/**
+ * The description wrapped as a document of its own for the preview frame. The
+ * CSP is a second wall behind the sandbox: nothing but images and inline styles
+ * may load, so even a browser that mishandled the sandbox would fetch no script.
+ */
+function previewDocument(html: string) {
+  return (
+    `<!doctype html><html><head><meta charset="utf-8">` +
+    `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: http:; style-src 'unsafe-inline'; form-action 'none'">` +
+    `<style>body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#303030}img{max-width:100%;height:auto}table{border-collapse:collapse}td,th{border:1px solid #e3e3e3;padding:4px 8px;text-align:left}</style>` +
+    `</head><body>${html}</body></html>`
   );
 }
 

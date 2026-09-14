@@ -1,10 +1,14 @@
+import { useEffect } from "react";
 import type { HeadersFunction, LoaderFunctionArgs } from "@remix-run/node";
-import { Link, Outlet, useLoaderData, useRouteError } from "@remix-run/react";
+import { Link, Outlet, useLoaderData, useNavigation, useRouteError, useRouteLoaderData } from "@remix-run/react";
 import { boundary } from "@shopify/shopify-app-remix/server";
 import { AppProvider } from "@shopify/shopify-app-remix/react";
-import { NavMenu } from "@shopify/app-bridge-react";
-import { Banner, Box } from "@shopify/polaris";
+import { NavMenu, type useAppBridge } from "@shopify/app-bridge-react";
+import { AppProvider as PolarisAppProvider, Banner, Box } from "@shopify/polaris";
+import polarisTranslations from "@shopify/polaris/locales/en.json";
 import polarisStyles from "@shopify/polaris/build/esm/styles.css?url";
+import { ErrorScreen } from "~/components/ErrorScreen";
+import { isShopifyAuthResponse } from "~/components/route-error";
 import { requireShop } from "~/lib/auth.server";
 import { env } from "~/lib/env.server";
 import { mergeShopSettings } from "~/domain/settings/shop-settings";
@@ -45,48 +49,113 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   };
 };
 
+type LayoutData = Awaited<ReturnType<typeof loader>>;
+
 export default function App() {
-  const { apiKey, unread, unpaid, locale, role } = useLoaderData<typeof loader>();
-  const t = makeT(locale);
+  const data = useLoaderData<typeof loader>();
 
   return (
-    <AppProvider isEmbeddedApp apiKey={apiKey}>
-      <NavMenu>
-        <Link to="/app" rel="home">
-          {t("nav.home")}
-        </Link>
-        <Link to="/app/search">{t("nav.search")}</Link>
-        <Link to="/app/import">{t("nav.import")}</Link>
-        <Link to="/app/products">{t("nav.products")}</Link>
-        <Link to="/app/orders">{t("nav.orders")}</Link>
-        <Link to="/app/payments">{unpaid > 0 ? `${t("nav.payments")} (${unpaid})` : t("nav.payments")}</Link>
-        <Link to="/app/tracking">{t("nav.tracking")}</Link>
-        <Link to="/app/suppliers">{t("nav.suppliers")}</Link>
-        <Link to="/app/pricing">{t("nav.pricing")}</Link>
-        <Link to="/app/shipping">{t("nav.shipping")}</Link>
-        <Link to="/app/inventory">{t("nav.inventory")}</Link>
-        <Link to="/app/reports">{t("nav.reports")}</Link>
-        <Link to="/app/notifications">
-          {unread > 0 ? `${t("nav.notifications")} (${unread})` : t("nav.notifications")}
-        </Link>
-        <Link to="/app/logs">{t("nav.logs")}</Link>
-        <Link to="/app/settings">{t("nav.settings")}</Link>
-      </NavMenu>
-      {role === "READ_ONLY" && (
-        <Box padding="400" paddingBlockEnd="0">
-          <Banner tone="info" title={t("access.readOnly.title")}>
-            <p>{t("access.readOnly.body")}</p>
-          </Banner>
-        </Box>
-      )}
+    <AppProvider isEmbeddedApp apiKey={data.apiKey}>
+      <AppNavigation data={data} />
+      <NavigationLoading />
+      {data.role === "READ_ONLY" && <ReadOnlyBanner locale={data.locale} />}
       <Outlet />
     </AppProvider>
   );
 }
 
-// Shopify needs Remix to catch some thrown responses, so that their headers are included in the response.
+function AppNavigation({ data }: { data: Pick<LayoutData, "locale" | "unread" | "unpaid"> }) {
+  const t = makeT(data.locale);
+  return (
+    <NavMenu>
+      <Link to="/app" rel="home">
+        {t("nav.home")}
+      </Link>
+      <Link to="/app/search">{t("nav.search")}</Link>
+      <Link to="/app/import">{t("nav.import")}</Link>
+      <Link to="/app/products">{t("nav.products")}</Link>
+      <Link to="/app/orders">{t("nav.orders")}</Link>
+      <Link to="/app/payments">{data.unpaid > 0 ? `${t("nav.payments")} (${data.unpaid})` : t("nav.payments")}</Link>
+      <Link to="/app/tracking">{t("nav.tracking")}</Link>
+      <Link to="/app/suppliers">{t("nav.suppliers")}</Link>
+      <Link to="/app/pricing">{t("nav.pricing")}</Link>
+      <Link to="/app/shipping">{t("nav.shipping")}</Link>
+      <Link to="/app/inventory">{t("nav.inventory")}</Link>
+      <Link to="/app/reports">{t("nav.reports")}</Link>
+      <Link to="/app/notifications">{data.unread > 0 ? `${t("nav.notifications")} (${data.unread})` : t("nav.notifications")}</Link>
+      <Link to="/app/logs">{t("nav.logs")}</Link>
+      <Link to="/app/settings">{t("nav.settings")}</Link>
+    </NavMenu>
+  );
+}
+
+function ReadOnlyBanner({ locale }: { locale: Locale }) {
+  const t = makeT(locale);
+  return (
+    <Box padding="400" paddingBlockEnd="0">
+      <Banner tone="info" title={t("access.readOnly.title")}>
+        <p>{t("access.readOnly.body")}</p>
+      </Banner>
+    </Box>
+  );
+}
+
+/**
+ * The admin's own loading bar while a page change is in flight.
+ *
+ * Every link in the navigation waits on `authenticate.admin` plus several
+ * queries before anything on screen changes, and nothing said the click had
+ * been heard, so merchants clicked again. App Bridge draws the bar in the admin
+ * header, which is where a merchant already looks for it.
+ *
+ * The global is read inside the effect rather than through `useAppBridge()`,
+ * which throws during render when the script has not attached yet: a missing
+ * progress bar must never be the reason the whole app shows an error.
+ */
+function NavigationLoading() {
+  const busy = useNavigation().state !== "idle";
+  useEffect(() => {
+    const shopify = (window as unknown as { shopify?: ReturnType<typeof useAppBridge> }).shopify;
+    try {
+      shopify?.loading(busy);
+    } catch {
+      // Older App Bridge builds without the loading API: nothing to show.
+    }
+  }, [busy]);
+  return null;
+}
+
+/**
+ * Errors from this layout's loader or from any page under it.
+ *
+ * Shopify's own auth responses still go through `boundary.error`, which renders
+ * the App Bridge bounce page that finishes signing the merchant in. Everything
+ * else used to go there too, and came out as unstyled text in place of the whole
+ * app. It now renders the Polaris error screen — inside the app frame with its
+ * navigation when the layout itself loaded, so the merchant can simply click
+ * somewhere else.
+ */
 export function ErrorBoundary() {
-  return boundary.error(useRouteError());
+  const error = useRouteError();
+  const data = useRouteLoaderData<typeof loader>("routes/app");
+
+  if (isShopifyAuthResponse(error)) return boundary.error(error);
+
+  if (data) {
+    return (
+      <AppProvider isEmbeddedApp apiKey={data.apiKey}>
+        <AppNavigation data={data} />
+        <ErrorScreen error={error} />
+      </AppProvider>
+    );
+  }
+  // The layout's own loader failed, so there is no API key or locale to build
+  // the app frame from. Polaris alone still gives a readable page.
+  return (
+    <PolarisAppProvider i18n={polarisTranslations}>
+      <ErrorScreen error={error} />
+    </PolarisAppProvider>
+  );
 }
 
 export const headers: HeadersFunction = (headersArgs) => {

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { sanitizeDescriptionHtml } from "~/lib/sanitize-html.server";
 import type { SupplierPlatform, SupplierProductDetail } from "./types";
 
 /**
@@ -50,7 +51,17 @@ export const CapturedVariant = z.object({
 export const CapturedProduct = z.object({
   externalId: z.string().trim().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/, "unexpected characters"),
   title: z.string().trim().min(1).max(500),
-  descriptionHtml: z.string().max(200_000).default(""),
+  // The description is the one field whose size the extension does not control:
+  // it is AliExpress's own description document. Rejecting an oversized one
+  // threw away the whole capture — title, images and variants — over a field
+  // the merchant can rewrite anyway, so it is clipped instead (the sanitizer
+  // closes whatever the cut leaves open). The outer bound still refuses a
+  // payload that is plainly not a product description.
+  descriptionHtml: z
+    .string()
+    .max(1_000_000)
+    .default("")
+    .transform((html) => html.slice(0, 200_000)),
   url: httpUrl,
   images: z.array(httpUrl).max(30).default([]),
   currency: z.string().trim().length(3).regex(/^[A-Za-z]{3}$/),
@@ -82,7 +93,10 @@ export function capturedToDetail(
     externalId,
     platform,
     title: input.title,
-    descriptionHtml: input.descriptionHtml,
+    // The extension fetches the supplier's own description document and builds
+    // a specification table from the page model. Both are shaped by scripts on
+    // aliexpress.com, so they are allowlist-sanitized before anything keeps them.
+    descriptionHtml: sanitizeDescriptionHtml(input.descriptionHtml),
     url: input.url,
     images: dedupe(input.images),
     currency,
