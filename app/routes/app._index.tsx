@@ -91,13 +91,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   return { ok: false };
 };
 
+/**
+ * Where a merchant goes to bring a product in. Products arrive through the
+ * Chrome extension on AliExpress and land in the import list; /app/search is a
+ * catalogue that, with no supplier API configured, only shows demo items, so
+ * sending a new store there taught it a way of importing that does not work.
+ */
+const IMPORT_PATH = "/app/import";
+
 /** The onboarding steps, in the order a new store should take them. */
 const ONBOARDING_STEPS = [
   { key: "supplier", to: "/app/suppliers" },
   { key: "pricing", to: "/app/pricing" },
   { key: "shipping", to: "/app/shipping" },
   { key: "fulfillmentService", to: "/app/settings/fulfillment" },
-  { key: "product", to: "/app/search" },
+  { key: "product", to: IMPORT_PATH },
   { key: "order", to: "/app/orders" },
 ] as const;
 
@@ -143,7 +151,7 @@ export default function Dashboard() {
     <Page
       title={`${t("page.dashboard.title")}, ${shop.name}`}
       subtitle={t("dashboard.subtitle")}
-      primaryAction={{ content: t("nav.search"), url: "/app/search" }}
+      primaryAction={{ content: t("dashboard.quick.findImport"), url: IMPORT_PATH }}
       actionGroups={[
         {
           title: t("dashboard.actions.sync"),
@@ -357,7 +365,7 @@ export default function Dashboard() {
                   {
                     content: t("dashboard.quick.findImport"),
                     helpText: t("dashboard.quick.findImport.hint"),
-                    url: "/app/search",
+                    url: IMPORT_PATH,
                   },
                   {
                     content: t("dashboard.quick.reviewImportList"),

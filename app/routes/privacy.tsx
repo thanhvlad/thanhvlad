@@ -2,6 +2,7 @@ import type { MetaFunction } from "@remix-run/node";
 import { useLoaderData } from "@remix-run/react";
 import { LanguageDivider, PublicPage, Section } from "~/components/PublicPage";
 import { env } from "~/lib/env.server";
+import { aiEndpointStatus } from "~/services/ai-landing.server";
 import {
   CLOSED_ORDER_PII_DAYS,
   EXPORT_RETENTION_DAYS,
@@ -13,41 +14,63 @@ import {
 export const meta: MetaFunction = () => [{ title: "Privacy policy · DropshipHub" }];
 
 /**
- * The retention periods come from the code that enforces them, so the page
- * cannot promise one number while the job applies another.
+ * A host name fit to print on a public page. aiEndpointStatus falls back to the
+ * raw ANTHROPIC_BASE_URL when it does not parse as a URL, and that raw value is
+ * operator configuration that could carry anything, so only a plain host (with
+ * an optional port) is shown. Exported for tests.
  */
-export const loader = async () => ({
-  supportEmail: env().SUPPORT_EMAIL ?? null,
-  updated: "2026-09-14",
-  days: {
-    uninstalled: RETENTION_DAYS,
-    closedOrder: CLOSED_ORDER_PII_DAYS,
-    anyOrder: STALE_ORDER_PII_DAYS,
-    export: EXPORT_RETENTION_DAYS,
-    webhook: WEBHOOK_EVENT_RETENTION_DAYS,
-  },
-});
+export function publicEndpointHost(host: string): string | null {
+  return /^[a-z0-9.-]+(:\d{1,5})?$/i.test(host) ? host.toLowerCase() : null;
+}
+
+/**
+ * The retention periods come from the code that enforces them, so the page
+ * cannot promise one number while the job applies another. The AI endpoint is
+ * read the same way: the SDK sends requests wherever ANTHROPIC_BASE_URL points,
+ * and the page names that host rather than assuming Anthropic's own.
+ */
+export const loader = async () => {
+  const ai = aiEndpointStatus();
+  return {
+    supportEmail: env().SUPPORT_EMAIL ?? null,
+    updated: "2026-09-14",
+    ai: { configured: ai.configured, direct: ai.direct, host: publicEndpointHost(ai.host) },
+    days: {
+      uninstalled: RETENTION_DAYS,
+      closedOrder: CLOSED_ORDER_PII_DAYS,
+      anyOrder: STALE_ORDER_PII_DAYS,
+      export: EXPORT_RETENTION_DAYS,
+      webhook: WEBHOOK_EVENT_RETENTION_DAYS,
+    },
+  };
+};
+
 
 /**
  * The privacy policy the App Store listing links to. It describes what the
  * app actually does with data, so it must change when the code does. The
  * previous version said customer data was never emailed while data-request
  * exports were mailed as JSON, and said Anthropic only saw variant option names
- * while landing-page rewrites sent whole product pages and images. Every
+ * while landing-page rewrites sent whole product pages and images. It then said
+ * the Chrome extension never touched customer data while the extension's order
+ * list carries every recipient's address. Every
  * statement below was checked against the code on the date above; the list of
  * recipients is the complete set of places data leaves the app.
  */
 export default function PrivacyPage() {
-  const { supportEmail, updated, days } = useLoaderData<typeof loader>();
+  const { supportEmail, updated, days, ai } = useLoaderData<typeof loader>();
+  const endpoint = ai.host ? <code>{ai.host}</code> : null;
   const contact = supportEmail ? <a href={`mailto:${supportEmail}`}>{supportEmail}</a> : <span>the support address in the app listing</span>;
   const lienHe = supportEmail ? <a href={`mailto:${supportEmail}`}>{supportEmail}</a> : <span>địa chỉ hỗ trợ trong trang ứng dụng</span>;
   return (
     <PublicPage title="Privacy policy" subtitle={`Last updated ${updated}. Tiếng Việt ở phía dưới.`}>
       <Section heading="Who we are">
         <p>
-          DropshipHub is a Shopify app that helps merchants import products from suppliers such as AliExpress and CJ Dropshipping, place supplier orders
-          for their Shopify orders and sync tracking back to Shopify. The merchant who installs the app decides why customer data is processed; the app
-          processes it on the merchant's behalf. This policy explains what the app stores, why, who receives it and for how long.
+          DropshipHub is a Shopify app that helps merchants import products from suppliers such as AliExpress and CJ Dropshipping, order those products
+          for their Shopify orders and sync tracking back to Shopify. For AliExpress, the Chrome extension lists the orders waiting to be placed and opens
+          each product on AliExpress. The merchant places and pays for the order there, then records the AliExpress order number in the extension;
+          tracking added there is sent to Shopify. The merchant who installs the app decides why customer data is processed; the app processes it on the
+          merchant's behalf. This policy explains what the app stores, why, who receives it and for how long.
         </p>
       </Section>
 
@@ -68,8 +91,8 @@ export default function PrivacyPage() {
             example CPF in Brazil or RUT in Chile). Orders with no such product keep no name, email, phone or street address.
           </li>
           <li>
-            <strong>Supplier orders</strong>: what was ordered from which supplier, costs, status, tracking numbers, and error messages the supplier
-            returned.
+            <strong>Supplier orders</strong>: what was ordered from which supplier, costs, status, supplier order numbers, tracking numbers and carriers,
+            and error messages the supplier returned.
           </li>
           <li>
             <strong>Products</strong>: products the merchant imports or links, their variants, prices, stock, descriptions and image links.
@@ -78,8 +101,11 @@ export default function PrivacyPage() {
             <strong>Supplier accounts</strong>: the token or API key for any supplier account the merchant connects, encrypted at rest.
           </li>
           <li>
-            <strong>Browser extension</strong>: the optional DropshipHub Chrome extension sends the product page the merchant is viewing on AliExpress or
-            CJ Dropshipping to the app, authenticated with a per-store API token. It reads product pages only; it does not read or send customer data.
+            <strong>Browser extension</strong>: the optional DropshipHub Chrome extension talks to the app with a per-store API token. It sends the
+            product page the merchant is viewing on AliExpress or CJ Dropshipping to the app. It also shows the merchant the orders waiting to be placed,
+            which includes each recipient's name, phone, shipping address and, where required, customs identifier, so the merchant can enter them on
+            AliExpress; the app sends that list only to the extension, with caching disabled, and web pages cannot read it. What the merchant records in the
+            extension - AliExpress order numbers, the order total, tracking numbers and carriers - is sent back to the app.
           </li>
           <li>
             <strong>Webhooks and notifications</strong>: copies of the webhooks Shopify sends the app (order webhooks contain customer details), and the
@@ -101,17 +127,28 @@ export default function PrivacyPage() {
         <ul>
           <li>
             <strong>The supplier the merchant orders from</strong> (AliExpress or CJ Dropshipping) receives the recipient's name, shipping address,
-            phone and, where required, customs identifier for each supplier order placed through the app, because the supplier ships the parcel. The
-            supplier's own privacy policy applies to that data.
+            phone and, where required, customs identifier for each supplier order, because the supplier ships the parcel. On AliExpress the merchant
+            enters these details when placing the order on the AliExpress site. The supplier's own privacy policy applies to that data.
           </li>
           <li>
             <strong>Shopify</strong> receives products, inventory, fulfilments and tracking numbers through the Admin API.
           </li>
           <li>
-            <strong>Anthropic (Claude)</strong>, only when an AI feature is used and the operator has configured an AI key. For AI landing-page rewrites
-            it receives the supplier product's title, description, variant options, prices, stock, supplier store name and image links, plus up to two of the store's own previously
-            rewritten product pages as examples. For AI variant matching it receives product and supplier titles and variant option names. The request may
-            pass through an Anthropic-compatible API gateway configured by the operator. No order or customer data is sent.
+            <strong>Anthropic's Claude</strong>, only when a merchant uses an AI feature and the operator of DropshipHub has configured an AI key
+            {ai.configured ? "" : " (AI features are not enabled at the moment)"}. For an AI landing-page rewrite it receives the product's title and
+            description, its variant options and prices (with each variant's stock), the supplier store name, the store's name and public support
+            email, and up to 8 image URLs, plus up to two of the store's own earlier rewritten product pages as style examples. For AI variant matching
+            it receives the Shopify and supplier product titles, the variant option names and values, and the supplier SKUs' attributes and
+            availability. Requests go to Claude either directly or through the AI endpoint the operator of DropshipHub configured.{" "}
+            {endpoint ? (
+              <>
+                The endpoint currently configured is {endpoint}
+                {ai.direct ? ", Anthropic's own API." : ", an Anthropic-compatible gateway run by a third party, which receives the same data."}
+              </>
+            ) : (
+              "The endpoint currently configured is a custom address set by the operator."
+            )}{" "}
+            No order or customer data is sent.
           </li>
           <li>
             <strong>An email provider</strong> (Resend or an SMTP service), only when email is configured. It receives the address the merchant chose
@@ -133,7 +170,10 @@ export default function PrivacyPage() {
             items and country - stays for the merchant's reports while the app is installed. The merchant still has the full order in Shopify.
           </li>
           <li>When a supplier order's customer details are removed, the copy of the supplier's order response is removed with them.</li>
-          <li>Webhook payloads are reduced to their ids within two days of arriving, and the webhook records are deleted after {days.webhook} days.</li>
+          <li>
+            A webhook's contents are removed within a day of it being processed. An order or fulfilment webhook still waiting after a day is reduced to
+            its ids; a pending privacy request is kept until it has been handled. Every webhook record is deleted after {days.webhook} days.
+          </li>
           <li>An export prepared for a customer's data request is deleted {days.export} days after it was created.</li>
           <li>
             When a merchant uninstalls the app, Shopify asks the app to erase the store 48 hours later and the app deletes all of the store's data,
@@ -171,9 +211,11 @@ export default function PrivacyPage() {
 
       <Section heading="Chính sách quyền riêng tư">
         <p>
-          DropshipHub là ứng dụng Shopify giúp người bán nhập sản phẩm từ các nhà cung cấp như AliExpress và CJ Dropshipping, đặt đơn nhà cung cấp cho
-          đơn hàng Shopify và đồng bộ mã vận đơn về Shopify. Người bán cài ứng dụng là người quyết định mục đích xử lý dữ liệu khách hàng; ứng dụng xử lý
-          thay mặt người bán. Chính sách này nêu rõ ứng dụng lưu gì, vì sao, gửi cho ai và giữ trong bao lâu.
+          DropshipHub là ứng dụng Shopify giúp người bán nhập sản phẩm từ các nhà cung cấp như AliExpress và CJ Dropshipping, đặt mua các sản phẩm đó
+          cho đơn hàng Shopify và đồng bộ mã vận đơn về Shopify. Với AliExpress, tiện ích Chrome liệt kê các đơn đang chờ đặt và mở từng sản phẩm trên
+          AliExpress. Người bán tự đặt và thanh toán đơn ở đó, rồi ghi mã đơn AliExpress vào tiện ích; mã vận đơn nhập ở đó được gửi về Shopify. Người
+          bán cài ứng dụng là người quyết định mục đích xử lý dữ liệu khách hàng; ứng dụng xử lý thay mặt người bán. Chính sách này nêu rõ ứng dụng lưu
+          gì, vì sao, gửi cho ai và giữ trong bao lâu.
         </p>
       </Section>
 
@@ -194,7 +236,8 @@ export default function PrivacyPage() {
             phẩm như vậy không lưu tên, email, điện thoại hay địa chỉ.
           </li>
           <li>
-            <strong>Đơn nhà cung cấp</strong>: đặt món gì ở nhà cung cấp nào, chi phí, trạng thái, mã vận đơn và thông báo lỗi nhà cung cấp trả về.
+            <strong>Đơn nhà cung cấp</strong>: đặt món gì ở nhà cung cấp nào, chi phí, trạng thái, mã đơn bên nhà cung cấp, mã vận đơn và hãng vận
+            chuyển, cùng thông báo lỗi nhà cung cấp trả về.
           </li>
           <li>
             <strong>Sản phẩm</strong>: sản phẩm người bán nhập hoặc liên kết, biến thể, giá, tồn kho, mô tả và đường dẫn ảnh.
@@ -203,8 +246,11 @@ export default function PrivacyPage() {
             <strong>Tài khoản nhà cung cấp</strong>: token hoặc API key của tài khoản nhà cung cấp người bán kết nối, được mã hoá khi lưu.
           </li>
           <li>
-            <strong>Tiện ích trình duyệt</strong>: tiện ích Chrome DropshipHub (không bắt buộc) gửi trang sản phẩm người bán đang xem trên AliExpress hoặc
-            CJ Dropshipping về ứng dụng, xác thực bằng API token riêng của cửa hàng. Tiện ích chỉ đọc trang sản phẩm; không đọc hay gửi dữ liệu khách hàng.
+            <strong>Tiện ích trình duyệt</strong>: tiện ích Chrome DropshipHub (không bắt buộc) kết nối với ứng dụng bằng API token riêng của cửa hàng.
+            Tiện ích gửi trang sản phẩm người bán đang xem trên AliExpress hoặc CJ Dropshipping về ứng dụng. Tiện ích cũng hiển thị cho người bán các
+            đơn đang chờ đặt, gồm tên, điện thoại, địa chỉ giao hàng và, khi bắt buộc, mã số hải quan của người nhận, để người bán điền khi đặt trên
+            AliExpress; ứng dụng chỉ gửi danh sách này tới tiện ích, có tắt lưu đệm, và trang web khác không đọc được. Những gì người bán ghi trong tiện ích -
+            mã đơn AliExpress, tổng tiền đơn, mã vận đơn và hãng vận chuyển - được gửi về ứng dụng.
           </li>
           <li>
             <strong>Webhook và thông báo</strong>: bản sao các webhook Shopify gửi cho ứng dụng (webhook đơn hàng có thông tin khách) và các thông báo
@@ -226,17 +272,28 @@ export default function PrivacyPage() {
         <ul>
           <li>
             <strong>Nhà cung cấp người bán đặt hàng</strong> (AliExpress hoặc CJ Dropshipping) nhận tên, địa chỉ giao hàng, điện thoại và, khi bắt buộc,
-            mã hải quan của người nhận cho mỗi đơn nhà cung cấp đặt qua ứng dụng, vì nhà cung cấp là bên gửi hàng. Chính sách riêng tư của nhà cung cấp
-            áp dụng cho dữ liệu đó.
+            mã hải quan của người nhận cho mỗi đơn nhà cung cấp, vì nhà cung cấp là bên gửi hàng. Với AliExpress, người bán tự điền các thông tin này khi
+            đặt đơn trên trang AliExpress. Chính sách riêng tư của nhà cung cấp áp dụng cho dữ liệu đó.
           </li>
           <li>
             <strong>Shopify</strong> nhận sản phẩm, tồn kho, fulfillment và mã vận đơn qua Admin API.
           </li>
           <li>
-            <strong>Anthropic (Claude)</strong>, chỉ khi dùng tính năng AI và đơn vị vận hành đã cấu hình khoá AI. Khi viết lại trang sản phẩm bằng AI,
-            Anthropic nhận tiêu đề, mô tả, tuỳ chọn biến thể, giá, tồn kho, tên cửa hàng nhà cung cấp và đường dẫn ảnh của sản phẩm, cùng tối đa hai trang sản phẩm đã viết lại trước đó của
-            chính cửa hàng làm ví dụ. Khi ghép biến thể bằng AI, Anthropic nhận tiêu đề sản phẩm, tiêu đề bên nhà cung cấp và tên tuỳ chọn biến thể. Yêu
-            cầu có thể đi qua một cổng API tương thích Anthropic do đơn vị vận hành cấu hình. Không gửi dữ liệu đơn hàng hay khách hàng.
+            <strong>Claude của Anthropic</strong>, chỉ khi người bán dùng tính năng AI và đơn vị vận hành DropshipHub đã cấu hình khoá AI
+            {ai.configured ? "" : " (hiện tính năng AI chưa được bật)"}. Khi viết lại trang sản phẩm bằng AI, Claude nhận tiêu đề và mô tả sản phẩm, các
+            tuỳ chọn biến thể và giá (kèm tồn kho từng biến thể), tên cửa hàng nhà cung cấp, tên cửa hàng và email hỗ trợ công khai của cửa hàng, tối đa 8
+            đường dẫn ảnh, cùng tối đa hai trang sản phẩm đã viết lại trước đó của chính cửa hàng để làm mẫu văn phong. Khi ghép biến thể bằng AI, Claude
+            nhận tiêu đề sản phẩm bên Shopify và bên nhà cung cấp, tên và giá trị tuỳ chọn biến thể, cùng thuộc tính và tình trạng còn hàng của các SKU
+            nhà cung cấp. Yêu cầu được gửi tới Claude trực tiếp hoặc qua địa chỉ AI do đơn vị vận hành DropshipHub cấu hình.{" "}
+            {endpoint ? (
+              <>
+                Địa chỉ đang được cấu hình là {endpoint}
+                {ai.direct ? ", tức API của chính Anthropic." : ", một cổng tương thích Anthropic do bên thứ ba vận hành và cũng nhận đúng dữ liệu này."}
+              </>
+            ) : (
+              "Địa chỉ đang được cấu hình là một địa chỉ riêng do đơn vị vận hành đặt."
+            )}{" "}
+            Không gửi dữ liệu đơn hàng hay khách hàng.
           </li>
           <li>
             <strong>Dịch vụ gửi email</strong> (Resend hoặc dịch vụ SMTP), chỉ khi email được cấu hình. Dịch vụ nhận địa chỉ người bán chọn và nội dung
@@ -257,7 +314,10 @@ export default function PrivacyPage() {
             cáo của người bán khi ứng dụng còn được cài. Người bán vẫn có đầy đủ đơn trong Shopify.
           </li>
           <li>Khi thông tin khách trên một đơn nhà cung cấp bị xoá, bản sao phản hồi đơn hàng của nhà cung cấp cũng bị xoá theo.</li>
-          <li>Nội dung webhook được rút gọn chỉ còn mã định danh trong vòng hai ngày, và bản ghi webhook bị xoá sau {days.webhook} ngày.</li>
+          <li>
+            Nội dung webhook bị xoá trong vòng một ngày sau khi xử lý xong. Webhook đơn hàng hoặc giao hàng còn chờ sau một ngày được rút gọn chỉ còn mã
+            định danh; yêu cầu quyền riêng tư đang chờ được giữ nguyên cho tới khi xử lý xong. Mọi bản ghi webhook bị xoá sau {days.webhook} ngày.
+          </li>
           <li>Bản xuất dữ liệu chuẩn bị cho yêu cầu của khách bị xoá {days.export} ngày sau khi tạo.</li>
           <li>
             Khi người bán gỡ ứng dụng, 48 giờ sau Shopify yêu cầu ứng dụng xoá cửa hàng và ứng dụng xoá toàn bộ dữ liệu của cửa hàng, gồm cả access token

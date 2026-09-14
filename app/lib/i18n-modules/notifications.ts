@@ -45,6 +45,7 @@ export const en = {
   "notifications.done.readMany": "{n} notification(s) marked as read.",
   "notifications.done.archiveMany": "{n} notification(s) archived.",
   "notifications.done.nothing": "Nothing to change — those were already done.",
+  "notifications.exportAdminsOnly": "A customer data export is attached. Only the store owner or an admin can download it.",
 } as const;
 
 export const vi: Partial<Record<keyof typeof en, string>> = {
@@ -89,4 +90,5 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   "notifications.done.readMany": "Đã đánh dấu đã đọc {n} thông báo.",
   "notifications.done.archiveMany": "Đã lưu trữ {n} thông báo.",
   "notifications.done.nothing": "Không có gì để đổi — những mục đó đã xong rồi.",
+  "notifications.exportAdminsOnly": "Có kèm bản xuất dữ liệu khách hàng. Chỉ chủ cửa hàng hoặc quản trị viên mới tải về được.",
 };

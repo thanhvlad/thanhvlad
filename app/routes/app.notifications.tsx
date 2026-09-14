@@ -3,6 +3,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { Link, useFetcher, useLoaderData, useNavigate, useSearchParams } from "@remix-run/react";
 import { Badge, Banner, BlockStack, Box, Button, ButtonGroup, Card, IndexTable, InlineStack, Layout, Page, Tabs, Text, useIndexResourceState } from "@shopify/polaris";
 import { EmptyScreen } from "~/components/EmptyScreen";
+import { atLeast } from "~/lib/access.server";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { formatDay, pageParam } from "~/lib/format";
 import type { I18nKey, Translator } from "~/lib/i18n";
@@ -16,7 +17,7 @@ type Tab = "all" | "unread";
 const PAGE_SIZE = 50;
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { shop } = await requireShop(request);
+  const { shop, role } = await requireShop(request);
   const url = new URL(request.url);
   const tab: Tab = url.searchParams.get("tab") === "unread" ? "unread" : "all";
   // The two tab counts are the only figures this screen leads with; the
@@ -33,7 +34,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     skip: (page - 1) * PAGE_SIZE,
     unreadOnly: tab === "unread",
   });
-  return { notifications, tab, counts: { all, unread }, page, pageSize: PAGE_SIZE, total };
+  // The download route answers 403 below ADMIN, so the button is only offered
+  // to someone it will work for. The rows themselves never carry the export.
+  const canDownloadExports = atLeast(role, "ADMIN");
+  return { notifications, tab, counts: { all, unread }, page, pageSize: PAGE_SIZE, total, canDownloadExports };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -93,7 +97,7 @@ function outcomeText(outcome: Outcome, t: Translator): string {
 
 export default function NotificationsPage() {
   const t = useT();
-  const { notifications, tab, counts, page, pageSize, total } = useLoaderData<typeof loader>();
+  const { notifications, tab, counts, page, pageSize, total, canDownloadExports } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const navigate = useNavigate();
   const [params] = useSearchParams();
@@ -213,7 +217,6 @@ export default function NotificationsPage() {
               >
                 {notifications.map((n, index) => {
                   const unread = !n.readAt;
-                  const hasExport = Boolean((n.meta as { dataRequest?: unknown } | null)?.dataRequest);
                   return (
                     // Read rows step back; what is left standing out is what
                     // still needs the merchant.
@@ -231,13 +234,18 @@ export default function NotificationsPage() {
                               {n.body}
                             </Text>
                           )}
-                          {hasExport && (
-                            <Box paddingBlockStart="100">
-                              <Button size="slim" onClick={() => downloadAuthed(`/app/notifications/${n.id}/export`, `customer-data-request-${n.id}.json`)}>
-                                {t("notifications.downloadExport")}
-                              </Button>
-                            </Box>
-                          )}
+                          {n.hasExport &&
+                            (canDownloadExports ? (
+                              <Box paddingBlockStart="100">
+                                <Button size="slim" onClick={() => downloadAuthed(`/app/notifications/${n.id}/export`, `customer-data-request-${n.id}.json`)}>
+                                  {t("notifications.downloadExport")}
+                                </Button>
+                              </Box>
+                            ) : (
+                              <Text as="span" tone="subdued" variant="bodySm">
+                                {t("notifications.exportAdminsOnly")}
+                              </Text>
+                            ))}
                         </BlockStack>
                       </IndexTable.Cell>
                       <IndexTable.Cell>

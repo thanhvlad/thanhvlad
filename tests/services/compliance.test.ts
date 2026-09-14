@@ -157,7 +157,10 @@ function seedAdaEverywhere() {
     },
   ]);
   prisma.seed("jobRun", [
-    { id: "j1", shopId: "shop1", type: "place-orders", payload: { orderIds: ["o1", "o2"] }, result: { results: [{ orderId: "o1", ok: false, error: `receiver ${ADA.name} rejected` }] }, error: null },
+    // The shape app.orders._index.tsx writes: { ids }. The queue job's own
+    // payload says orderIds, and a fixture using that name hid a filter that
+    // matched no run ever recorded.
+    { id: "j1", shopId: "shop1", type: "place-orders", payload: { ids: ["o1", "o2"] }, result: { results: [{ orderId: "o1", ok: false, error: `receiver ${ADA.name} rejected` }] }, error: null },
   ]);
   prisma.seed("webhookEvent", [
     {
@@ -246,6 +249,16 @@ describe("scrubbing helpers", () => {
     expect(compliance.webhookPayloadMatches("ORDERS_CREATE", { redacted: true, id: 70011 }, match)).toBe(false);
   });
 
+  it("finds place-orders runs by the payload path the orders screen actually writes", () => {
+    // Pinned exactly: a JSON path the database never holds would pass any
+    // in-memory fixture written with the same mistake.
+    expect(compliance.placeOrdersRunsWhere("shop1", "o1")).toEqual({
+      shopId: "shop1",
+      type: "place-orders",
+      OR: [{ payload: { path: ["ids"], array_contains: ["o1"] } }, { payload: { path: ["orderIds"], array_contains: ["o1"] } }],
+    });
+  });
+
   it("only orders the app can act on keep customer details", () => {
     expect(compliance.orderNeedsCustomerData({ managedLines: 0, purchaseOrders: 0, fulfillmentRequests: 0 })).toBe(false);
     expect(compliance.orderNeedsCustomerData({ managedLines: 1, purchaseOrders: 0, fulfillmentRequests: 0 })).toBe(true);
@@ -270,6 +283,9 @@ describe("customers/redact", () => {
     const o1 = prisma.rows("order").find((o) => o.id === "o1")!;
     expect(o1).toMatchObject({ customerName: null, customerEmail: null, phone: null, note: null, shippingAddress: { countryCode: "GB" }, totalPrice: "10.00", stage: "FAILED" });
     expect((o1.issues as unknown[]).length).toBe(3);
+
+    // The bulk run's supplier error for Ada, found through payload.ids.
+    expect(JSON.stringify(prisma.rows("jobRun")[0].result)).toContain("[redacted]");
 
     const po = prisma.rows("purchaseOrder")[0];
     expect(po.raw).toEqual({ externalOrderIds: ["AE-1"], shippingReason: "Cheapest tracked option." });
@@ -407,6 +423,85 @@ describe("retention", () => {
     expect(hooks).not.toHaveProperty("ancient");
     expect(result.webhookEventsDeleted).toBe(1);
   });
+
+  it("leaves a pending privacy request whole, so its retry still names the customer", async () => {
+    const request = { customer: { id: 42, email: "a@example.com" }, orders_to_redact: [70011] };
+    prisma.seed("webhookEvent", [
+      { id: "redact", shopId: "shop1", topic: "CUSTOMERS_REDACT", webhookId: "r", createdAt: ago(3 * DAY), payload: request },
+      { id: "product", shopId: "shop1", topic: "PRODUCTS_UPDATE", webhookId: "p", createdAt: ago(3 * DAY), payload: { id: 9, admin_graphql_api_id: "gid://shopify/Product/9" } },
+    ]);
+    await compliance.applyRetention(now);
+    const hooks = Object.fromEntries(prisma.rows("webhookEvent").map((w) => [w.id, w.payload]));
+    expect(hooks.redact).toEqual(request);
+    expect(hooks.product).toEqual({ id: 9, admin_graphql_api_id: "gid://shopify/Product/9" });
+  });
+});
+
+describe("uninstalled store purge", () => {
+  const now = new Date("2026-09-14T12:00:00Z");
+  const ago = (ms: number) => new Date(now.getTime() - ms);
+  const cutoff = ago(30 * DAY);
+
+  it("trusts only the store's own records, and a later auth means it came back", () => {
+    expect(compliance.stillUninstalled({ isActive: false, uninstalledAt: ago(40 * DAY), lastAuthAt: ago(100 * DAY) }, cutoff)).toBe(true);
+    expect(compliance.stillUninstalled({ isActive: false, uninstalledAt: ago(40 * DAY), lastAuthAt: null }, cutoff)).toBe(true);
+    expect(compliance.stillUninstalled({ isActive: false, uninstalledAt: ago(40 * DAY), lastAuthAt: ago(20 * DAY) }, cutoff)).toBe(false);
+    expect(compliance.stillUninstalled({ isActive: true, uninstalledAt: ago(40 * DAY), lastAuthAt: null }, cutoff)).toBe(false);
+    expect(compliance.stillUninstalled({ isActive: false, uninstalledAt: ago(10 * DAY), lastAuthAt: null }, cutoff)).toBe(false);
+    expect(compliance.stillUninstalled({ isActive: false, uninstalledAt: null, lastAuthAt: null }, cutoff)).toBe(false);
+  });
+
+  it("erases a store still uninstalled, skips one that authenticated since, and removes the AI counters it owned", async () => {
+    prisma.tables.shop = [];
+    prisma.seed("shop", [
+      { id: "gone", domain: "gone.myshopify.com", accountId: "acc-gone", isActive: false, uninstalledAt: ago(40 * DAY), lastAuthAt: ago(90 * DAY) },
+      { id: "back", domain: "back.myshopify.com", accountId: null, isActive: false, uninstalledAt: ago(40 * DAY), lastAuthAt: ago(2 * DAY) },
+      { id: "sibling", domain: "sibling.myshopify.com", accountId: "acc-shared", isActive: true, uninstalledAt: null, lastAuthAt: ago(DAY) },
+      { id: "solo", domain: "solo.myshopify.com", accountId: "acc-shared", isActive: false, uninstalledAt: ago(45 * DAY), lastAuthAt: null },
+    ]);
+    prisma.seed("account", [{ id: "acc-gone" }, { id: "acc-shared" }]);
+    prisma.seed("session", [{ id: "offline_gone", shop: "gone.myshopify.com" }]);
+    prisma.seed("aiRewriteUsage", [
+      { ownerKey: "shop:gone", period: "2026-08", used: 3 },
+      { ownerKey: "acc-gone", period: "2026-09", used: 5 },
+      { ownerKey: "shop:back", period: "2026-09", used: 1 },
+      { ownerKey: "acc-shared", period: "2026-09", used: 7 },
+    ]);
+
+    const result = await compliance.purgeUninstalledShops(now);
+    expect(result.purged.sort()).toEqual(["gone.myshopify.com", "solo.myshopify.com"]);
+    expect(result.skipped).toEqual(["back.myshopify.com"]);
+    expect(prisma.rows("shop").map((shop) => shop.id).sort()).toEqual(["back", "sibling"]);
+    expect(prisma.rows("session")).toHaveLength(0);
+    // The erased store's own counter and its deleted account's go; the store
+    // that came back keeps its counter, and so does an account another store
+    // still uses, or uninstalling one store would reset the other's allowance.
+    expect(prisma.rows("aiRewriteUsage").map((row) => row.ownerKey).sort()).toEqual(["acc-shared", "shop:back"]);
+  });
+
+  it("re-reads each store before erasing it, so a reinstall during the run wins", async () => {
+    prisma.tables.shop = [];
+    prisma.seed("shop", [{ id: "racing", domain: "racing.myshopify.com", accountId: null, isActive: false, uninstalledAt: ago(40 * DAY), lastAuthAt: null }]);
+    const fake = prisma as unknown as Record<string, Record<string, (args: unknown) => Promise<unknown>>>;
+    // The candidate list was read while uninstalled; the store re-authenticates
+    // before its turn comes.
+    db.current = new Proxy(fake, {
+      get: (target, prop: string) => {
+        if (prop !== "shop") return target[prop];
+        const shop = target.shop;
+        return {
+          ...shop,
+          findUnique: async (args: unknown) => {
+            Object.assign(prisma.rows("shop")[0], { lastAuthAt: now, isActive: true });
+            return shop.findUnique(args);
+          },
+        };
+      },
+    });
+    const result = await compliance.purgeUninstalledShops(now);
+    expect(result.purged).toEqual([]);
+    expect(prisma.rows("shop")).toHaveLength(1);
+  });
 });
 
 describe("shop/redact", () => {
@@ -491,5 +586,97 @@ describe("order ingest minimisation", () => {
     const order = await upsertOrderFromSnapshot(await shopWithSettings(), snapshot("8004", null));
     expect(order).toMatchObject({ customerName: null, customerEmail: null, phone: null });
     expect(JSON.stringify(order.shippingAddress)).not.toContain("Analytical");
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("customer data Shopify withheld", () => {
+  /** What Shopify returns before Protected customer data approval: nulls, with an access error per field. */
+  function withheldSnapshot(id: string, variantId: string | null) {
+    return {
+      id: `gid://shopify/Order/${id}`,
+      name: `#${id}`,
+      orderNumber: Number(id),
+      createdAt: new Date().toISOString(),
+      cancelledAt: null,
+      displayFinancialStatus: "PAID",
+      displayFulfillmentStatus: "UNFULFILLED",
+      email: null,
+      phone: null,
+      note: null,
+      tags: [],
+      test: false,
+      riskLevel: "LOW",
+      currencyCode: "GBP",
+      totalPrice: "10.00",
+      totalShipping: "0.00",
+      totalTax: "0.00",
+      totalDiscounts: "0.00",
+      customer: null,
+      customAttributes: [],
+      shippingAddress: null,
+      lineItems: [{ id: `${id}-line`, title: "Tea cup", variantTitle: null, sku: null, quantity: 1, unfulfilledQuantity: 1, productId: null, variantId, image: null, price: "10.00", totalDiscount: "0", requiresShipping: true }],
+      redactedFields: ["customer", "email", "phone", "shippingAddress"],
+    };
+  }
+
+  async function shopWithSettings() {
+    const { parseShopSettings } = await import("~/domain/settings/shop-settings");
+    return { ...prisma.rows("shop")[0], parsedSettings: parseShopSettings({}) } as never;
+  }
+
+  beforeEach(() => {
+    prisma.seed("product", [{ id: "p1", shopId: "shop1", title: "Tea cup" }]);
+    prisma.seed("productVariant", [{ id: "v1", productId: "p1", shopifyVariantId: "gid://shopify/ProductVariant/1" }]);
+  });
+
+  it("picks out the withheld paths that are customer details", async () => {
+    const { withheldCustomerFields } = await import("~/services/orders.server");
+    expect(withheldCustomerFields(["customer.defaultEmailAddress", "lineItems.image", "shippingAddress.address1", "*"])).toEqual(["customer.defaultEmailAddress", "shippingAddress.address1", "*"]);
+    expect(withheldCustomerFields(undefined)).toEqual([]);
+    expect(withheldCustomerFields(["shippingAddressLabel"])).toEqual([]);
+  });
+
+  it("keeps a stored value only where Shopify withheld it and returned nothing", async () => {
+    const { keepWithheldCustomerData } = await import("~/services/orders.server");
+    const stored = { customerName: ADA.name, customerEmail: ADA.email, phone: ADA.phone, shippingAddress: adaAddress() };
+    const next = { customerName: "Ada L.", customerEmail: null, phone: null, note: null, shippingAddress: { name: "Ada L.", address1: null, city: "London", countryCode: "GB", phone: null } };
+
+    const partial = keepWithheldCustomerData(next, stored, ["shippingAddress.address1", "customer.defaultEmailAddress"], { personal: true });
+    expect(partial.data).toMatchObject({ customerName: "Ada L.", customerEmail: ADA.email, phone: null });
+    expect(partial.data.shippingAddress).toMatchObject({ name: "Ada L.", address1: ADA.address1, phone: null });
+    expect(partial.kept.sort()).toEqual(["customerEmail", "shippingAddress.address1"]);
+
+    // Nothing withheld: an empty value is Shopify's answer and is written.
+    expect(keepWithheldCustomerData(next, stored, [], { personal: true })).toEqual({ data: next, kept: [] });
+    // An order the app does not fulfil keeps only the country, never the person.
+    const minimal = keepWithheldCustomerData({ customerName: null, customerEmail: null, phone: null, note: null, shippingAddress: {} }, stored, ["shippingAddress"], { personal: false });
+    expect(minimal.data).toEqual({ customerName: null, customerEmail: null, phone: null, note: null, shippingAddress: { countryCode: "GB" } });
+  });
+
+  it("never clears a placed order's address on a refresh Shopify redacted, and says why once per order and once per shop", async () => {
+    prisma.seed("order", [
+      { id: "o7", shopId: "shop1", shopifyOrderId: "gid://shopify/Order/9001", name: "#9001", customerName: ADA.name, customerEmail: ADA.email, phone: ADA.phone, countryCode: "GB", shippingAddress: adaAddress() },
+    ]);
+    const { upsertOrderFromSnapshot } = await import("~/services/orders.server");
+    const shop = await shopWithSettings();
+
+    const order = await upsertOrderFromSnapshot(shop, withheldSnapshot("9001", "gid://shopify/ProductVariant/1"));
+    expect(order).toMatchObject({ customerName: ADA.name, customerEmail: ADA.email, phone: ADA.phone, countryCode: "GB" });
+    expect(order.shippingAddress).toMatchObject({ address1: ADA.address1, zip: ADA.zip, phone: ADA.phone, taxNumber: ADA.taxNumber });
+
+    await upsertOrderFromSnapshot(shop, withheldSnapshot("9001", "gid://shopify/ProductVariant/1"));
+    await upsertOrderFromSnapshot(shop, withheldSnapshot("9002", "gid://shopify/ProductVariant/1"));
+
+    const logs = prisma.rows("activityLog").filter((a) => a.action === "order.customer_data_withheld");
+    expect(logs.map((l) => l.entityId).sort()).toEqual(["o7", prisma.rows("order").find((o) => o.name === "#9002")!.id].sort());
+    expect(logs[0].message).toContain("Protected customer data");
+    // Field names only, never the values that were kept.
+    expect(JSON.stringify(logs)).not.toContain("Lovelace");
+
+    const notices = prisma.rows("notification").filter((n) => (n.meta as { dedupeKey?: string }).dedupeKey === "protected-customer-data-withheld");
+    expect(notices).toHaveLength(1);
+    expect(notices[0].body).toContain("Protected customer data");
   });
 });
