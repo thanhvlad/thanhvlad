@@ -963,7 +963,23 @@ export async function cancelPurchaseOrder(shop: ShopWithSettings, purchaseOrderI
       upstream = await adapter.cancelOrder(po.externalOrderId, reason).catch(() => false);
     }
   }
-  await prisma.purchaseOrder.update({ where: { id: po.id }, data: { status: "CANCELED", canceledAt: new Date(), errorMessage: reason ?? null } });
+  if (neverPlaced) {
+    // Conditional, like the extension's "Mark as placed" write it races with.
+    // A cancel that read AWAITING_PLACEMENT just before the merchant recorded
+    // the AliExpress order would otherwise stamp CANCELED over an order they
+    // had already paid for. When the status moved under us, start again from
+    // what is stored now, which takes the placed-order path.
+    const claimed = await prisma.purchaseOrder.updateMany({
+      where: { id: po.id, status: "AWAITING_PLACEMENT" },
+      data: { status: "CANCELED", canceledAt: new Date(), errorMessage: reason ?? null },
+    });
+    if (claimed.count === 0) {
+      logger.warn("Purchase order changed while being cancelled; re-reading", { purchaseOrderId: po.id });
+      return cancelPurchaseOrder(shop, purchaseOrderId, reason, actor);
+    }
+  } else {
+    await prisma.purchaseOrder.update({ where: { id: po.id }, data: { status: "CANCELED", canceledAt: new Date(), errorMessage: reason ?? null } });
+  }
   await logActivity(shop.id, {
     actor,
     action: "order.supplier_canceled",

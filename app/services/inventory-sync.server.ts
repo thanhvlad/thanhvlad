@@ -76,6 +76,17 @@ function toPolicyInput(row: Awaited<ReturnType<typeof getInventoryPolicy>>): Inv
 }
 
 /**
+ * Whether an extension capture is news for a product. A product with no sync
+ * stamp is treated as already holding its capture: pushing a product stamps it,
+ * so a missing stamp means a row this rule cannot date, and the safe reading of
+ * an undatable capture is "not new".
+ */
+export function captureIsNewerThanSync(capturedAt: Date | null | undefined, lastSyncedAt: Date | null | undefined): boolean {
+  if (!capturedAt || !lastSyncedAt) return false;
+  return capturedAt.getTime() > lastSyncedAt.getTime();
+}
+
+/**
  * The auto-update job: refresh every supplier product referenced by a managed
  * product, run the policy over each variant and apply the resulting actions to
  * Shopify. Runs per shop; safe to call from a cron or the "Sync now" button.
@@ -142,15 +153,23 @@ export async function runInventorySync(
     summary.productsChecked += 1;
     const actions: SyncAction[] = [];
     let skippedVariants = 0;
+    let plannedFromCapture = false;
     for (const variant of product.variants) {
       const mapping = variant.variantMappings[0];
       if (!mapping) continue;
       if (notRefreshable.has(mapping.supplierVariant.supplierProductId)) {
-        // Nothing new is known about this supplier product, so there is nothing
-        // to act on. Planning from the stored capture would re-send the same
-        // numbers as if the supplier had just confirmed them.
-        skippedVariants += 1;
-        continue;
+        // No supplier API, so the only supplier numbers are the extension's last
+        // capture. Acting on them every run would be wrong both ways it can go:
+        // planning each hour from a capture taken days ago resets Shopify stock
+        // to what the supplier had then, silently undoing every sale since, and
+        // never planning means a fresh re-capture never reaches the store. So a
+        // capture is acted on once - when it is newer than this product's last
+        // sync - and skipped otherwise.
+        if (!captureIsNewerThanSync(mapping.supplierVariant.updatedAt, product.lastSyncedAt)) {
+          skippedVariants += 1;
+          continue;
+        }
+        plannedFromCapture = true;
       }
       const sv = freshById.get(mapping.supplierVariantId);
       const supplierProductRemoved = removed.has(mapping.supplierVariant.supplierProductId);
@@ -176,7 +195,15 @@ export async function runInventorySync(
     if (skippedVariants > 0) summary.skipped.push(`${product.title}: ${REFRESH_BY_RECAPTURE_REASON}`);
     planned.push(...actions);
     if (options.onProgress) await options.onProgress(1);
-    if (options.dryRun || actions.length === 0) continue;
+    if (options.dryRun) continue;
+    if (actions.length === 0) {
+      // Comparing a fresh capture and finding nothing to change is still a sync
+      // of that capture. Without the stamp the same capture would stay "newer
+      // than the last sync" and be planned again every run, which is how an old
+      // capture comes to overwrite the stock of a product that has sold since.
+      if (plannedFromCapture) await prisma.product.update({ where: { id: product.id }, data: { lastSyncedAt: new Date() } });
+      continue;
+    }
 
     try {
       await applyActions(shop, client, product.id, product.shopifyProductId, product.title, actions, summary, options.operationId);

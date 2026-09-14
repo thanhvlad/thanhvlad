@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { afterEach, describe, expect, it } from "vitest";
-import { aiEndpointStatus, createRewriteClient, extractResult, mightBeTheImages, rewriteWasNotBilled } from "~/services/ai-landing.server";
+import { aiEndpointStatus, createRewriteClient, extractResult, mightBeTheImages, rateLimitWaitMs, rewriteWasNotBilled } from "~/services/ai-landing.server";
 
 /**
  * These two helpers exist because the app can be pointed at an
@@ -163,5 +163,29 @@ describe("createRewriteClient", () => {
   it("never retries on its own, so one reserved rewrite is one request", () => {
     const client = createRewriteClient();
     expect(client.maxRetries).toBe(0);
+  });
+});
+
+describe("rateLimitWaitMs", () => {
+  const limited = (retryAfter?: string) =>
+    new Anthropic.APIError(429, undefined, "rate limited", new Headers(retryAfter === undefined ? {} : { "retry-after": retryAfter }));
+
+  it("waits as long as the endpoint asks", () => {
+    expect(rateLimitWaitMs(limited("7"))).toBe(7_000);
+  });
+
+  it("caps the wait so one product cannot hold a batch for minutes", () => {
+    expect(rateLimitWaitMs(limited("600"))).toBe(30_000);
+  });
+
+  it("uses a short default when the endpoint gives no hint", () => {
+    expect(rateLimitWaitMs(limited())).toBe(5_000);
+    expect(rateLimitWaitMs(limited("soon"))).toBe(5_000);
+  });
+
+  it("retries only rate limits, never an answer that may have been billed", () => {
+    expect(rateLimitWaitMs(new Anthropic.APIError(500, undefined, "x", new Headers()))).toBeNull();
+    expect(rateLimitWaitMs(new Anthropic.APIConnectionTimeoutError())).toBeNull();
+    expect(rateLimitWaitMs(new Error("nope"))).toBeNull();
   });
 });

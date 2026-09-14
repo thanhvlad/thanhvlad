@@ -15,6 +15,8 @@ import { markShopUninstalled, REAUTH_MARGIN_MS, reauthenticatedSince } from "~/s
 import {
   abandonExpiredWebhooks,
   clockLeadFromSamples,
+  estimateClockLeadMs,
+  CLOCK_LEAD_CAP_MS,
   COMPLIANCE_TOPICS,
   expiredWebhookFilter,
   pendingWebhookFilter,
@@ -142,9 +144,15 @@ describe("app/uninstalled with a server clock running fast", () => {
     const lead = 5 * MIN;
     const lastAuthAt = new Date(triggeredAt.getTime() - 30_000 + lead);
     claimed(storedEvent("APP_UNINSTALLED", { triggeredAt, createdAt: new Date(triggeredAt.getTime() + lead + 800) }), { lastAuthAt });
+    // Other deliveries from the last day, each showing the same five-minute
+    // lead plus a little delivery delay. The uninstall being judged is not among
+    // them: measuring it against itself is exactly what let a late delivery
+    // shift the decision.
+    const earlier = (iso: string, delayMs: number) => ({ createdAt: new Date(iso), triggeredAt: new Date(new Date(iso).getTime() - lead - delayMs) });
     db.webhookEvent.findMany.mockResolvedValue([
-      { createdAt: new Date(triggeredAt.getTime() + lead + 800), triggeredAt },
-      { createdAt: new Date("2026-09-14T09:10:03Z"), triggeredAt: new Date(new Date("2026-09-14T09:10:03Z").getTime() - lead - 2_000) },
+      earlier("2026-09-14T09:10:03Z", 2_000),
+      earlier("2026-09-14T08:40:11Z", 1_500),
+      earlier("2026-09-14T07:05:42Z", 3_000),
     ]);
     db.shop.updateMany.mockResolvedValue({ count: 1 });
     db.account.findUnique.mockResolvedValue({ id: "a1", plan: "FREE", subscriptionId: null, billingShopId: null });
@@ -154,14 +162,14 @@ describe("app/uninstalled with a server clock running fast", () => {
     await processWebhookEvent("evt");
 
     expect(db.webhookEvent.findMany).toHaveBeenCalledWith({
-      where: { triggeredAt: { not: null }, createdAt: { gt: expect.any(Date) } },
+      where: { id: { not: "evt" }, triggeredAt: { not: null }, createdAt: { gt: expect.any(Date) } },
       orderBy: { createdAt: "desc" },
       take: 200,
       select: { createdAt: true, triggeredAt: true },
     });
     expect(db.shop.updateMany).toHaveBeenCalledWith({ where: { id: "s1", lastAuthAt }, data: expect.objectContaining({ isActive: false }) });
     expect(db.session.deleteMany).toHaveBeenCalled();
-    expect(info).toHaveBeenCalledWith("app/uninstalled decision", expect.objectContaining({ decision: "applied", clockLeadMs: lead + 800, marginMs: REAUTH_MARGIN_MS }));
+    expect(info).toHaveBeenCalledWith("app/uninstalled decision", expect.objectContaining({ decision: "applied", clockLeadMs: lead + 1_500, marginMs: REAUTH_MARGIN_MS }));
   });
 
   it("still ignores an uninstall for a store that really reinstalled", async () => {
@@ -177,9 +185,22 @@ describe("app/uninstalled with a server clock running fast", () => {
     const t = new Date("2026-09-14T10:00:00Z");
     const at = (ms: number) => new Date(t.getTime() + ms);
     expect(clockLeadFromSamples([])).toBe(0);
-    expect(clockLeadFromSamples([{ createdAt: at(90_000), triggeredAt: t }, { createdAt: at(61_000), triggeredAt: t }, { createdAt: at(5_000), triggeredAt: null }])).toBe(61_000);
+    expect(
+      clockLeadFromSamples([
+        { createdAt: at(90_000), triggeredAt: t },
+        { createdAt: at(61_000), triggeredAt: t },
+        { createdAt: at(75_000), triggeredAt: t },
+        { createdAt: at(5_000), triggeredAt: null },
+      ]),
+    ).toBe(61_000);
     // Our clock behind Shopify's: the difference is negative and reads as no lead.
-    expect(clockLeadFromSamples([{ createdAt: at(-40_000), triggeredAt: t }])).toBe(0);
+    expect(
+      clockLeadFromSamples([
+        { createdAt: at(-40_000), triggeredAt: t },
+        { createdAt: at(-30_000), triggeredAt: t },
+        { createdAt: at(-35_000), triggeredAt: t },
+      ]),
+    ).toBe(0);
     expect(reauthenticatedSince(at(REAUTH_MARGIN_MS + 61_000 + 1_000), t, 61_000)).toBe(true);
     expect(reauthenticatedSince(at(REAUTH_MARGIN_MS + 61_000 - 1_000), t, 61_000)).toBe(false);
   });
@@ -354,5 +375,41 @@ describe("abandoned events", () => {
     expect(await abandonExpiredWebhooks(now)).toBe(0);
     expect(error).not.toHaveBeenCalled();
     expect(db.activityLog.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("clock lead estimate guards", () => {
+  const t = new Date("2026-09-14T10:00:00Z");
+  const at = (ms: number) => new Date(t.getTime() + ms);
+
+  it("refuses to estimate from fewer than three deliveries", () => {
+    // One slow delivery looks exactly like a fast clock.
+    expect(clockLeadFromSamples([{ createdAt: at(45 * MIN), triggeredAt: t }, { createdAt: at(40 * MIN), triggeredAt: t }])).toBe(0);
+  });
+
+  it("caps the lead so a delivery backlog cannot shift every sign-in by hours", () => {
+    const backlog = [1, 2, 3].map((h) => ({ createdAt: at(h * 60 * MIN), triggeredAt: t }));
+    expect(clockLeadFromSamples(backlog)).toBe(CLOCK_LEAD_CAP_MS);
+  });
+
+  it("leaves the judged delivery out of its own measurement", async () => {
+    db.webhookEvent.findMany.mockResolvedValue([]);
+    await estimateClockLeadMs(t, { excludeId: "evt-being-judged" });
+    expect(db.webhookEvent.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ id: { not: "evt-being-judged" } }) }),
+    );
+  });
+});
+
+describe("shop/redact for an inactive store", () => {
+  it("erases without consulting timestamps, however recent the last sign-in looks", async () => {
+    const redactTriggeredAt = new Date("2026-09-14T10:00:00Z");
+    claimed(storedEvent("SHOP_REDACT", { triggeredAt: redactTriggeredAt, createdAt: new Date(redactTriggeredAt.getTime() + 1_000) }), {
+      isActive: false,
+      // A sign-in that would read as a reinstall if timestamps decided it.
+      lastAuthAt: new Date(redactTriggeredAt.getTime() - 60 * MIN),
+    });
+    await processWebhookEvent("evt");
+    expect(services.redactShop).toHaveBeenCalledTimes(1);
   });
 });

@@ -27,7 +27,9 @@ import { enqueue, registerHandler } from "./queue.server";
  * allowance is the authority, so a reworded message still stops the batch.
  * Exported for the test.
  */
-export async function rewriteAllowanceUsedUp(shop: { id: string; accountId: string | null }, outcome: RewriteOutcome): Promise<boolean> {
+// The domain is part of the shape on purpose: the owner exemption is keyed on
+// it, and a caller that could omit it would quietly be shown metered numbers.
+export async function rewriteAllowanceUsedUp(shop: { id: string; accountId: string | null; domain: string }, outcome: RewriteOutcome): Promise<boolean> {
   if (outcome.ok) return false;
   if (/allowance is used up/i.test(outcome.error ?? "")) return true;
   try {

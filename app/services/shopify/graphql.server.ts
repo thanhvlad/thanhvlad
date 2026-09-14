@@ -335,7 +335,9 @@ export function isThrottleError(error: GraphqlError): boolean {
 }
 
 export function isAccessDeniedError(error: GraphqlError): boolean {
-  return error.extensions?.code === "ACCESS_DENIED" || /not approved to access|access denied/i.test(error.message);
+  // "not approved to use the <field> field" is how Shopify words a field-level
+  // protected-data denial; missing it made a redaction look like a hard failure.
+  return error.extensions?.code === "ACCESS_DENIED" || /not approved to (access|use)|access denied/i.test(error.message);
 }
 
 /**

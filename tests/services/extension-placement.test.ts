@@ -781,20 +781,39 @@ describe("recording an order the merchant already paid for", () => {
 describe("cancelling a purchase order", () => {
   it("cancels one waiting for the extension locally, without asking any supplier", async () => {
     mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ id: "po1", orderId: "order1", status: "AWAITING_PLACEMENT", platform: "ALIEXPRESS", externalOrderId: null, raw: {} });
+    mocks.prisma.purchaseOrder.updateMany.mockResolvedValue({ count: 1 });
 
     const result = await fulfillment.cancelPurchaseOrder(makeShop(), "po1", "Shopify order cancelled", "webhook");
 
     expect(result).toEqual({ upstream: false, alreadyCanceled: false, neverPlaced: true });
     expect(mocks.adapterForShop).not.toHaveBeenCalled();
-    expect(mocks.prisma.purchaseOrder.update).toHaveBeenCalledWith({
-      where: { id: "po1" },
+    expect(mocks.prisma.purchaseOrder.updateMany).toHaveBeenCalledWith({
+      where: { id: "po1", status: "AWAITING_PLACEMENT" },
       data: expect.objectContaining({ status: "CANCELED", errorMessage: "Shopify order cancelled" }),
     });
     expect(mocks.logActivity).toHaveBeenCalledWith("shop1", expect.objectContaining({ message: expect.stringMatching(/Nothing had been ordered/) }));
     expect(mocks.evaluateAndStoreOrder).toHaveBeenCalledWith(expect.anything(), "order1");
   });
 
+  it("does not overwrite an order the extension recorded as placed while the cancel was running", async () => {
+    // First read: still waiting. By the write, the merchant has marked it placed and paid.
+    mocks.prisma.purchaseOrder.findFirst
+      .mockResolvedValueOnce({ id: "po1", orderId: "order1", status: "AWAITING_PLACEMENT", platform: "ALIEXPRESS", externalOrderId: null, raw: {} })
+      .mockResolvedValueOnce({ id: "po1", orderId: "order1", status: "PAID", platform: "ALIEXPRESS", externalOrderId: "8190000000000001", raw: {} });
+    mocks.prisma.purchaseOrder.updateMany.mockResolvedValueOnce({ count: 0 });
+    const cancelOrder = vi.fn().mockResolvedValue(false);
+    mocks.adapterForShop.mockResolvedValue({ adapter: { platform: "ALIEXPRESS", cancelOrder }, account: null });
+
+    const result = await fulfillment.cancelPurchaseOrder(makeShop(), "po1", "Shopify order cancelled", "webhook");
+
+    // It took the placed-order path the second time round, so the merchant is
+    // told the supplier order exists rather than that nothing was ordered.
+    expect(result.neverPlaced).toBe(false);
+    expect(mocks.logActivity).not.toHaveBeenCalledWith("shop1", expect.objectContaining({ message: expect.stringMatching(/Nothing had been ordered/) }));
+  });
+
   it("does not ask the supplier even if an id was somehow stored before placement", async () => {
+    mocks.prisma.purchaseOrder.updateMany.mockResolvedValue({ count: 1 });
     mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ id: "po1", orderId: "order1", status: "AWAITING_PLACEMENT", platform: "ALIEXPRESS", externalOrderId: "8190000000000001", raw: {} });
     await fulfillment.cancelPurchaseOrder(makeShop(), "po1");
     expect(mocks.adapterForShop).not.toHaveBeenCalled();

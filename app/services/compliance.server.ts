@@ -368,6 +368,9 @@ export async function handleCustomerDataRequest(shop: ShopRef, payload: Record<s
     body,
     link: "/app/notifications",
     meta: { dataRequest: exportData as unknown as Prisma.InputJsonValue },
+    // The webhook is retried for up to 30 days; one request is one export.
+    dedupeKey: `data-request:${requestId}`,
+    dedupeMinutes: "forever",
   });
   await logActivity(shop.id, { action: "gdpr.data_request", message: `${title}: ${orders.length} order(s) exported.`, meta: { customerId: customer.id ?? null, orders: orders.length } });
 

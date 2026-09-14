@@ -31,7 +31,7 @@ vi.mock("~/services/suppliers/catalog.server", () => ({ refreshSupplierProduct }
 vi.mock("~/services/suppliers/index.server", () => ({ SUPPLIER_API_UNAVAILABLE: "SUPPLIER_API_UNAVAILABLE" }));
 vi.mock("~/services/shopify/products.server", () => ({ setInventoryQuantities, setProductStatus: vi.fn(), updateVariantPrices: vi.fn() }));
 
-const { isNoSupplierApiError, runInventorySync, REFRESH_BY_RECAPTURE_REASON } = await import("~/services/inventory-sync.server");
+const { captureIsNewerThanSync, isNoSupplierApiError, runInventorySync, REFRESH_BY_RECAPTURE_REASON } = await import("~/services/inventory-sync.server");
 
 const shop = { id: "shop1", primaryLocationId: "gid://shopify/Location/1", fulfillmentLocationId: null, parsedSettings: { notifications: {} } } as never;
 const client = vi.fn() as never;
@@ -108,5 +108,52 @@ describe("runInventorySync with a product the extension captured", () => {
     expect(isNoSupplierApiError(new SupplierError("SUPPLIER_NOT_CONFIGURED", "x"))).toBe(true);
     expect(isNoSupplierApiError(new SupplierError("SUPPLIER_RATE_LIMITED", "x"))).toBe(false);
     expect(isNoSupplierApiError(new Error("SUPPLIER_API_UNAVAILABLE"))).toBe(false);
+  });
+});
+
+describe("an extension capture newer than the product's last sync", () => {
+  const synced = new Date("2026-09-14T10:05:00Z");
+
+  function capturedProduct(capturedAt: Date, inventoryQuantity: number) {
+    const p = product("p1", "Lamp", "captured");
+    return {
+      ...p,
+      lastSyncedAt: synced,
+      variants: p.variants.map((v) => ({
+        ...v,
+        inventoryQuantity,
+        variantMappings: v.variantMappings.map((m) => ({ ...m, supplierVariant: { ...m.supplierVariant, updatedAt: capturedAt } })),
+      })),
+    };
+  }
+
+  it("is acted on: a re-capture reaches the store", async () => {
+    db.product.findMany.mockResolvedValue([capturedProduct(new Date("2026-09-14T12:00:00Z"), 5)]);
+    const result = await runInventorySync(shop, client, { dryRun: true });
+    expect(result.skipped).toEqual([]);
+    expect(result.plannedActions.map((a) => a.productVariantId)).toContain("p1-v1");
+  });
+
+  it("is not acted on when it predates the last sync, so sales since are never undone", async () => {
+    // Captured at 10:00 with stock 20, pushed and synced at 10:05, sold down to 5.
+    db.product.findMany.mockResolvedValue([capturedProduct(new Date("2026-09-14T10:00:00Z"), 5)]);
+    const result = await runInventorySync(shop, client, {});
+    expect(result.plannedActions).toEqual([]);
+    expect(setInventoryQuantities).not.toHaveBeenCalled();
+    expect(result.skipped).toEqual([`Lamp: ${REFRESH_BY_RECAPTURE_REASON}`]);
+  });
+
+  it("stamps the sync even when the fresh capture changes nothing, so it is not replayed next run", async () => {
+    // Shopify already shows the captured stock of 20: no action, but the capture is now consumed.
+    db.product.findMany.mockResolvedValue([capturedProduct(new Date("2026-09-14T12:00:00Z"), 20)]);
+    await runInventorySync(shop, client, {});
+    expect(db.product.update).toHaveBeenCalledWith({ where: { id: "p1" }, data: { lastSyncedAt: expect.any(Date) } });
+  });
+
+  it("treats an undatable capture as not new", () => {
+    expect(captureIsNewerThanSync(new Date(), null)).toBe(false);
+    expect(captureIsNewerThanSync(null, new Date())).toBe(false);
+    expect(captureIsNewerThanSync(new Date("2026-09-14T12:00:00Z"), synced)).toBe(true);
+    expect(captureIsNewerThanSync(synced, synced)).toBe(false);
   });
 });

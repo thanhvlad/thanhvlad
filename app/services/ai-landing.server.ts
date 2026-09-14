@@ -322,7 +322,33 @@ interface ModelCall {
   model: string;
 }
 
+/** Longest a rewrite waits out one rate limit before giving the product up. */
+const RATE_LIMIT_WAIT_CAP_MS = 30_000;
+
+/**
+ * How long a 429 asks to be left alone, from its retry-after header, capped.
+ * Exported for the test.
+ */
+export function rateLimitWaitMs(error: unknown): number | null {
+  if (!(error instanceof Anthropic.APIError) || error.status !== 429) return null;
+  const header = (error.headers as { get?: (name: string) => string | null } | undefined)?.get?.("retry-after");
+  const seconds = header ? Number(header) : NaN;
+  const ms = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : 5_000;
+  return Math.min(RATE_LIMIT_WAIT_CAP_MS, ms);
+}
+
 async function callModel(client: Anthropic, call: ModelCall) {
+  try {
+    return await callModelOnce(client, call);
+  } catch (error) {
+    const waitMs = rateLimitWaitMs(error);
+    if (waitMs === null) throw error;
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    return callModelOnce(client, call);
+  }
+}
+
+async function callModelOnce(client: Anthropic, call: ModelCall) {
   const response = await client.messages.create({
     model: call.model,
     max_tokens: 16000,

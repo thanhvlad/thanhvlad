@@ -208,7 +208,7 @@ export async function processWebhookEvent(webhookEventId: string) {
         // Shopify's trigger time with our own auth stamp honestly.
         await markShopUninstalled(shop.domain, {
           triggeredAt: event.triggeredAt ?? event.createdAt,
-          clockLeadMs: await estimateClockLeadMs(new Date()),
+          clockLeadMs: await estimateClockLeadMs(new Date(), { excludeId: event.id }),
         });
         break;
       }
@@ -235,12 +235,21 @@ export async function processWebhookEvent(webhookEventId: string) {
         // Decided from what this app recorded, not by asking Shopify: the probe
         // this replaced could not tell an expired token from a network error,
         // so a store whose uninstall had been lost was retried and never erased.
-        const clockLeadMs = await estimateClockLeadMs(new Date());
+        //
+        // An inactive store is the plain case and is decided locally: the
+        // install hook sets isActive and lastAuthAt in one write, so a store
+        // still inactive has not signed in since its uninstall was applied and
+        // cannot have reinstalled. The timestamp comparison is only for a store
+        // marked active, where it tells a lost uninstall from a real reinstall.
+        // It leans on X-Shopify-Triggered-At, whose meaning for this topic the
+        // Shopify docs do not define, so it must never be the only thing deciding.
         const redactTriggeredAt = event.triggeredAt ?? event.createdAt;
-        const decision = shopRedactDecision(shop.lastAuthAt, redactTriggeredAt, clockLeadMs);
+        const clockLeadMs = shop.isActive ? await estimateClockLeadMs(new Date(), { excludeId: event.id }) : 0;
+        const decision = shop.isActive ? shopRedactDecision(shop.lastAuthAt, redactTriggeredAt, clockLeadMs) : "erase";
         logger.info("shop/redact decision", {
           shop: shop.domain,
           decision,
+          isActive: shop.isActive,
           lastAuthAt: shop.lastAuthAt,
           redactTriggeredAt,
           uninstallEstimatedAt: new Date(redactTriggeredAt.getTime() - SHOP_REDACT_DELAY_MS),
@@ -366,9 +375,17 @@ const CLOCK_SAMPLE_SIZE = 200;
  * which is the safe direction for both callers: it makes a sign-in look earlier,
  * so an uninstall is applied and a redact erases.
  */
-export async function estimateClockLeadMs(now: Date): Promise<number> {
+export async function estimateClockLeadMs(now: Date, options: { excludeId?: string } = {}): Promise<number> {
   const samples = await prisma.webhookEvent.findMany({
-    where: { triggeredAt: { not: null }, createdAt: { gt: new Date(now.getTime() - CLOCK_SAMPLE_WINDOW_MS) } },
+    where: {
+      // The delivery being judged must not measure itself. When it is late
+      // because Shopify retried it, its own lag is delivery delay, not clock
+      // lead, and counting it would make the store's sign-in look earlier by
+      // exactly the amount that decides whether a reinstall is erased.
+      ...(options.excludeId ? { id: { not: options.excludeId } } : {}),
+      triggeredAt: { not: null },
+      createdAt: { gt: new Date(now.getTime() - CLOCK_SAMPLE_WINDOW_MS) },
+    },
     orderBy: { createdAt: "desc" },
     take: CLOCK_SAMPLE_SIZE,
     select: { createdAt: true, triggeredAt: true },
@@ -376,15 +393,34 @@ export async function estimateClockLeadMs(now: Date): Promise<number> {
   return clockLeadFromSamples(samples);
 }
 
+/**
+ * Fewer deliveries than this say nothing about the clock: one slow delivery is
+ * indistinguishable from a fast clock. A quiet store reads as no lead.
+ */
+export const CLOCK_MIN_SAMPLES = 3;
+
+/**
+ * Past this the estimate is a delivery backlog, not a clock. A server running
+ * ten minutes fast is broken in far louder ways than this guard can see, and
+ * the cap keeps a Shopify delivery outage from shifting every sign-in by hours.
+ */
+export const CLOCK_LEAD_CAP_MS = 10 * 60_000;
+
 /** The pure half of estimateClockLeadMs. Exported for the test. */
 export function clockLeadFromSamples(samples: Array<{ createdAt: Date; triggeredAt: Date | null }>): number {
   let lead: number | null = null;
+  let usable = 0;
   for (const { createdAt, triggeredAt } of samples) {
     if (!triggeredAt) continue;
+    usable += 1;
     const lag = createdAt.getTime() - triggeredAt.getTime();
     lead = lead === null ? lag : Math.min(lead, lag);
   }
-  return Math.max(0, lead ?? 0);
+  if (usable < CLOCK_MIN_SAMPLES) {
+    if (usable > 0) logger.warn("Too few webhook deliveries to estimate clock lead; assuming none", { samples: usable });
+    return 0;
+  }
+  return Math.min(CLOCK_LEAD_CAP_MS, Math.max(0, lead ?? 0));
 }
 
 const INSTALL_PROBE = `#graphql
@@ -529,7 +565,13 @@ export function expiredWebhookFilter(now: Date): Prisma.WebhookEventWhereInput {
  * queue. The claim in processWebhookEvent makes a double hand-off harmless.
  */
 export async function sweepPendingWebhooks(enqueueWebhook: (webhookEventId: string) => Promise<unknown>, now: Date = new Date()): Promise<number> {
-  await abandonExpiredWebhooks(now);
+  // Flagging expired events is bookkeeping; re-queueing due ones is the job.
+  // A failure in the first must not cost a tick of the second.
+  try {
+    await abandonExpiredWebhooks(now);
+  } catch (error) {
+    logger.error("Could not flag expired webhook events; re-queueing due ones anyway", { error });
+  }
 
   const candidates = await prisma.webhookEvent.findMany({
     where: pendingWebhookFilter(now),

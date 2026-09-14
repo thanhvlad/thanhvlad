@@ -103,7 +103,11 @@ export async function registerFulfillmentService(shop: ShopWithSettings, client:
 
   let service = mine;
   if (mine) {
-    if (mine.callbackUrl !== url) {
+    // A service registered while the app still claimed tracking support keeps
+    // that claim until it is updated, and Shopify goes on asking it for tracking
+    // numbers it never answers. Re-attaching is when that is corrected, not only
+    // when the callback URL happens to have moved.
+    if (mine.callbackUrl !== url || mine.trackingSupport) {
       await updateFulfillmentServiceCallback(client, mine.id, url).catch((error) =>
         logger.warn("Could not update fulfilment service callback", { error }),
       );
