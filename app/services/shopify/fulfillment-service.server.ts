@@ -7,8 +7,10 @@ import { assertNoUserErrors, gql, operationIdempotencyKey, type GraphqlClient, t
  * Registering the app as a fulfilment service creates a Shopify *location* owned
  * by the app. Any variant whose inventory sits at that location shows a native
  * **Request fulfillment** button on the Shopify order page; clicking it sends a
- * `fulfillment_orders/fulfillment_request_submitted` webhook here, which the app
- * accepts and then fulfils with the supplier's tracking number.
+ * `fulfillment_orders/fulfillment_request_submitted` notification here. The app
+ * prices it and holds it for the merchant's approval without answering; once
+ * approved it places the supplier order, accepts the request, and fulfils with
+ * the supplier's tracking number.
  *
  * This is opt-in from Settings → Fulfilment service rather than automatic on
  * install: it changes where a merchant's inventory lives, which is not something
@@ -75,6 +77,16 @@ const FULFILLMENT_SERVICES_QUERY = `#graphql
   }
 `;
 
+/**
+ * Whether the service tells Shopify it answers `/fetch_tracking_numbers`.
+ *
+ * It does not. With tracking support on, Shopify calls that endpoint every hour
+ * for completed fulfilments awaiting numbers, and the app has no such list: it
+ * sends the tracking number with each fulfilment when it creates it. Claiming
+ * support promised Shopify an integration that only ever answered empty.
+ */
+export const FULFILLMENT_SERVICE_TRACKING_SUPPORT = false;
+
 export interface FulfillmentServiceInfo {
   id: string;
   serviceName: string;
@@ -82,6 +94,8 @@ export interface FulfillmentServiceInfo {
   callbackUrl: string | null;
   locationId: string | null;
   locationName: string | null;
+  /** What the registration currently claims, so an old one that says true can be corrected. */
+  trackingSupport: boolean;
 }
 
 /** Every fulfilment service on the shop, so we can find one we registered before. */
@@ -93,6 +107,7 @@ export async function listFulfillmentServices(client: GraphqlClient): Promise<Fu
         serviceName: string;
         handle: string;
         callbackUrl: string | null;
+        trackingSupport: boolean;
         type: string;
         location: { id: string; name: string } | null;
       }>;
@@ -105,6 +120,7 @@ export async function listFulfillmentServices(client: GraphqlClient): Promise<Fu
     callbackUrl: s.callbackUrl,
     locationId: s.location?.id ?? null,
     locationName: s.location?.name ?? null,
+    trackingSupport: Boolean(s.trackingSupport),
   }));
 }
 
@@ -119,6 +135,7 @@ export async function createFulfillmentService(
         serviceName: string;
         handle: string;
         callbackUrl: string | null;
+        trackingSupport: boolean;
         location: { id: string; name: string } | null;
       } | null;
       userErrors: UserError[];
@@ -126,7 +143,7 @@ export async function createFulfillmentService(
   }>(client, FULFILLMENT_SERVICE_CREATE, {
     name: input.name,
     callbackUrl: input.callbackUrl,
-    trackingSupport: true,
+    trackingSupport: FULFILLMENT_SERVICE_TRACKING_SUPPORT,
     // The app already mirrors supplier stock onto the merchant's own location,
     // so it does not also want Shopify asking it for inventory levels.
     inventoryManagement: false,
@@ -141,14 +158,20 @@ export async function createFulfillmentService(
     callbackUrl: service.callbackUrl,
     locationId: service.location?.id ?? null,
     locationName: service.location?.name ?? null,
+    trackingSupport: Boolean(service.trackingSupport),
   };
 }
 
+/**
+ * Point an existing registration at this server's callback. It also sets
+ * tracking support off, so a service registered while the app still claimed it
+ * is corrected whenever this runs.
+ */
 export async function updateFulfillmentServiceCallback(client: GraphqlClient, id: string, callbackUrl: string) {
   const data = await gql<{ fulfillmentServiceUpdate: { userErrors: UserError[] } }>(client, FULFILLMENT_SERVICE_UPDATE, {
     id,
     callbackUrl,
-    trackingSupport: true,
+    trackingSupport: FULFILLMENT_SERVICE_TRACKING_SUPPORT,
   });
   assertNoUserErrors(data.fulfillmentServiceUpdate.userErrors, "fulfillmentServiceUpdate");
 }

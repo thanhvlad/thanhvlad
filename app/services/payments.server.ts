@@ -1,4 +1,4 @@
-import type { PurchaseOrderStatus, SupplierPlatform } from "@prisma/client";
+import type { Prisma, PurchaseOrderStatus, SupplierPlatform } from "@prisma/client";
 import prisma from "~/db.server";
 import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
@@ -69,34 +69,132 @@ export interface UnpaidPurchaseOrder {
   supplierAccount: string | null;
 }
 
+/** The views of the payment queue; the Overdue view is derived from the deadline. */
+export const PAYMENT_TABS = ["all", "AWAITING_PAYMENT", "PLACED", "overdue"] as const;
+export type PaymentTab = (typeof PAYMENT_TABS)[number];
+
+/** Rows per page of the payment queue. */
+export const PAYMENT_PAGE_SIZE = 50;
+
+/** A tab from the query string, falling back to "all" for anything unknown. */
+export function paymentTab(value: string | null | undefined): PaymentTab {
+  return PAYMENT_TABS.includes(value as PaymentTab) ? (value as PaymentTab) : "all";
+}
+
+/** Every purchase order that belongs in the queue at all. */
+export function unpaidWhere(shopId: string): Prisma.PurchaseOrderWhereInput {
+  return { order: { shopId }, status: { in: UNPAID_STATUSES }, paymentMarkedAt: null };
+}
+
+/** The rows one tab shows. Overdue means the supplier's deadline is now or past. */
+export function paymentTabWhere(shopId: string, tab: PaymentTab, now: Date): Prisma.PurchaseOrderWhereInput {
+  const base = unpaidWhere(shopId);
+  switch (tab) {
+    case "AWAITING_PAYMENT":
+    case "PLACED":
+      return { ...base, status: tab };
+    case "overdue":
+      return { ...base, paymentDueAt: { lte: now } };
+    default:
+      return base;
+  }
+}
+
 export interface PaymentQueue {
+  /** One page of the selected tab. */
   items: UnpaidPurchaseOrder[];
+  tab: PaymentTab;
+  page: number;
+  pageSize: number;
+  /** Rows in the selected tab, across every page. */
+  total: number;
+  /** Every unpaid purchase order, whatever the tab and page. */
+  count: number;
+  tabCounts: Record<PaymentTab, number>;
   /** Totals per currency, since a shop can order from several platforms. */
   totals: Array<{ currency: string; amount: string; count: number }>;
   byPlatform: Array<{ platform: SupplierPlatform; count: number; bulkUrl: string | null }>;
   expiringSoon: number;
   overdue: number;
+  /** Whether any unpaid order carries a supplier deadline at all. */
+  hasDeadlines: boolean;
+  /** The unpaid order placed longest ago. */
+  oldest: { orderName: string; at: Date | null } | null;
   /** Priced orders still to be placed with the Chrome extension, before they can be paid. */
   awaitingPlacement: number;
 }
 
 /**
- * The payment queue. `now` is injected so the countdown is testable and so a
- * single request renders a consistent set of deadlines.
+ * The payment queue: one page of rows for the selected tab, and figures for
+ * the whole queue.
+ *
+ * It used to load every unpaid purchase order and let the screen filter and
+ * count them, which grows without bound for a busy store and renders hundreds
+ * of rows at once. Rows are now paged in the database, and the stat strip, the
+ * banners and the tab counts come from counts and sums over the whole queue, so
+ * they stay right whichever page is open.
+ *
+ * `now` is injected so the countdown is testable and so a single request
+ * renders a consistent set of deadlines.
  */
-export async function getPaymentQueue(shopId: string, now: Date = new Date()): Promise<PaymentQueue> {
-  const rows = await prisma.purchaseOrder.findMany({
-    where: { order: { shopId }, status: { in: UNPAID_STATUSES }, paymentMarkedAt: null },
-    include: {
-      order: { select: { id: true, name: true, shopifyCreatedAt: true, customerName: true, customerEmail: true, countryCode: true } },
-      supplierAccount: { select: { label: true } },
-      _count: { select: { items: true } },
-    },
-    orderBy: [{ paymentDueAt: "asc" }, { placedAt: "asc" }],
-  });
-  // The same rule the orders list and the extension use, so the banner never
-  // promises more orders to place than the extension actually lists.
-  const awaitingPlacement = await prisma.purchaseOrder.count({ where: awaitingPlacementWhere(shopId) });
+export async function getPaymentQueue(
+  shopId: string,
+  now: Date = new Date(),
+  options: { tab?: PaymentTab; page?: number; pageSize?: number } = {},
+): Promise<PaymentQueue> {
+  const tab = options.tab ?? "all";
+  const pageSize = options.pageSize ?? PAYMENT_PAGE_SIZE;
+  const base = unpaidWhere(shopId);
+  const soon = new Date(now.getTime() + 6 * 3_600_000);
+
+  const [byStatus, byCurrency, platforms, overdue, expiringSoon, withDeadline, oldestRow, awaitingPlacement] = await Promise.all([
+    prisma.purchaseOrder.groupBy({ by: ["status"], where: base, _count: { _all: true } }),
+    prisma.purchaseOrder.groupBy({ by: ["currency"], where: base, _sum: { totalCost: true }, _count: { _all: true } }),
+    prisma.purchaseOrder.groupBy({ by: ["platform"], where: base, _count: { _all: true } }),
+    prisma.purchaseOrder.count({ where: paymentTabWhere(shopId, "overdue", now) }),
+    prisma.purchaseOrder.count({ where: { ...base, paymentDueAt: { gt: now, lte: soon } } }),
+    prisma.purchaseOrder.count({ where: { ...base, paymentDueAt: { not: null } } }),
+    // An unpaid order has been placed, so placedAt is nearly always set; the
+    // rare one without it sorts last rather than posing as the oldest.
+    prisma.purchaseOrder.findFirst({
+      where: base,
+      orderBy: [{ placedAt: { sort: "asc", nulls: "last" } }, { createdAt: "asc" }],
+      select: { placedAt: true, order: { select: { name: true, shopifyCreatedAt: true } } },
+    }),
+    // The same rule the orders list and the extension use, so the banner never
+    // promises more orders to place than the extension actually lists.
+    prisma.purchaseOrder.count({ where: awaitingPlacementWhere(shopId) }),
+  ]);
+
+  const statusCount = (status: PurchaseOrderStatus) => byStatus.find((row) => row.status === status)?._count._all ?? 0;
+  const count = byStatus.reduce((n, row) => n + row._count._all, 0);
+  const tabCounts: Record<PaymentTab, number> = {
+    all: count,
+    AWAITING_PAYMENT: statusCount("AWAITING_PAYMENT"),
+    PLACED: statusCount("PLACED"),
+    overdue,
+  };
+
+  // A page past the end (its rows were paid since the link was made) shows the
+  // last page instead of an empty table.
+  const total = tabCounts[tab];
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  const page = Math.min(Math.max(1, Math.floor(options.page ?? 1)), pages);
+
+  const rows = total
+    ? await prisma.purchaseOrder.findMany({
+        where: paymentTabWhere(shopId, tab, now),
+        include: {
+          order: { select: { id: true, name: true, shopifyCreatedAt: true, customerName: true, customerEmail: true, countryCode: true } },
+          supplierAccount: { select: { label: true } },
+          _count: { select: { items: true } },
+        },
+        // The id breaks ties, so a row cannot appear on two pages or on none.
+        orderBy: [{ paymentDueAt: "asc" }, { placedAt: "asc" }, { id: "asc" }],
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      })
+    : [];
 
   const items: UnpaidPurchaseOrder[] = rows.map((po) => ({
     id: po.id,
@@ -120,31 +218,26 @@ export async function getPaymentQueue(shopId: string, now: Date = new Date()): P
     supplierAccount: po.supplierAccount?.label ?? null,
   }));
 
-  const byCurrency = new Map<string, { amount: ReturnType<typeof d>; count: number }>();
-  for (const item of items) {
-    const entry = byCurrency.get(item.currency) ?? { amount: d(0), count: 0 };
-    entry.amount = entry.amount.plus(d(item.totalCost));
-    entry.count += 1;
-    byCurrency.set(item.currency, entry);
-  }
-
-  const platforms = new Map<SupplierPlatform, number>();
-  for (const item of items) platforms.set(item.platform, (platforms.get(item.platform) ?? 0) + 1);
-
   return {
     items,
-    totals: [...byCurrency.entries()].map(([currency, v]) => ({ currency, amount: money(v.amount), count: v.count })),
-    byPlatform: [...platforms.entries()].map(([platform, count]) => ({ platform, count, bulkUrl: bulkPaymentUrl(platform) })),
-    expiringSoon: items.filter((i) => i.hoursLeft !== null && i.hoursLeft > 0 && i.hoursLeft <= 6).length,
-    overdue: items.filter((i) => i.hoursLeft !== null && i.hoursLeft <= 0).length,
+    tab,
+    page,
+    pageSize,
+    total,
+    count,
+    tabCounts,
+    totals: byCurrency.map((row) => ({ currency: row.currency, amount: money(row._sum.totalCost ?? 0), count: row._count._all })),
+    byPlatform: platforms.map((row) => ({ platform: row.platform, count: row._count._all, bulkUrl: bulkPaymentUrl(row.platform) })),
+    expiringSoon,
+    overdue,
+    hasDeadlines: withDeadline > 0,
+    oldest: oldestRow ? { orderName: oldestRow.order.name, at: oldestRow.placedAt ?? oldestRow.order.shopifyCreatedAt } : null,
     awaitingPlacement,
   };
 }
 
 export async function countUnpaid(shopId: string): Promise<number> {
-  return prisma.purchaseOrder.count({
-    where: { order: { shopId }, status: { in: UNPAID_STATUSES }, paymentMarkedAt: null },
-  });
+  return prisma.purchaseOrder.count({ where: unpaidWhere(shopId) });
 }
 
 /** Re-read the given (or all) unpaid orders upstream to pick up payments. */

@@ -1145,7 +1145,10 @@ model DailyMetric {
 
 enum FulfillmentRequestStatus {
   SUBMITTED
-  /// Accepted in Shopify, priced, and waiting for the merchant to approve the spend.
+  /// Still SUBMITTED in Shopify: priced and held, without answering Shopify,
+  /// until the merchant approves the spend. Approving places the supplier order
+  /// and then accepts the request; declining rejects it. A request not approved
+  /// in time is rejected by the reconciliation sweep before Shopify's deadline.
   AWAITING_APPROVAL
   ACCEPTED
   REJECTED

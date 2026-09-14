@@ -30,6 +30,13 @@ export interface PlatformInfo {
 
 const mock = new MockSupplierAdapter();
 
+/**
+ * How ordering through the extension works, in the words every screen and
+ * notification uses. The extension never places or pays for anything itself.
+ */
+export const EXTENSION_PLACEMENT_STEPS =
+  "The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.";
+
 /** Error code for a platform this server cannot reach through an API. */
 export const SUPPLIER_API_UNAVAILABLE = "SUPPLIER_API_UNAVAILABLE";
 
@@ -208,25 +215,50 @@ export function supplierProductUrl(platform: SupplierPlatform, externalProductId
   return null;
 }
 
-export function listPlatforms(): PlatformInfo[] {
+/**
+ * The supplier platforms as the Suppliers and Search screens describe them.
+ *
+ * Each description has to be true on this server. AliExpress used to be
+ * "Official Dropshipping API. Search, import, place orders and track
+ * shipments." everywhere, including production, which runs the mock driver
+ * with no AliExpress keys: there it can do none of that, and orders go through
+ * the Chrome extension instead. So a platform only claims its API, and only
+ * shows API capabilities, when the live driver and the server keys are both
+ * present. `driver` and the configured flags are parameters so the rule is
+ * tested for both servers.
+ */
+export function listPlatforms(
+  input: { driver?: "mock" | "live"; aliexpressConfigured?: boolean; cjConfigured?: boolean } = {},
+): PlatformInfo[] {
   const ali = new AliExpressAdapter();
   const cj = new CjDropshippingAdapter();
+  const driver = input.driver ?? env().SUPPLIER_DRIVER;
+  const aliConfigured = input.aliexpressConfigured ?? ali.isConfigured();
+  const cjConfigured = input.cjConfigured ?? cj.isConfigured();
+  const aliApi = driver === "live" && aliConfigured;
+  const cjApi = driver === "live" && cjConfigured;
   return [
     {
       platform: "ALIEXPRESS",
       displayName: "AliExpress",
-      description: "Official Dropshipping API. Search, import, place orders and track shipments.",
+      description: aliApi
+        ? "Official AliExpress Dropshipping API: search, import, place orders and track shipments once your AliExpress account is connected."
+        : `Not connected through the AliExpress API on this server. Add products with the DropshipHub Chrome extension on the AliExpress product page. ${EXTENSION_PLACEMENT_STEPS}`,
       authMode: "oauth",
-      configured: ali.isConfigured(),
-      capabilities: ali.capabilities,
+      // Only a platform that can really be connected reports itself configured;
+      // keys under the mock driver would offer a Connect button that goes nowhere.
+      configured: aliApi,
+      capabilities: aliApi ? ali.capabilities : new UnavailableSupplierAdapter("ALIEXPRESS").capabilities,
     },
     {
       platform: "CJ_DROPSHIPPING",
       displayName: "CJ Dropshipping",
-      description: "Warehouses in CN/US/EU, POD and branding services.",
+      description: cjApi
+        ? "Warehouses in CN/US/EU, POD and branding services, through the CJ API once your CJ account is connected."
+        : "Not connected on this server. CJ products cannot be searched, imported or ordered from DropshipHub yet.",
       authMode: "apikey",
-      configured: cj.isConfigured(),
-      capabilities: cj.capabilities,
+      configured: cjApi,
+      capabilities: cjApi ? cj.capabilities : new UnavailableSupplierAdapter("CJ_DROPSHIPPING").capabilities,
     },
     {
       platform: "MOCK",

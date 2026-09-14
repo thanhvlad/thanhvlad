@@ -20,7 +20,7 @@ import { addOrderTags, createFulfillmentWithTracking, updateFulfillmentTracking 
 import { touchSupplierAccount } from "./supplier-accounts.server";
 import { orderPaymentUrl } from "./suppliers/aliexpress.server";
 import { getShippingOptions } from "./suppliers/catalog.server";
-import { adapterForShop, placementModeForShop, supplierProductUrl, unavailableReason, type PlacementMode } from "./suppliers/index.server";
+import { EXTENSION_PLACEMENT_STEPS, adapterForShop, placementModeForShop, supplierProductUrl, unavailableReason, type PlacementMode } from "./suppliers/index.server";
 import type { PlaceOrderInput, SupplierOrderState } from "./suppliers/types";
 
 // ---------------------------------------------------------------------------
@@ -388,7 +388,8 @@ export async function placeSupplierOrders(
         zip: address.zip ?? null,
         countryCode: country,
         taxNumber: address.taxNumber ?? null,
-        email: full.customerEmail ?? null,
+        // No email: neither supplier integration sends one, and a buyer's
+        // address is the least customer data a supplier needs to ship.
       },
       note: po.supplierNote,
       currency: shop.currency,
@@ -420,7 +421,9 @@ export async function placeSupplierOrders(
           paymentDueAt: result.paymentDueAt ?? null,
           errorCode: null,
           errorMessage: null,
-          raw: { ...(po.raw as object), externalOrderIds: result.externalOrderIds ?? [result.externalOrderId], response: sanitize(result.raw) } as Prisma.InputJsonValue,
+          // Only the ids are kept. The supplier's full response echoes the
+          // consignee's name, address and phone, and nothing ever read it back.
+          raw: { ...purchaseOrderRawReadBack(po.raw), externalOrderIds: result.externalOrderIds ?? [result.externalOrderId] } as Prisma.InputJsonValue,
         },
       });
       if (account) await touchSupplierAccount(account.id);
@@ -900,7 +903,7 @@ export async function markPurchaseOrderManual(shop: ShopWithSettings, purchaseOr
   }
 
   const simulated = isSimulatedPurchaseOrder(owned);
-  const raw = owned.raw && typeof owned.raw === "object" && !Array.isArray(owned.raw) ? (owned.raw as Record<string, unknown>) : {};
+  const raw = purchaseOrderRawReadBack(owned.raw);
   const { po, discarded } = await prisma.$transaction(async (tx) => {
     const removed = simulated ? await tx.trackingNumber.deleteMany({ where: { purchaseOrderId: owned.id, syncedToShopify: false } }) : { count: 0 };
     const updated = await tx.purchaseOrder.update({
@@ -1121,7 +1124,10 @@ export async function syncPurchaseOrder(
       paymentUrl: upstream.paymentUrl ?? po.paymentUrl ?? undefined,
       // Once the supplier confirms payment the deadline no longer applies.
       paymentDueAt: ORDER_RANK[status] >= ORDER_RANK.PAID ? null : undefined,
-      raw: { ...(po.raw as object), lastStatus: sanitize(upstream.raw) } as Prisma.InputJsonValue,
+      // The upstream status response is not stored: it repeats the buyer's
+      // address and nothing reads it. Rewriting raw here also drops the copy
+      // older versions of the app kept.
+      raw: purchaseOrderRawReadBack(po.raw),
     },
   });
 
@@ -1522,6 +1528,59 @@ export async function addManualTracking(
 }
 
 // ---------------------------------------------------------------------------
+// Order page access
+// ---------------------------------------------------------------------------
+
+/** One "viewed" entry per person per order per this window. */
+export const ORDER_VIEW_LOG_WINDOW_MS = 60 * 60_000;
+
+/**
+ * Record that someone opened an order's page.
+ *
+ * The page shows the buyer's name, email, phone and address, and Shopify's
+ * protected customer data requirements ask an app to log access to that data.
+ * A refresh, or a merchant flicking between tabs, must not bury the order's
+ * real history under identical lines, so a person who already has an entry for
+ * this order inside the window gets no second one. Two loads racing each other
+ * can both write; that costs a duplicate line, which is harmless.
+ *
+ * Never throws: failing to write the log must not stop the merchant reading
+ * the order. Returns whether an entry was written.
+ */
+export async function recordOrderView(
+  shopId: string,
+  order: { id: string; name: string },
+  actor: string,
+  now: Date = new Date(),
+): Promise<boolean> {
+  try {
+    const recent = await prisma.activityLog.findFirst({
+      where: {
+        shopId,
+        action: "order.viewed",
+        entity: "Order",
+        entityId: order.id,
+        actor,
+        createdAt: { gte: new Date(now.getTime() - ORDER_VIEW_LOG_WINDOW_MS) },
+      },
+      select: { id: true },
+    });
+    if (recent) return false;
+    await logActivity(shopId, {
+      actor,
+      action: "order.viewed",
+      entity: "Order",
+      entityId: order.id,
+      message: `${order.name} was opened by ${actor}, showing the customer's contact details and address.`,
+    });
+    return true;
+  } catch (error) {
+    logger.warn("Could not record an order view", { shopId, orderId: order.id, error });
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Extension placement API
 //
 // Until the AliExpress API is connected, the merchant's own browser places
@@ -1531,12 +1590,9 @@ export async function addManualTracking(
 // thin; the rules live here so they are tested once.
 // ---------------------------------------------------------------------------
 
-/**
- * How ordering through the extension works, in the words every screen and
- * notification uses. The extension never places or pays for anything itself.
- */
-export const EXTENSION_PLACEMENT_STEPS =
-  "The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.";
+// The wording lives with the placement modes in the supplier registry, which
+// describes AliExpress with it too; it is re-exported here for existing callers.
+export { EXTENSION_PLACEMENT_STEPS };
 
 /** Largest body each extension endpoint reads before refusing. */
 export const EXTENSION_BODY_LIMITS = {
@@ -1961,7 +2017,7 @@ export async function markPlacedFromExtension(
   const now = new Date();
   const paid = input.paid === true;
   const status: PurchaseOrderStatus = paid ? "PAID" : "AWAITING_PAYMENT";
-  const raw = po.raw && typeof po.raw === "object" && !Array.isArray(po.raw) ? (po.raw as Record<string, unknown>) : {};
+  const raw = purchaseOrderRawReadBack(po.raw);
 
   // No tracking rows are cleared here, unlike the manual link of a simulated
   // purchase order: one waiting for placement was created in extension mode,
@@ -2113,12 +2169,35 @@ export async function rollupOrderCosts(orderId: string) {
   return { unconverted };
 }
 
-function sanitize(value: unknown): Prisma.InputJsonValue {
-  try {
-    return JSON.parse(JSON.stringify(value ?? null, (_k, v) => (typeof v === "bigint" ? v.toString() : v)));
-  } catch {
-    return null as unknown as Prisma.InputJsonValue;
+/**
+ * The keys of PurchaseOrder.raw the app reads back, and nothing else.
+ *
+ * raw used to carry the supplier's whole placement and status responses, which
+ * repeat the consignee's name, address and phone. Nothing read them, so they
+ * were customer data kept for no purpose. Every write goes through this list,
+ * which also sheds what older versions stored the next time a row is touched.
+ */
+const PURCHASE_ORDER_RAW_KEYS = [
+  "externalOrderIds",
+  "shippingReason",
+  "placementMode",
+  "simulated",
+  "simulatedHistory",
+  "discardedSimulatedTracking",
+  "placedBy",
+  "reportedTotal",
+  // Older purchase orders kept the payment link here before the column existed.
+  "paymentUrl",
+] as const;
+
+export function purchaseOrderRawReadBack(raw: unknown): Record<string, Prisma.InputJsonValue> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const source = raw as Record<string, unknown>;
+  const out: Record<string, Prisma.InputJsonValue> = {};
+  for (const key of PURCHASE_ORDER_RAW_KEYS) {
+    if (source[key] !== undefined && source[key] !== null) out[key] = source[key] as Prisma.InputJsonValue;
   }
+  return out;
 }
 
 export type { PurchaseOrder, ResolveResult };

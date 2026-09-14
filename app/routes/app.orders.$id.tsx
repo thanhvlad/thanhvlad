@@ -42,6 +42,7 @@ import {
   isSimulatedPurchaseOrder,
   markPurchaseOrderManual,
   placeSupplierOrders,
+  recordOrderView,
   retryPurchaseOrder,
   syncPendingTracking,
   syncPurchaseOrder,
@@ -53,9 +54,11 @@ import { approveFulfillmentRequest, declineFulfillmentRequest, pendingApproval }
 import { placementModeForShop, supplierProductUrl, type PlacementMode } from "~/services/suppliers/index.server";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
-  const { shop } = await requireShop(request);
+  const { shop, actor } = await requireShop(request);
   const order = await getOrderDetail(shop.id, params.id!);
   if (!order) throw new Response("Not found", { status: 404 });
+  // Read before the view is recorded, so the list shows what happened to the
+  // order rather than opening with this very visit.
   const activity = await listActivity(shop.id, { entity: "Order", entityId: order.id, limit: 20 });
 
   // A better supplier is only useful where the decision is actually taken, and
@@ -96,6 +99,9 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   }
 
   const approval = await pendingApproval(shop.id, order.id);
+  // The page shows the buyer's contact details, so opening it is logged as
+  // access to protected customer data (at most once an hour per person).
+  await recordOrderView(shop.id, { id: order.id, name: order.name }, actor);
 
   // Whether "Check status" can mean anything: an order placed from the browser
   // has no API to ask, and pretending to check it would only echo its status.

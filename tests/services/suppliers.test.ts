@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MockSupplierAdapter, MOCK_CATALOG_IDS } from "~/services/suppliers/mock.server";
-import { detectPlatform, getAdapter, listPlatforms } from "~/services/suppliers/index.server";
+import { readFileSync } from "node:fs";
+import { EXTENSION_PLACEMENT_STEPS, detectPlatform, getAdapter, listPlatforms } from "~/services/suppliers/index.server";
 
 describe("MockSupplierAdapter", () => {
   const adapter = new MockSupplierAdapter();
@@ -135,5 +136,58 @@ describe("supplier registry", () => {
     });
     expect(detectPlatform("1005006001")?.externalId).toBe("1005006001");
     expect(detectPlatform("hello")).toBeNull();
+  });
+});
+
+describe("how the supplier platforms describe themselves", () => {
+  it("uses the agreed words for extension ordering, never the extension buying anything", () => {
+    expect(EXTENSION_PLACEMENT_STEPS).toBe(
+      "The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.",
+    );
+  });
+
+  it("does not promise the AliExpress API on a server running the mock driver with no keys", () => {
+    // Production today: SUPPLIER_DRIVER=mock and no AliExpress keys.
+    const ali = listPlatforms({ driver: "mock", aliexpressConfigured: false }).find((p) => p.platform === "ALIEXPRESS")!;
+    expect(ali.description).not.toMatch(/Official|API\. Search/);
+    expect(ali.description).toContain("Chrome extension");
+    expect(ali.description).toContain(EXTENSION_PLACEMENT_STEPS);
+    expect(ali.configured).toBe(false);
+    expect(ali.capabilities).toMatchObject({ search: false, placeOrder: false, tracking: false });
+  });
+
+  it("still does not promise it with keys but the mock driver, since nothing would call it", () => {
+    const ali = listPlatforms({ driver: "mock", aliexpressConfigured: true }).find((p) => p.platform === "ALIEXPRESS")!;
+    expect(ali.description).toContain("Chrome extension");
+    expect(ali.configured).toBe(false);
+  });
+
+  it("describes the API once the live driver and the keys are both there", () => {
+    const platforms = listPlatforms({ driver: "live", aliexpressConfigured: true, cjConfigured: false });
+    const ali = platforms.find((p) => p.platform === "ALIEXPRESS")!;
+    expect(ali.description).toMatch(/Official AliExpress Dropshipping API/);
+    expect(ali.configured).toBe(true);
+    expect(ali.capabilities.placeOrder).toBe(true);
+    const cj = platforms.find((p) => p.platform === "CJ_DROPSHIPPING")!;
+    expect(cj.description).toMatch(/Not connected/);
+    expect(cj.capabilities.placeOrder).toBe(false);
+  });
+});
+
+describe("demo data", () => {
+  // The registry never serves invented data for a real platform, so demo data
+  // filed under ALIEXPRESS fails on its first refresh or order.
+  it("seeds the demo catalogue under the Demo supplier", () => {
+    const seed = readFileSync("prisma/seed.ts", "utf8");
+    expect(seed).toContain('platform: "MOCK"');
+    expect(seed).not.toContain('platform: "ALIEXPRESS"');
+    expect(seed).not.toContain("aliexpress.com/item");
+  });
+
+  it("imports the demo product from the Demo supplier, on a test order", () => {
+    const demo = readFileSync("scripts/demo.ts", "utf8");
+    expect(demo).toMatch(/addToImportList\(shop, "\d+", \{ platform: "MOCK"/);
+    expect(demo).toContain("test: true,");
+    expect(demo).not.toContain("aliexpress.com/item");
   });
 });
