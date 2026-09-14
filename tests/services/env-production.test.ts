@@ -42,6 +42,17 @@ describe("env() in production", () => {
     expect(env().SHOPIFY_APP_URL).toBe("https://app.example.com");
   });
 
+  it("boots with the AI exemption list unset, empty or malformed", async () => {
+    // Production today has no AI_UNMETERED_SHOP_DOMAINS; a typo when it is
+    // added must not take the app down either.
+    for (const value of [undefined, "", " ,, not a domain ,https://x.myshopify.com/"]) {
+      vi.resetModules();
+      withEnv({ ...complete, AI_UNMETERED_SHOP_DOMAINS: value });
+      const { env } = await import("~/lib/env.server");
+      expect(env().AI_UNMETERED_SHOP_DOMAINS).toBe(value ?? "");
+    }
+  });
+
   it("refuses to boot without an encryption key, naming it", async () => {
     withEnv({ ...complete, ENCRYPTION_KEY: undefined });
     const { env } = await import("~/lib/env.server");

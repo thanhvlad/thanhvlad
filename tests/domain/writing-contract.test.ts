@@ -96,6 +96,16 @@ describe("resolveStoreBrand", () => {
     expect(brand).toEqual({ name: "Lumora Loves", supportEmail: "support@lumoraloves.com", signOffTagline: LUMORA_TAGLINE });
   });
 
+  it("prefers the merchant's own setting, then Shopify's contact email", () => {
+    const base = { shopName: "Quiet Goods", domain: "q.myshopify.com", examples: [] };
+    expect(resolveStoreBrand({ ...base, settingsEmail: " Care@QuietGoods.com ", contactEmail: "owner@quietgoods.com" }).supportEmail).toBe("care@quietgoods.com");
+    // An empty or unusable setting does not hide Shopify's address.
+    expect(resolveStoreBrand({ ...base, settingsEmail: "", contactEmail: "owner@quietgoods.com" }).supportEmail).toBe("owner@quietgoods.com");
+    expect(resolveStoreBrand({ ...base, settingsEmail: "not an address", contactEmail: "owner@quietgoods.com" }).supportEmail).toBe("owner@quietgoods.com");
+    // The setting still applies when Shopify could not be asked.
+    expect(resolveStoreBrand({ ...base, settingsEmail: "care@quietgoods.com", contactEmail: undefined }).supportEmail).toBe("care@quietgoods.com");
+  });
+
   it("never borrows a tagline or address from a page signed by another brand", () => {
     // A merchant whose early rewrites were signed with the owner's brand.
     const brand = resolveStoreBrand({
@@ -107,11 +117,16 @@ describe("resolveStoreBrand", () => {
     expect(brand).toEqual({ name: "Harbor & Pine", supportEmail: null, signOffTagline: null });
   });
 
-  it("falls back to the store's own pages for the address only when Shopify could not be asked", () => {
-    const examples = [{ descriptionHtml: finishedPage("Quiet Goods", null, "care@quietgoods.com") }];
-    expect(resolveStoreBrand({ shopName: "Quiet Goods", domain: "q.myshopify.com", contactEmail: undefined, examples }).supportEmail).toBe("care@quietgoods.com");
-    // Shopify answered with no usable address: that answer stands.
+  it("prints no address when neither the setting nor Shopify gives one", () => {
+    // Even the store's own older page is not a source: the address on it may
+    // be one the merchant has since retired.
+    const examples = [{ descriptionHtml: finishedPage("Quiet Goods", "A tagline.", "care@quietgoods.com") }];
+    const unreachable = resolveStoreBrand({ shopName: "Quiet Goods", domain: "q.myshopify.com", settingsEmail: "", contactEmail: undefined, examples });
+    expect(unreachable).toEqual({ name: "Quiet Goods", supportEmail: null, signOffTagline: "A tagline." });
     expect(resolveStoreBrand({ shopName: "Quiet Goods", domain: "q.myshopify.com", contactEmail: "", examples }).supportEmail).toBeNull();
+    expect(resolveStoreBrand({ shopName: "Quiet Goods", domain: "q.myshopify.com", contactEmail: null, examples }).supportEmail).toBeNull();
+    // With no address the contract permits no link at all.
+    expect(buildWritingContract(unreachable)).not.toMatch(/mailto:/);
   });
 
   it("names a store with no name after its domain", () => {

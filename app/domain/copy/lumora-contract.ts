@@ -464,43 +464,45 @@ export interface BrandSources {
   shopName: string | null;
   domain: string;
   /**
+   * The support address the merchant entered for AI-written pages in
+   * Settings. It wins over Shopify's, because it is the one answer given for
+   * exactly this purpose.
+   */
+  settingsEmail?: string | null;
+  /**
    * `shop.contactEmail` - the address Shopify says customers use to reach the
-   * shop. `undefined` means it could not be fetched, which is not the same as
-   * the shop having none.
+   * shop. `undefined` when it could not be fetched.
    */
   contactEmail: string | null | undefined;
   /** The shop's own finished pages. */
   examples: Array<{ descriptionHtml: string }>;
 }
 
+/** A usable address, lowercased, or null. */
+function cleanEmail(value: string | null | undefined): string | null {
+  const candidate = value?.trim().toLowerCase() ?? "";
+  return EMAIL.test(candidate) ? candidate : null;
+}
+
 /**
  * The brand a store's pages are written under, from that store's own data.
  *
- * Never the account owner's email (`Shop.email` is where Shopify writes to the
- * merchant, not where customers write to the shop) and never a value from a
- * page signed by another brand. The tagline and, when Shopify could not be
- * asked, the support address are read back from the store's own finished
- * pages - which is what keeps Lumora's sign-off sentence on Lumora's pages
- * without it being written into the code.
+ * The support address is the merchant's setting, else Shopify's public
+ * contact email, else nothing: the page then carries no link. It is never the
+ * account owner's email (`Shop.email` is where Shopify writes to the merchant,
+ * not where customers write to the shop), and no longer an address read back
+ * from an older finished page either. That fallback printed whatever address
+ * a page happened to carry, which may be one the merchant has since retired,
+ * and a live page with a dead support address is worse than one with none.
+ *
+ * The tagline is still read back from the store's own finished pages, and only
+ * from pages signed with this store's name - which is what keeps Lumora's
+ * sign-off sentence on Lumora's pages without it being written into the code.
  */
 export function resolveStoreBrand(sources: BrandSources): StoreBrand {
   const name = sources.shopName?.trim() || sources.domain.replace(/\.myshopify\.com$/i, "");
-  const own = sources.examples.map((e) => ({ html: e.descriptionHtml, signOff: signOffFrom(e.descriptionHtml) })).filter((e) => e.signOff && sameName(e.signOff.name, brandText(name)));
-
-  let supportEmail: string | null = null;
-  if (sources.contactEmail !== undefined) {
-    const candidate = sources.contactEmail?.trim().toLowerCase() ?? "";
-    supportEmail = EMAIL.test(candidate) ? candidate : null;
-  } else {
-    for (const example of own) {
-      const found = /href\s*=\s*["']mailto:([^"'?]+)["']/i.exec(example.html)?.[1]?.toLowerCase();
-      if (found && EMAIL.test(found)) {
-        supportEmail = found;
-        break;
-      }
-    }
-  }
-
-  const signOffTagline = own.map((e) => e.signOff?.tagline).find((t): t is string => Boolean(t)) ?? null;
+  const own = sources.examples.map((e) => signOffFrom(e.descriptionHtml)).filter((signOff) => signOff && sameName(signOff.name, brandText(name)));
+  const supportEmail = cleanEmail(sources.settingsEmail) ?? cleanEmail(sources.contactEmail);
+  const signOffTagline = own.map((signOff) => signOff?.tagline).find((t): t is string => Boolean(t)) ?? null;
   return { name, supportEmail, signOffTagline };
 }

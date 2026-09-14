@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { afterEach, describe, expect, it } from "vitest";
-import { aiEndpointStatus, extractResult, mightBeTheImages, rewriteWasNotBilled } from "~/services/ai-landing.server";
+import { aiEndpointStatus, createRewriteClient, extractResult, mightBeTheImages, rewriteWasNotBilled } from "~/services/ai-landing.server";
 
 /**
  * These two helpers exist because the app can be pointed at an
@@ -104,16 +104,64 @@ describe("aiEndpointStatus", () => {
 });
 
 describe("rewriteWasNotBilled", () => {
-  it("refunds a request the endpoint answered with an error status", () => {
-    expect(rewriteWasNotBilled(new Anthropic.APIError(403, undefined, "blocked", new Headers()))).toBe(true);
-    expect(rewriteWasNotBilled(new Anthropic.APIError(529, undefined, "overloaded", new Headers()))).toBe(true);
+  const gateway = { direct: false };
+  const direct = { direct: true };
+  const apiError = (status: number) => new Anthropic.APIError(status, undefined, `status ${status}`, new Headers());
+
+  it("gives back a request refused before any model ran, through a gateway or directly", () => {
+    for (const status of [400, 401, 403, 404, 413, 422, 429]) {
+      expect(rewriteWasNotBilled(apiError(status), gateway), `gateway ${status}`).toBe(true);
+      expect(rewriteWasNotBilled(apiError(status), direct), `direct ${status}`).toBe(true);
+    }
   });
 
-  it("charges a dropped connection, where the model may have finished anyway", () => {
-    expect(rewriteWasNotBilled(new Anthropic.APIConnectionError({ message: "socket hang up" }))).toBe(false);
+  it("gives back Anthropic's own 500 and 529, which it raises instead of running the request", () => {
+    expect(rewriteWasNotBilled(apiError(500), direct)).toBe(true);
+    expect(rewriteWasNotBilled(apiError(529), direct)).toBe(true);
+  });
+
+  it("keeps every 5xx counted through a gateway, where the model may have finished upstream", () => {
+    // Production's configuration: a gateway that gives up on a long generation
+    // answers 502/504/524 after the upstream call was billed.
+    for (const status of [500, 502, 503, 504, 524, 529]) {
+      expect(rewriteWasNotBilled(apiError(status), gateway), `gateway ${status}`).toBe(false);
+    }
+  });
+
+  it("keeps other statuses counted even directly", () => {
+    for (const status of [408, 409, 502, 503, 504]) {
+      expect(rewriteWasNotBilled(apiError(status), direct), `direct ${status}`).toBe(false);
+    }
+  });
+
+  it("charges a dropped connection or timeout, where the model may have finished anyway", () => {
+    expect(rewriteWasNotBilled(new Anthropic.APIConnectionError({ message: "socket hang up" }), direct)).toBe(false);
+    expect(rewriteWasNotBilled(new Anthropic.APIConnectionTimeoutError(), direct)).toBe(false);
   });
 
   it("charges an answer that came back and would not parse", () => {
-    expect(rewriteWasNotBilled(new Error("The endpoint returned no JSON object."))).toBe(false);
+    expect(rewriteWasNotBilled(new Error("The endpoint returned no JSON object."), direct)).toBe(false);
+  });
+
+  describe("reading the endpoint from the environment", () => {
+    const saved = process.env.ANTHROPIC_BASE_URL;
+    afterEach(() => {
+      if (saved === undefined) delete process.env.ANTHROPIC_BASE_URL;
+      else process.env.ANTHROPIC_BASE_URL = saved;
+    });
+
+    it("treats a 529 as billed once ANTHROPIC_BASE_URL names a gateway", () => {
+      process.env.ANTHROPIC_BASE_URL = "https://gateway.example.net/v1";
+      expect(rewriteWasNotBilled(apiError(529))).toBe(false);
+      delete process.env.ANTHROPIC_BASE_URL;
+      expect(rewriteWasNotBilled(apiError(529))).toBe(true);
+    });
+  });
+});
+
+describe("createRewriteClient", () => {
+  it("never retries on its own, so one reserved rewrite is one request", () => {
+    const client = createRewriteClient();
+    expect(client.maxRetries).toBe(0);
   });
 });

@@ -3,7 +3,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { useFetcher, useLoaderData } from "@remix-run/react";
 import { Banner, Card, Checkbox, FormLayout, Layout, Select, TextField } from "@shopify/polaris";
 import { useSettingsPageAction } from "~/components/settings-page-action";
-import { mergeShopSettings, type ShopSettings } from "~/domain/settings/shop-settings";
+import { mergeShopSettings, supportEmailProblem, type ShopSettings } from "~/domain/settings/shop-settings";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { actionFailure } from "~/lib/errors";
 import { SUPPORTED_LOCALES, localeCoverage } from "~/lib/i18n";
@@ -27,6 +27,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const patch = json<Partial<ShopSettings>>("settings", {});
     if (patch.ui?.locale && patch.ui.locale !== shop.parsedSettings.ui.locale) {
       patch.ui = { ...patch.ui, localeChosen: true };
+    }
+    // This address is printed as a mailto link on live product pages, so a
+    // value that is not one plain address is refused here rather than saved
+    // and quietly ignored at rewrite time.
+    if (patch.products && typeof patch.products.storefrontSupportEmail === "string") {
+      if (supportEmailProblem(patch.products.storefrontSupportEmail)) {
+        return { ok: false, error: "The storefront support email is not a valid address.", errorKey: "settings.products.storefrontSupportEmail.invalid" };
+      }
+      patch.products = { ...patch.products, storefrontSupportEmail: patch.products.storefrontSupportEmail.trim() };
     }
     if (patch.orders?.autoPlaceOrders && !shop.parsedSettings.orders.autoPlaceOrders) {
       await requireFeature(shop, "autoPlaceOrders");
@@ -151,6 +160,16 @@ export default function GeneralSettings() {
               <TextField label={t("settings.products.defaultProductType.label")} value={s.products.defaultProductType} onChange={(v) => set("products", { defaultProductType: v })} autoComplete="off" />
               <TextField label={t("settings.products.defaultTags.label")} value={s.products.defaultTags} onChange={(v) => set("products", { defaultTags: v })} autoComplete="off" helpText={t("settings.general.products.defaultTags.help")} />
             </FormLayout.Group>
+            <TextField
+              label={t("settings.products.storefrontSupportEmail.label")}
+              type="email"
+              value={s.products.storefrontSupportEmail}
+              onChange={(v) => set("products", { storefrontSupportEmail: v })}
+              autoComplete="off"
+              placeholder={t("settings.products.storefrontSupportEmail.placeholder")}
+              helpText={t("settings.products.storefrontSupportEmail.help")}
+              error={supportEmailProblem(s.products.storefrontSupportEmail) ? t("settings.products.storefrontSupportEmail.invalid") : undefined}
+            />
             <Checkbox label={t("settings.products.importDescription.label")} checked={s.products.importDescription} onChange={(v) => set("products", { importDescription: v })} />
             <Checkbox label={t("settings.products.cleanDescription.label")} checked={s.products.cleanDescription} onChange={(v) => set("products", { cleanDescription: v })} disabled={!s.products.importDescription} />
           </FormLayout>

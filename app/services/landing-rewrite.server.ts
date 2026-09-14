@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import prisma from "~/db.server";
-import { aiRewriteAllowance, aiUsagePeriod, type AiRewriteAllowance } from "~/domain/billing/plans";
+import { aiRewriteAllowance, aiUsagePeriod, isUnmeteredShop, parseShopDomainList, type AiRewriteAllowance } from "~/domain/billing/plans";
 import { checkRewrite } from "~/domain/copy/check-rewrite";
 import { exampleFitsBrand, resolveStoreBrand, type StoreBrand } from "~/domain/copy/lumora-contract";
+import { env } from "~/lib/env.server";
 import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
 import { logActivity } from "./activity.server";
@@ -36,10 +37,15 @@ export interface RewriteOutcome {
  *
  * These are what make the rewrite adapt per shop without anyone describing the
  * shop: their markup already renders correctly in that shop's theme, so it is
- * copied rather than guessed at. Longest first, because length is the cheapest
- * available proxy for "this one was actually written".
+ * copied rather than guessed at. Newest first.
+ *
+ * This returns candidates, not the examples themselves: pages rewritten before
+ * the contract was per store may be signed by another brand, and the caller
+ * drops those. Fetching only the two a rewrite uses meant two contaminated
+ * recent pages left a store with no examples at all, even with older pages of
+ * its own, so a few more are read and the caller keeps the first two that fit.
  */
-export async function landingExamples(shopId: string, excludeId?: string, limit = 2) {
+export async function landingExamples(shopId: string, excludeId?: string, limit = 6) {
   const rows = await prisma.importedProduct.findMany({
     where: {
       shopId,
@@ -56,7 +62,20 @@ export async function landingExamples(shopId: string, excludeId?: string, limit 
   return rows.map((r) => ({ title: r.title, descriptionHtml: r.description }));
 }
 
-type ShopRef = Pick<ShopWithSettings, "id" | "accountId">;
+type ShopRef = Pick<ShopWithSettings, "id" | "accountId" | "domain">;
+
+/** How many of the fetched worked examples a rewrite is sent with. */
+const EXAMPLES_PER_REWRITE = 2;
+
+/**
+ * Whether this shop's rewrites are exempt from the monthly allowance.
+ *
+ * Read from the environment on every call rather than at module load, so a
+ * test or an operator changing the variable is not defeated by a cached list.
+ */
+export function aiRewritesUnmetered(shop: Pick<ShopWithSettings, "domain">): boolean {
+  return isUnmeteredShop(shop.domain, parseShopDomainList(env().AI_UNMETERED_SHOP_DOMAINS));
+}
 
 /**
  * Whose allowance a rewrite comes out of. The plan belongs to the account, so
@@ -76,7 +95,7 @@ export async function getAiRewriteAllowance(shop: ShopRef): Promise<AiRewriteAll
       select: { used: true },
     }),
   ]);
-  return aiRewriteAllowance(plan, row?.used ?? 0);
+  return aiRewriteAllowance(plan, row?.used ?? 0, { unmetered: aiRewritesUnmetered(shop) });
 }
 
 /**
@@ -86,13 +105,24 @@ export async function getAiRewriteAllowance(shop: ShopRef): Promise<AiRewriteAll
  * the last rewrite: the row only moves while it is under the limit, and the
  * affected-row count says whether it did. Returns the period it was charged to
  * so a refund lands in the same month even if the call straddles midnight.
+ *
+ * An unmetered shop is still counted, without the limit, so the operator can
+ * see what the exemption costs in the same table as everyone else's usage.
  */
 async function reserveAiRewrite(shop: ShopRef): Promise<{ period: string } | null> {
-  const plan = await currentPlan(shop);
-  const limit = aiRewriteAllowance(plan, 0).limit;
-  if (limit <= 0) return null;
   const period = aiUsagePeriod();
   const key = usageOwnerKey(shop);
+  if (aiRewritesUnmetered(shop)) {
+    await prisma.$executeRaw`
+      INSERT INTO "AiRewriteUsage" ("id", "ownerKey", "period", "used", "createdAt", "updatedAt")
+      VALUES (${randomUUID()}, ${key}, ${period}, 1, NOW(), NOW())
+      ON CONFLICT ("ownerKey", "period") DO UPDATE
+        SET "used" = "AiRewriteUsage"."used" + 1, "updatedAt" = NOW()`;
+    return { period };
+  }
+  const plan = await currentPlan(shop);
+  const limit = aiRewriteAllowance(plan, 0).limit ?? 0;
+  if (limit <= 0) return null;
   const applied = await prisma.$executeRaw`
     INSERT INTO "AiRewriteUsage" ("id", "ownerKey", "period", "used", "createdAt", "updatedAt")
     VALUES (${randomUUID()}, ${key}, ${period}, 1, NOW(), NOW())
@@ -123,13 +153,13 @@ const brandCache = new Map<string, { at: number; name: string | null; contactEma
 const BRAND_TTL_MS = 5 * 60_000;
 
 /**
- * The store's public name and contact address, straight from Shopify.
+ * The store's public name and contact address, straight from Shopify, plus
+ * the support address the merchant set for these pages in Settings.
  *
- * Asked at rewrite time rather than read from the Shop row because the row
- * holds `shop.email` - the address Shopify uses to reach the merchant, which
- * must never be printed on a storefront. When Shopify cannot be asked the
- * email stays `undefined`, and resolveStoreBrand falls back to the store's own
- * finished pages instead of dropping the address.
+ * Shopify is asked at rewrite time rather than read from the Shop row because
+ * the row holds `shop.email` - the address Shopify uses to reach the merchant,
+ * which must never be printed on a storefront. When Shopify cannot be asked and
+ * the merchant set no address, the page carries no email link at all.
  */
 async function storeBrand(shop: ShopWithSettings, examples: Array<{ descriptionHtml: string }>): Promise<StoreBrand> {
   let name: string | null = shop.name;
@@ -149,7 +179,13 @@ async function storeBrand(shop: ShopWithSettings, examples: Array<{ descriptionH
       logger.warn("Could not read the store's contact email for the rewrite", { shopId: shop.id, error: errorMessage(error) });
     }
   }
-  return resolveStoreBrand({ shopName: name, domain: shop.domain, contactEmail, examples });
+  return resolveStoreBrand({
+    shopName: name,
+    domain: shop.domain,
+    settingsEmail: shop.parsedSettings?.products.storefrontSupportEmail,
+    contactEmail,
+    examples,
+  });
 }
 
 export async function rewriteImportedProduct(
@@ -189,7 +225,7 @@ export async function rewriteImportedProduct(
 
   const examples = options.examples ?? (await landingExamples(shop.id, importedProductId));
   input.brand = await storeBrand(shop, examples);
-  input.examples = examples.filter((e) => exampleFitsBrand(e.descriptionHtml, input.brand.name));
+  input.examples = examples.filter((e) => exampleFitsBrand(e.descriptionHtml, input.brand.name)).slice(0, EXAMPLES_PER_REWRITE);
 
   // The allowance is taken here, per product and at the moment of spending,
   // not when the batch was queued: a batch queued with rewrites to spare can

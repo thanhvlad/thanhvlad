@@ -11,6 +11,8 @@ import {
   checkLimit,
   cheapestPlanWith,
   entitledPlan,
+  isUnmeteredShop,
+  parseShopDomainList,
   planAllows,
   planFromSubscriptionName,
   usageFraction,
@@ -125,6 +127,35 @@ describe("AI rewrite allowance", () => {
     expect(checkAiRewriteRequest(aiRewriteAllowance("FREE", 3), 1)).toBe("quota-exhausted");
     expect(checkAiRewriteRequest(aiRewriteAllowance("FREE", 1), 3)).toBe("quota-short");
     expect(checkAiRewriteRequest(aiRewriteAllowance("FREE", 1), 2)).toBeNull();
+  });
+
+  it("gives an unmetered store no limit but still reports its usage", () => {
+    // The owner's store sits on the free tier; without the exemption it would
+    // drop to three rewrites a month on deploy.
+    expect(aiRewriteAllowance("FREE", 41, { unmetered: true })).toEqual({ plan: "FREE", limit: null, used: 41, remaining: null, upgradeTo: null });
+    expect(aiRewriteAllowance("FREE", 3, { unmetered: false }).remaining).toBe(0);
+  });
+
+  it("lets an unmetered store rewrite any batch up to the batch cap", () => {
+    const unmetered = aiRewriteAllowance("FREE", 10_000, { unmetered: true });
+    expect(checkAiRewriteRequest(unmetered, MAX_AI_REWRITE_BATCH)).toBeNull();
+    expect(checkAiRewriteRequest(unmetered, MAX_AI_REWRITE_BATCH + 1)).toBe("batch-too-large");
+    expect(checkAiRewriteRequest(unmetered, 0)).toBe("none-selected");
+  });
+
+  it("reads the unmetered shop list forgivingly and matches domains exactly", () => {
+    const list = parseShopDomainList(" 1szvp0-4u.myshopify.com, ,HTTPS://Other-Store.myshopify.com/ ");
+    expect(list).toEqual(["1szvp0-4u.myshopify.com", "other-store.myshopify.com"]);
+    expect(isUnmeteredShop("1SZVP0-4U.myshopify.com", list)).toBe(true);
+    expect(isUnmeteredShop("other-store.myshopify.com", list)).toBe(true);
+    // A prefix or suffix of a listed domain is a different shop.
+    expect(isUnmeteredShop("1szvp0-4u.myshopify.com.evil.example", list)).toBe(false);
+    expect(isUnmeteredShop("szvp0-4u.myshopify.com", list)).toBe(false);
+    expect(isUnmeteredShop(null, list)).toBe(false);
+    // The default, an empty variable, exempts nobody.
+    expect(parseShopDomainList("")).toEqual([]);
+    expect(parseShopDomainList(undefined)).toEqual([]);
+    expect(isUnmeteredShop("1szvp0-4u.myshopify.com", parseShopDomainList(""))).toBe(false);
   });
 
   it("counts by UTC calendar month and resets on the first", () => {
