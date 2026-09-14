@@ -15,7 +15,7 @@ import { notify } from "./notifications.server";
 import { evaluateAndStoreOrder, lineResolution, orderIssues, supplierAddressFor } from "./orders.server";
 import { chooseShippingForShop } from "./shipping.server";
 import { withSettings, type ShopWithSettings } from "./shop.server";
-import { offlineClient, type GraphqlClient } from "./shopify/graphql.server";
+import { gql, offlineClient, type GraphqlClient } from "./shopify/graphql.server";
 import { addOrderTags, createFulfillmentWithTracking, updateFulfillmentTracking } from "./shopify/orders.server";
 import { touchSupplierAccount } from "./supplier-accounts.server";
 import { orderPaymentUrl } from "./suppliers/aliexpress.server";
@@ -1110,6 +1110,102 @@ export async function syncOpenPurchaseOrders(shop: ShopWithSettings, options: { 
   return { checked: open.length, changed };
 }
 
+// ---------------------------------------------------------------------------
+// Fulfilment-service routing
+// ---------------------------------------------------------------------------
+
+const FULFILLMENT_ROUTING_QUERY = `#graphql
+  query DropshipFulfillmentRouting($id: ID!) {
+    order(id: $id) {
+      fulfillmentOrders(first: 50) {
+        nodes {
+          id
+          status
+          requestStatus
+          assignedLocation { location { id } }
+          lineItems(first: 100) { nodes { remainingQuantity lineItem { id } } }
+        }
+      }
+    }
+  }
+`;
+
+export interface RoutedFulfillmentOrder {
+  id: string;
+  status: string;
+  requestStatus: string;
+  locationId: string | null;
+  lineItems: Array<{ lineItemId: string; remainingQuantity: number }>;
+}
+
+/** Where each fulfilment order of a Shopify order sits, and whether it was requested. */
+export async function fetchFulfillmentRouting(client: GraphqlClient, shopifyOrderId: string): Promise<RoutedFulfillmentOrder[]> {
+  const data = await gql<{
+    order: {
+      fulfillmentOrders: {
+        nodes: Array<{
+          id: string;
+          status: string;
+          requestStatus: string;
+          assignedLocation: { location: { id: string } | null } | null;
+          lineItems: { nodes: Array<{ remainingQuantity: number; lineItem: { id: string } }> };
+        }>;
+      };
+    } | null;
+  }>(client, FULFILLMENT_ROUTING_QUERY, { id: shopifyOrderId });
+  return (data.order?.fulfillmentOrders.nodes ?? []).map((fo) => ({
+    id: fo.id,
+    status: fo.status,
+    requestStatus: fo.requestStatus,
+    locationId: fo.assignedLocation?.location?.id ?? null,
+    lineItems: fo.lineItems.nodes.map((li) => ({ lineItemId: li.lineItem.id, remainingQuantity: li.remainingQuantity })),
+  }));
+}
+
+/** Fulfilment-order statuses that still have work in them. */
+const OPEN_FULFILLMENT_ORDER_STATUSES = new Set(["OPEN", "IN_PROGRESS", "SCHEDULED", "ON_HOLD"]);
+
+/**
+ * Request states in which the app, as the fulfilment service, has been asked to
+ * fulfil and has said yes. A rejected cancellation leaves the accepted request
+ * standing, so it counts too.
+ */
+const FULFILLABLE_REQUEST_STATUSES = new Set(["ACCEPTED", "CANCELLATION_REJECTED"]);
+
+/**
+ * Which Shopify line items belong to the app's fulfilment-service location.
+ *
+ * `serviceLineItemIds` are placed only through a fulfilment request, never by
+ * auto-place. `awaitingRequest` are those not yet requested and accepted, which
+ * the app must not fulfil: Built for Shopify 5.8.4 allows a fulfilment service
+ * to fulfil only after the merchant asks, and an unrequested fulfilment order
+ * at the app's location was fulfilled the moment a tracking number arrived.
+ *
+ * Lines at the merchant's own locations are not affected: there the app acts
+ * as an order-management app on the merchant's behalf, as it always has.
+ */
+export function fulfillmentServiceRouting(
+  fulfillmentOrders: RoutedFulfillmentOrder[],
+  appLocationId: string | null | undefined,
+): { serviceLineItemIds: Set<string>; awaitingRequest: Set<string> } {
+  const serviceLineItemIds = new Set<string>();
+  const awaitingRequest = new Set<string>();
+  if (!appLocationId) return { serviceLineItemIds, awaitingRequest };
+  for (const fo of fulfillmentOrders) {
+    if (fo.locationId !== appLocationId || !OPEN_FULFILLMENT_ORDER_STATUSES.has(fo.status)) continue;
+    const fulfillable = fo.status === "IN_PROGRESS" && FULFILLABLE_REQUEST_STATUSES.has(fo.requestStatus);
+    for (const li of fo.lineItems) {
+      if (li.remainingQuantity <= 0) continue;
+      serviceLineItemIds.add(li.lineItemId);
+      if (!fulfillable) awaitingRequest.add(li.lineItemId);
+    }
+  }
+  return { serviceLineItemIds, awaitingRequest };
+}
+
+const AWAITING_FULFILLMENT_REQUEST =
+  "Not sent to Shopify yet: these items are routed to DropshipHub's fulfilment location, and Shopify only lets the app fulfil them after you press Request fulfillment and the request is accepted.";
+
 /**
  * Push tracking numbers to Shopify as fulfilments. One fulfilment per tracking
  * number covering the line items of its purchase order.
@@ -1187,6 +1283,17 @@ export async function syncPendingTracking(shop: ShopWithSettings, purchaseOrderI
       settings.trackingUrlTemplate ? settings.trackingUrlTemplate.replace("{tracking}", t.number) : t.trackingUrl;
 
     try {
+      if (outstanding.length > 0 && shop.fulfillmentLocationId) {
+        // The whole shipment waits rather than going out in part: a partial
+        // fulfilment would mark the tracking synced and the held lines would
+        // never be fulfilled once the request was accepted. The rows stay
+        // unsynced, so the next tick tries again.
+        const routing = fulfillmentServiceRouting(await fetchFulfillmentRouting(graphql, po.order.shopifyOrderId), shop.fulfillmentLocationId);
+        if (outstanding.some((l) => routing.awaitingRequest.has(l.shopifyLineItemId))) {
+          await prisma.trackingNumber.updateMany({ where: { id: { in: trackingIds } }, data: { syncError: AWAITING_FULFILLMENT_REQUEST } });
+          continue;
+        }
+      }
       if (outstanding.length > 0) {
         const result = await createFulfillmentWithTracking(graphql, {
           orderId: po.order.shopifyOrderId,

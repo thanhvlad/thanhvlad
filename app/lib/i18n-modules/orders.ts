@@ -79,6 +79,16 @@ export const en = {
   // ---- Simulated supplier orders -----------------------------------------------
   "orders.simulated.title": "Simulated supplier order",
   "orders.simulated.body": "This supplier order was made up by the Demo supplier. Nothing was ordered or paid for, and its tracking is never sent to a real customer. Cancel it, then send the order to a real supplier.",
+
+  // ---- Fulfilment requests from Shopify ------------------------------------------
+  "orders.fulfillmentRequest.decideBy": "Shopify has not been answered yet. Unless you approve it, the request is declined automatically on {when}.",
+  "orders.fulfillmentRequest.how.step3": "With approval on (the default), it prices the order and waits for you: approving places the supplier order and accepts the request, declining rejects it, and a request nobody approves within 20 hours is declined automatically so Shopify is never left waiting. With approval off, it places the supplier order and accepts straight away.",
+
+  // ---- Paying several supplier orders ---------------------------------------------
+  "orders.payments.moreTitle": "{n} more payment page(s) to open",
+  "orders.payments.blockedTitle": "Your browser blocked the payment page. {n} page(s) to open",
+  "orders.payments.moreBody": "A browser opens one new tab per click, so open the rest one at a time.",
+  "orders.payments.payOrder": "Pay {order} ({amount})",
 } as const;
 
 export const vi: Partial<Record<keyof typeof en, string>> = {
@@ -157,4 +167,14 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   // ---- Simulated supplier orders -----------------------------------------------
   "orders.simulated.title": "Đơn nhà cung cấp giả lập",
   "orders.simulated.body": "Đơn này do Nhà cung cấp mẫu tự tạo ra. Không có gì được đặt hay thanh toán, và mã vận đơn của nó không bao giờ được gửi cho khách thật. Hãy huỷ đơn này rồi gửi đơn hàng cho một nhà cung cấp thật.",
+
+  // ---- Fulfilment requests from Shopify ------------------------------------------
+  "orders.fulfillmentRequest.decideBy": "Shopify vẫn đang chờ trả lời. Nếu bạn không duyệt, yêu cầu sẽ tự động bị từ chối vào {when}.",
+  "orders.fulfillmentRequest.how.step3": "Khi bật duyệt (mặc định), app tính giá rồi chờ bạn: duyệt thì app đặt đơn nhà cung cấp và nhận yêu cầu, từ chối thì app báo từ chối, còn yêu cầu không ai duyệt trong 20 giờ sẽ tự động bị từ chối để Shopify không phải chờ mãi. Khi tắt duyệt, app đặt đơn nhà cung cấp và nhận yêu cầu ngay.",
+
+  // ---- Paying several supplier orders ---------------------------------------------
+  "orders.payments.moreTitle": "Còn {n} trang thanh toán cần mở",
+  "orders.payments.blockedTitle": "Trình duyệt đã chặn trang thanh toán. Còn {n} trang cần mở",
+  "orders.payments.moreBody": "Mỗi lần bấm, trình duyệt chỉ cho mở một thẻ mới, nên hãy mở lần lượt từng trang còn lại.",
+  "orders.payments.payOrder": "Thanh toán {order} ({amount})",
 };

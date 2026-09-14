@@ -38,6 +38,7 @@ const mocks = vi.hoisted(() => {
     updateFulfillmentTracking: fn(),
     addOrderTags: fn(),
     offlineClient: fn(),
+    gql: fn(),
   };
 });
 
@@ -53,7 +54,7 @@ vi.mock("~/services/orders.server", () => ({
 }));
 vi.mock("~/services/shipping.server", () => ({ chooseShippingForShop: mocks.chooseShippingForShop }));
 vi.mock("~/services/shop.server", () => ({ withSettings: (shop: object) => ({ ...shop, parsedSettings: parseShopSettings({}) }) }));
-vi.mock("~/services/shopify/graphql.server", () => ({ offlineClient: mocks.offlineClient }));
+vi.mock("~/services/shopify/graphql.server", () => ({ offlineClient: mocks.offlineClient, gql: mocks.gql }));
 vi.mock("~/services/shopify/orders.server", () => ({
   addOrderTags: mocks.addOrderTags,
   createFulfillmentWithTracking: mocks.createFulfillmentWithTracking,
@@ -303,6 +304,90 @@ describe("simulated purchase orders and Shopify", () => {
     const input = mocks.createFulfillmentWithTracking.mock.calls[0][1];
     expect(input.notifyCustomer).toBe(true);
     expect(input.tracking.urls).toHaveLength(1);
+  });
+});
+
+describe("fulfilment-service routing", () => {
+  const APP_LOCATION = "gid://shopify/Location/99";
+  const routed = (overrides: Partial<import("~/services/fulfillment.server").RoutedFulfillmentOrder>) => ({
+    id: "gid://shopify/FulfillmentOrder/1",
+    status: "OPEN",
+    requestStatus: "UNSUBMITTED",
+    locationId: APP_LOCATION,
+    lineItems: [{ lineItemId: "gid://shopify/LineItem/1", remainingQuantity: 1 }],
+    ...overrides,
+  });
+
+  it("holds back lines at the app's location until their request is accepted", () => {
+    for (const requestStatus of ["UNSUBMITTED", "SUBMITTED", "REJECTED", "CANCELLATION_REQUESTED"]) {
+      const routing = fulfillment.fulfillmentServiceRouting([routed({ requestStatus, status: requestStatus === "UNSUBMITTED" ? "OPEN" : "IN_PROGRESS" })], APP_LOCATION);
+      expect(routing.serviceLineItemIds.has("gid://shopify/LineItem/1")).toBe(true);
+      expect(routing.awaitingRequest.has("gid://shopify/LineItem/1")).toBe(true);
+    }
+    for (const requestStatus of ["ACCEPTED", "CANCELLATION_REJECTED"]) {
+      const routing = fulfillment.fulfillmentServiceRouting([routed({ requestStatus, status: "IN_PROGRESS" })], APP_LOCATION);
+      expect(routing.serviceLineItemIds.has("gid://shopify/LineItem/1")).toBe(true);
+      expect(routing.awaitingRequest.size).toBe(0);
+    }
+  });
+
+  it("leaves the merchant's own locations, finished fulfilment orders and unregistered shops alone", () => {
+    expect(fulfillment.fulfillmentServiceRouting([routed({ locationId: "gid://shopify/Location/1" })], APP_LOCATION).serviceLineItemIds.size).toBe(0);
+    expect(fulfillment.fulfillmentServiceRouting([routed({ status: "CLOSED" })], APP_LOCATION).serviceLineItemIds.size).toBe(0);
+    expect(fulfillment.fulfillmentServiceRouting([routed({ lineItems: [{ lineItemId: "gid://shopify/LineItem/1", remainingQuantity: 0 }] })], APP_LOCATION).serviceLineItemIds.size).toBe(0);
+    expect(fulfillment.fulfillmentServiceRouting([routed({})], null).serviceLineItemIds.size).toBe(0);
+  });
+
+  function trackingRow(purchaseOrder: Record<string, unknown>) {
+    return {
+      id: "t1",
+      purchaseOrderId: "po1",
+      number: "LP00000000001",
+      carrierName: "Cainiao",
+      carrierCode: "CAINIAO",
+      trackingUrl: null,
+      notifyCustomer: true,
+      purchaseOrder: { id: "po1", orderId: "order1", items: [{ orderLineItemId: "li1" }], trackings: [], ...purchaseOrder },
+    };
+  }
+
+  function routingResponse(requestStatus: string, status: string) {
+    return {
+      order: {
+        fulfillmentOrders: {
+          nodes: [{ id: "gid://shopify/FulfillmentOrder/1", status, requestStatus, assignedLocation: { location: { id: APP_LOCATION } }, lineItems: { nodes: [{ remainingQuantity: 1, lineItem: { id: "gid://shopify/LineItem/1" } }] } }],
+        },
+      },
+    };
+  }
+
+  it("does not fulfil an unrequested fulfilment order at the app's location, and says why", async () => {
+    mocks.prisma.trackingNumber.findMany.mockResolvedValue([
+      trackingRow({ platform: "ALIEXPRESS", externalOrderId: "8190000000000000", raw: {}, order: { name: "#1001", isTest: false, shopifyOrderId: "gid://shopify/Order/1" } }),
+    ]);
+    mocks.prisma.orderLineItem.findMany.mockResolvedValue([{ id: "li1", shopifyLineItemId: "gid://shopify/LineItem/1", fulfillableQuantity: 1 }]);
+    mocks.gql.mockResolvedValue(routingResponse("UNSUBMITTED", "OPEN"));
+
+    const result = await fulfillment.syncPendingTracking(makeShop({ fulfillmentLocationId: APP_LOCATION }), undefined, {} as never);
+
+    expect(mocks.createFulfillmentWithTracking).not.toHaveBeenCalled();
+    expect(result).toEqual({ synced: 0, failed: 0 });
+    expect(mocks.prisma.trackingNumber.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { syncError: expect.stringMatching(/Request fulfillment/) } }),
+    );
+  });
+
+  it("fulfils once the request has been accepted", async () => {
+    mocks.prisma.trackingNumber.findMany.mockResolvedValue([
+      trackingRow({ platform: "ALIEXPRESS", externalOrderId: "8190000000000000", raw: {}, order: { name: "#1001", isTest: false, shopifyOrderId: "gid://shopify/Order/1" } }),
+    ]);
+    mocks.prisma.orderLineItem.findMany.mockResolvedValue([{ id: "li1", shopifyLineItemId: "gid://shopify/LineItem/1", fulfillableQuantity: 1 }]);
+    mocks.gql.mockResolvedValue(routingResponse("ACCEPTED", "IN_PROGRESS"));
+    mocks.createFulfillmentWithTracking.mockResolvedValue({ skipped: false, id: "gid://shopify/Fulfillment/1", fulfilled: { "gid://shopify/LineItem/1": 1 } });
+
+    await fulfillment.syncPendingTracking(makeShop({ fulfillmentLocationId: APP_LOCATION }), undefined, {} as never);
+
+    expect(mocks.createFulfillmentWithTracking).toHaveBeenCalledTimes(1);
   });
 });
 

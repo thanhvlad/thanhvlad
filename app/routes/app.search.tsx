@@ -377,7 +377,17 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
             // A native img, not Polaris Image: `loading` is not on ImageProps in
             // this version, and a page of 24 full-size supplier photos loading
             // at once inside the admin iframe is worth the one exception.
-            <img src={item.image} alt={item.title} loading="lazy" style={{ width: "100%", display: "block" }} />
+            // Square and contained, with intrinsic dimensions: supplier photos
+            // come in every proportion, and a box sized by the photo grew each
+            // card as it loaded and pushed the grid down (layout shift).
+            <img
+              src={item.image}
+              alt={item.title}
+              loading="lazy"
+              width={480}
+              height={480}
+              style={{ width: "100%", height: "auto", aspectRatio: "1 / 1", objectFit: "contain", display: "block" }}
+            />
           ) : (
             <Box paddingBlock="1600">
               <Thumb src={null} alt={t("search.card.noImage")} size="large" />

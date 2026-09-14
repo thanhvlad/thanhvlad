@@ -421,6 +421,12 @@ export default function OrderDetailPage() {
                   <Text as="p" tone="subdued">
                     {t("orders.detail.approvalHelp")}
                   </Text>
+                  {/* Shopify is told nothing until the merchant decides, and it
+                      expects an answer within a day, so the deadline the app
+                      enforces is said out loud rather than discovered. */}
+                  <Text as="p" variant="bodySm">
+                    {t("orders.fulfillmentRequest.decideBy", { when: formatDate(approval.decideBy) })}
+                  </Text>
                   {approval.requestMessage && (
                     <Text as="p" variant="bodySm">
                       “{approval.requestMessage}”
