@@ -1,0 +1,10 @@
+{
+  shop {
+    name
+    myshopifyDomain
+    email
+    currencyCode
+    ianaTimezone
+    plan { displayName partnerDevelopment shopifyPlus }
+  }
+}
