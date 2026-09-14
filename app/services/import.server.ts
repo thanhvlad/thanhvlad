@@ -395,6 +395,38 @@ export interface PushResult {
   /** Set when the failure is one the app raised and can translate (a plan limit). */
   errorKey?: string;
   errorVars?: Record<string, string | number>;
+  /** True when the product came from the Demo supplier and was kept out of the storefront. */
+  demo?: boolean;
+  /**
+   * Images Shopify could not download, as far as it knew when the push
+   * returned. Supplier CDNs refuse hotlinking often enough that a listing can
+   * go live with no pictures, and the merchant has to be told which ones.
+   */
+  failedMedia?: Array<{ alt: string | null; message: string }>;
+  /** Images Shopify was still downloading when the push returned; their outcome is not known yet. */
+  processingMediaCount?: number;
+}
+
+/** Tag on every product pushed from the Demo supplier, so it can be found and removed in Shopify. */
+export const DEMO_PRODUCT_TAG = "dropshiphub-demo";
+
+/**
+ * How a product is listed in Shopify, decided before anything is sent.
+ *
+ * A Demo supplier product has invented prices and stock and cannot be ordered
+ * from anyone, so it is always a draft, never published to a sales channel and
+ * tagged so the merchant can find it, whatever the push settings say. Selling
+ * it would take real money for goods nobody will ship.
+ */
+export function listingForPush(
+  platform: SupplierPlatform | null | undefined,
+  settings: { defaultStatus: "ACTIVE" | "DRAFT"; publishOnPush: boolean },
+  tags: string[],
+): { status: "ACTIVE" | "DRAFT"; publish: boolean; tags: string[]; demo: boolean } {
+  if (platform === "MOCK") {
+    return { status: "DRAFT", publish: false, tags: [...new Set([...tags, DEMO_PRODUCT_TAG])], demo: true };
+  }
+  return { status: settings.defaultStatus, publish: settings.publishOnPush && settings.defaultStatus === "ACTIVE", tags, demo: false };
 }
 
 /**
@@ -429,6 +461,7 @@ export async function pushImportedProduct(shop: ShopWithSettings, client: Graphq
 
   await prisma.importedProduct.update({ where: { id: product.id }, data: { status: "PUSHING", pushError: null } });
   const settings = shop.parsedSettings.products;
+  const listing = listingForPush(product.supplierProduct?.platform, settings, product.tags);
 
   try {
     const optionNames = product.options as unknown as string[];
@@ -448,9 +481,9 @@ export async function pushImportedProduct(shop: ShopWithSettings, client: Graphq
       descriptionHtml: sanitizeDescriptionHtml(product.description),
       vendor: product.vendor,
       productType: product.productType,
-      tags: product.tags,
+      tags: listing.tags,
       handle: product.handle,
-      status: settings.defaultStatus,
+      status: listing.status,
       optionNames,
       images: product.images,
       variants: variantsToPush.map((v) => ({
@@ -476,7 +509,7 @@ export async function pushImportedProduct(shop: ShopWithSettings, client: Graphq
       await prisma.importedProduct.update({ where: { id: product.id }, data: { shopifyProductId: pushed.id } });
     }
 
-    if (settings.publishOnPush && settings.defaultStatus === "ACTIVE") {
+    if (listing.publish) {
       await publishProduct(client, pushed.id).catch((error) => logger.warn("Publish failed", { productId: pushed.id, error }));
     }
 
@@ -554,6 +587,7 @@ export async function pushImportedProduct(shop: ShopWithSettings, client: Graphq
     });
 
     const routed = await routeNewProductToService(shop, client, local.id);
+    const failedMedia = pushed.failedMedia.map((m) => ({ alt: m.alt, message: m.message }));
 
     await logActivity(shop.id, {
       actor,
@@ -562,10 +596,39 @@ export async function pushImportedProduct(shop: ShopWithSettings, client: Graphq
       entityId: local.id,
       message:
         `"${pushed.title}" pushed to Shopify with ${pushed.variants.length} variant(s)` +
-        (routed === null ? "." : `; ${routed} variant(s) routed to the app's fulfilment location.`),
-      meta: { shopifyProductId: pushed.id },
+        (routed === null ? "" : `; ${routed} variant(s) routed to the app's fulfilment location`) +
+        (listing.demo ? `. Demo supplier product: kept as a draft, not published, tagged ${DEMO_PRODUCT_TAG}.` : ".") +
+        (pushed.processingMediaCount > 0 ? ` Shopify was still downloading ${pushed.processingMediaCount} image(s).` : ""),
+      meta: { shopifyProductId: pushed.id, demo: listing.demo, failedMedia: failedMedia.length, processingMedia: pushed.processingMediaCount },
     });
-    return { importedProductId, ok: true, productId: local.id, shopifyProductId: pushed.id };
+    if (failedMedia.length > 0) {
+      // Its own warning entry, so a listing that went live without its pictures
+      // stands out in the log instead of hiding inside a success line.
+      await logActivity(shop.id, {
+        actor,
+        action: "product.media_failed",
+        entity: "Product",
+        entityId: local.id,
+        level: "warn",
+        message:
+          `Shopify could not download ${failedMedia.length} image(s) for "${pushed.title}": ` +
+          failedMedia
+            .slice(0, 5)
+            .map((m) => (m.alt ? `${m.alt} (${m.message})` : m.message))
+            .join("; ") +
+          (failedMedia.length > 5 ? `; and ${failedMedia.length - 5} more.` : "."),
+        meta: { shopifyProductId: pushed.id, failedMedia: failedMedia.slice(0, 20) },
+      });
+    }
+    return {
+      importedProductId,
+      ok: true,
+      productId: local.id,
+      shopifyProductId: pushed.id,
+      demo: listing.demo,
+      failedMedia,
+      processingMediaCount: pushed.processingMediaCount,
+    };
   } catch (error) {
     const message = errorMessage(error);
     logger.error("Push to Shopify failed", { importedProductId, error });

@@ -91,7 +91,9 @@ async function main() {
 
   // ---- 3. Import ------------------------------------------------------------
   const { addToImportList } = await import("../app/services/import.server");
-  const imported = await addToImportList(shop, "https://www.aliexpress.com/item/1005006002.html", { actor: "demo" });
+  // The Demo supplier by name: an AliExpress link now goes to the real API or
+  // the Chrome extension, and neither is what a demo should exercise.
+  const imported = await addToImportList(shop, "1005006002", { platform: "MOCK", actor: "demo" });
   const cheapest = imported.variants.reduce((a, b) => (Number(a.price) < Number(b.price) ? a : b));
   say(
     "Imported a product into the import list",
@@ -108,7 +110,7 @@ async function main() {
   const product = await prisma.product.findUniqueOrThrow({ where: { id: productId }, include: { variants: true } });
   say(
     "Pushed it to Shopify",
-    `Shopify product ${product.shopifyProductId}, status ${product.status}`,
+    `Shopify product ${product.shopifyProductId}, status ${product.status}${pushed.demo ? " (Demo supplier products stay drafts, tagged dropshiphub-demo)" : ""}`,
     `${product.variants.length} variants created`,
   );
 
@@ -146,7 +148,9 @@ async function main() {
     phone: null,
     note: null,
     tags: [],
-    test: false,
+    // A test order: the Demo supplier refuses to simulate a supplier order for
+    // a real buyer, and this demo store is not a development store.
+    test: true,
     riskLevel: "LOW",
     currencyCode: "USD",
     totalPrice: String(variant.price),
@@ -201,15 +205,15 @@ async function main() {
     "It is waiting for payment on the supplier's site",
     `${queue.items.length} unpaid order(s), ${queue.totals.map((t) => `${t.amount} ${t.currency}`).join(", ")}`,
     `pay link: ${queue.items[0]?.paymentUrl ?? "—"}, ${queue.items[0]?.hoursLeft ?? "?"}h left before the supplier cancels it`,
-    `AliExpress cancels unpaid orders after 24h; the app counts down and never charges your account itself`,
+    `a real supplier cancels unpaid orders after its deadline (24h on AliExpress); the app counts down and never charges your account itself`,
   );
 
   // ---- 10. The supplier pays, ships ----------------------------------------
   const { syncPurchaseOrder, syncPendingTracking, addManualTracking } = await import("../app/services/fulfillment.server");
   if (QUICK) {
     await checkPayments(shop);
-    await addManualTracking(shop, poId, { number: "LP123456789CN", carrierName: "AliExpress Standard" }, "demo", fake.client);
-    say("Entered a tracking number by hand (--quick)", "LP123456789CN via AliExpress Standard");
+    await addManualTracking(shop, poId, { number: "DEMO123456789", carrierName: "Demo carrier" }, "demo", fake.client);
+    say("Entered a tracking number by hand (--quick)", "DEMO123456789 via Demo carrier");
   } else {
     say("Waiting for the supplier to charge and ship it", "the Demo supplier pays after ~1 min and ships after ~3 min");
     const started = Date.now();

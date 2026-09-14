@@ -8,7 +8,7 @@ import { JobProgress } from "~/components/JobProgress";
 import { Paginator } from "~/components/Paginator";
 import { Stat } from "~/components/Stat";
 import { StatusBadge } from "~/components/StatusBadge";
-import { STAGE_ORDER } from "~/domain/orders/pipeline";
+import { STAGE_ORDER, waitingOnlyForExtension } from "~/domain/orders/pipeline";
 import type { OrderIssue } from "~/domain/orders/pipeline";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { downloadAuthed } from "~/lib/download.client";
@@ -110,8 +110,14 @@ export default function OrdersPage() {
   const tabs = [{ id: "ALL", content: `${t("common.all")} (${totalCount})` }, ...STAGE_ORDER.map((s) => ({ id: s, content: `${t(`stage.${s}`)} (${data.counts[s]})` }))];
   const selectedTab = Math.max(0, tabs.findIndex((tab) => tab.id === data.stage));
   // Only orders that are awaiting order can be sent; the rest of a selection is
-  // named in the confirmation so nothing is silently skipped.
-  const placeable = selectedResources.filter((id) => items.find((i) => i.id === id)?.stage === "AWAITING_ORDER");
+  // named in the confirmation so nothing is silently skipped. An order whose
+  // supplier order is already waiting for the extension reads as awaiting
+  // order too, but sending it again would find nothing new to send.
+  const placeable = selectedResources.filter((id) => {
+    const row = items.find((i) => i.id === id);
+    if (row?.stage !== "AWAITING_ORDER") return false;
+    return !waitingOnlyForExtension({ issues: row.issues, purchaseOrderStatuses: row.purchaseOrders.map((po) => po.status) });
+  });
   const skipped = selectedResources.length - placeable.length;
 
   const setParam = (key: string, value: string) => {

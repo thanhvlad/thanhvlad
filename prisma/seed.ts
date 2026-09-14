@@ -82,7 +82,10 @@ async function main() {
     });
   }
 
-  // Imported products from the mock catalog (services are not used here to keep the seed dependency-free).
+  // Imported products from the Demo supplier's catalogue (services are not used
+  // here to keep the seed dependency-free). They are filed under MOCK, not
+  // ALIEXPRESS: the adapter registry never serves invented data for a real
+  // platform, so an ALIEXPRESS row would fail every refresh and every order.
   const catalog = [
     { externalId: "1005006001", title: "Wireless Bluetooth Earbuds Pro, Noise Cancelling, 48H Battery", options: ["Color"], values: [["Black"], ["White"], ["Navy"]], cost: 9.8 },
     { externalId: "1005006003", title: "Portable Blender USB Rechargeable 380ml Fresh Juice Cup", options: ["Color"], values: [["Pink"], ["Green"], ["Blue"]], cost: 7.2 },
@@ -90,12 +93,14 @@ async function main() {
   ];
   for (const item of catalog) {
     const supplierProduct = await prisma.supplierProduct.upsert({
-      where: { platform_externalId: { platform: "ALIEXPRESS", externalId: item.externalId } },
+      where: { platform_externalId: { platform: "MOCK", externalId: item.externalId } },
       create: {
-        platform: "ALIEXPRESS",
+        platform: "MOCK",
         externalId: item.externalId,
         title: item.title,
-        url: `https://www.aliexpress.com/item/${item.externalId}.html`,
+        // The same placeholder address the Demo supplier uses: never a real
+        // marketplace page for a product nobody sells.
+        url: `https://example.com/dropshiphub-demo-supplier/item/${item.externalId}`,
         storeName: "Demo Supplier",
         rating: 4.7,
         orderCount: 12000,

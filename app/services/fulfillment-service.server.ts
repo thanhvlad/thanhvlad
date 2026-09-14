@@ -630,7 +630,7 @@ async function handleSubmitted(
       action: "fulfillment_service.accepted",
       entity: "Order",
       entityId: order.id,
-      message: `${order.name}: supplier order placed and Shopify's fulfilment request accepted.`,
+      message: `${order.name}: ${supplierSideSummary(outcome.awaitingPlacementIds)}; Shopify's fulfilment request accepted.`,
     });
   } else {
     // Held for the merchant rather than rejected: a supplier timeout is not a
@@ -664,16 +664,23 @@ async function commitRequest(
   request: Pick<FulfillmentRequest, "id" | "orderId">,
   live: LiveFulfillmentOrder,
   actor: string,
-): Promise<{ ok: true; purchaseOrderIds: string[] } | { ok: false; error: string; issues?: string[] }> {
+): Promise<{ ok: true; purchaseOrderIds: string[]; awaitingPlacementIds: string[] } | { ok: false; error: string; issues?: string[] }> {
   const outcome = await placeSupplierOrders(shop, request.orderId, {
     actor,
     shopifyLineItemIds: live.lineItems.map((li) => li.shopifyLineItemId),
   });
   if (!outcome.ok) return { ok: false, error: outcome.error ?? "Could not place the supplier order", issues: outcome.issues };
+  const awaitingPlacementIds = outcome.awaitingPlacementIds ?? [];
 
   if (live.requestStatus === "SUBMITTED") {
     try {
-      await acceptFulfillmentRequest(client, live.id, "Accepted by DropshipHub: the supplier order has been created.");
+      // Accepting is still right when the order only went to the extension
+      // queue: the app has taken the fulfilment on. The message just must not
+      // tell the merchant, in Shopify, that something was bought.
+      const message = awaitingPlacementIds.length
+        ? "Accepted by DropshipHub: the supplier order is waiting to be placed with the Chrome extension."
+        : "Accepted by DropshipHub: the supplier order has been created.";
+      await acceptFulfillmentRequest(client, live.id, message);
     } catch (error) {
       // Another run may have accepted it a moment earlier; only a request that
       // is still not accepted is a failure.
@@ -691,7 +698,14 @@ async function commitRequest(
     where: { id: request.id },
     data: { status: "ACCEPTED", approvedAt: new Date(), approvedBy: actor, quoteError: null, respondedAt: new Date() },
   });
-  return { ok: true, purchaseOrderIds: outcome.purchaseOrderIds };
+  return { ok: true, purchaseOrderIds: outcome.purchaseOrderIds, awaitingPlacementIds };
+}
+
+/** How an accepted request's supplier side is described in logs and notices. */
+function supplierSideSummary(awaitingPlacementIds: string[]): string {
+  return awaitingPlacementIds.length
+    ? "supplier order waiting to be placed with the extension (nothing ordered yet)"
+    : "supplier order placed";
 }
 
 /** The request as Shopify holds it, or a reason to stop. */
@@ -754,9 +768,9 @@ export async function approveFulfillmentRequest(shop: ShopWithSettings, requestI
     action: "fulfillment_service.approved",
     entity: "Order",
     entityId: request.orderId,
-    message: `${request.order.name}: supplier order approved and placed; Shopify's fulfilment request accepted.`,
+    message: `${request.order.name}: approved, ${supplierSideSummary(outcome.awaitingPlacementIds)}; Shopify's fulfilment request accepted.`,
   });
-  return { ok: true as const, purchaseOrderIds: outcome.purchaseOrderIds };
+  return { ok: true as const, purchaseOrderIds: outcome.purchaseOrderIds, awaitingPlacementIds: outcome.awaitingPlacementIds };
 }
 
 /**

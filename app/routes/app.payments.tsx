@@ -1,22 +1,29 @@
 import { useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { Link, useFetcher, useLoaderData, useNavigate, useSearchParams } from "@remix-run/react";
-import type { PurchaseOrderStatus, SupplierPlatform } from "@prisma/client";
-import { Badge, Banner, BlockStack, Button, Card, IndexTable, InlineGrid, InlineStack, Layout, Link as PolarisLink, Page, Tabs, Text, Tooltip, useIndexResourceState } from "@shopify/polaris";
+import type { SupplierPlatform } from "@prisma/client";
+import { Badge, Banner, BlockStack, Box, Button, Card, IndexTable, InlineGrid, InlineStack, Layout, Link as PolarisLink, Page, Tabs, Text, Tooltip, useIndexResourceState } from "@shopify/polaris";
 import { EmptyScreen } from "~/components/EmptyScreen";
+import { Paginator } from "~/components/Paginator";
 import { SectionHeader } from "~/components/SectionHeader";
 import { Stat } from "~/components/Stat";
 import { PlatformBadge, StatusBadge } from "~/components/StatusBadge";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
-import { formatDate, formatMoney, relativeTime } from "~/lib/format";
+import { formatDate, formatMoney, pageParam, relativeTime } from "~/lib/format";
 import type { I18nVars } from "~/lib/i18n";
 import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
-import { checkPayments, getPaymentQueue, markPaidManually, undoManualPayment } from "~/services/payments.server";
+import { checkPayments, getPaymentQueue, markPaidManually, paymentTab, undoManualPayment } from "~/services/payments.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
-  const queue = await getPaymentQueue(shop.id);
+  const url = new URL(request.url);
+  // The tab and the page are applied in the database: the queue used to arrive
+  // whole and be filtered here, however many unpaid orders a store had.
+  const queue = await getPaymentQueue(shop.id, new Date(), {
+    tab: paymentTab(url.searchParams.get("status")),
+    page: pageParam(url.searchParams.get("page")),
+  });
   return { queue, currency: shop.currency };
 };
 
@@ -61,10 +68,10 @@ type ActionResult = { ok?: boolean; message?: string; messageKey?: string; messa
 /**
  * The queue only ever holds the two "placed upstream, not paid" statuses
  * (`UNPAID_STATUSES` in the payments service, which cannot be imported into a
- * client component), plus the deadline-derived Overdue view.
+ * client component), plus the deadline-derived Overdue view. The same list as
+ * `PAYMENT_TABS` there, which decides what each tab loads.
  */
 const TABS = ["all", "AWAITING_PAYMENT", "PLACED", "overdue"] as const;
-type TabId = (typeof TABS)[number];
 
 /** Supplier platform as the merchant names it; PlatformBadge keeps the same wording. */
 function platformName(platform: SupplierPlatform): string {
@@ -86,18 +93,15 @@ export default function PaymentsPage() {
   const pendingIntent = busy ? fetcher.formData?.get("intent") : null;
   const pendingIds = busy ? String(fetcher.formData?.get("ids") ?? "") : "";
 
-  const tabParam = params.get("status") as TabId | null;
-  const tab: TabId = tabParam && TABS.includes(tabParam) ? tabParam : "all";
   const isOverdue = (hoursLeft: number | null) => hoursLeft !== null && hoursLeft <= 0;
-  const matches = (item: (typeof queue.items)[number], id: TabId) =>
-    id === "all" ? true : id === "overdue" ? isOverdue(item.hoursLeft) : item.status === (id as PurchaseOrderStatus);
-  const items = queue.items.filter((item) => matches(item, tab));
+  // The loader already holds just this tab's page; the counts cover the whole queue.
+  const items = queue.items;
 
   const tabs = TABS.map((id) => {
     const label = id === "all" ? t("common.all") : id === "overdue" ? t("payments.tab.overdue") : id === "AWAITING_PAYMENT" ? t("stage.AWAITING_PAYMENT") : t("status.PLACED");
-    return { id, content: `${label} (${queue.items.filter((item) => matches(item, id)).length})` };
+    return { id, content: `${label} (${queue.tabCounts[id]})` };
   });
-  const selectedTab = Math.max(0, tabs.findIndex((entry) => entry.id === tab));
+  const selectedTab = Math.max(0, tabs.findIndex((entry) => entry.id === queue.tab));
 
   const { selectedResources, allResourcesSelected, handleSelectionChange, clearSelection } = useIndexResourceState(items);
 
@@ -109,6 +113,8 @@ export default function PaymentsPage() {
     const sp = new URLSearchParams(params);
     if (tabs[index].id === "all") sp.delete("status");
     else sp.set("status", tabs[index].id);
+    // Page 3 of one tab means nothing on another.
+    sp.delete("page");
     clearSelection();
     navigate(`?${sp.toString()}`);
   };
@@ -147,14 +153,9 @@ export default function PaymentsPage() {
   };
   const stillToOpen = queue.items.filter((item) => toOpen.includes(item.id) && item.paymentUrl);
 
-  // ---- Stat strip: everything here comes from the queue the loader already built.
-  const oldest = queue.items.reduce<(typeof queue.items)[number] | null>((best, item) => {
-    const when = item.placedAt ?? item.orderCreatedAt;
-    if (!when) return best;
-    const bestWhen = best ? (best.placedAt ?? best.orderCreatedAt) : null;
-    return !bestWhen || new Date(when) < new Date(bestWhen) ? item : best;
-  }, null);
-  const hasDeadlines = queue.items.some((item) => item.hoursLeft !== null);
+  // ---- Stat strip: figures for the whole queue, worked out by the loader, so
+  // they do not change with the page on screen.
+  const { oldest, hasDeadlines } = queue;
 
   const bannerTone = result?.messageKey === "payments.msg.checkedNone" ? "info" : "success";
 
@@ -171,7 +172,7 @@ export default function PaymentsPage() {
           content: t("action.checkPayment"),
           onAction: () => submit("check", []),
           loading: pendingIntent === "check" && pendingIds === "",
-          disabled: busy || queue.items.length === 0,
+          disabled: busy || queue.count === 0,
         },
         ...queue.byPlatform
           .filter((p) => p.bulkUrl)
@@ -237,7 +238,7 @@ export default function PaymentsPage() {
           </Layout.Section>
         )}
 
-        {queue.items.length > 0 && (
+        {queue.count > 0 && (
           <Layout.Section>
             <InlineGrid columns={{ xs: 1, sm: 2, md: 4 }} gap="300">
               {/* One tile per currency, each labelled and with its own count.
@@ -253,14 +254,14 @@ export default function PaymentsPage() {
               ))}
               <Stat
                 label={t("payments.stat.unpaidOrders")}
-                value={String(queue.items.length)}
+                value={String(queue.count)}
                 hint={queue.expiringSoon > 0 ? t("payments.stat.dueSoon", { n: queue.expiringSoon }) : t("payments.stat.noneDueSoon")}
                 tone={queue.expiringSoon > 0 ? "warning" : "default"}
               />
               <Stat
                 label={t("payments.stat.oldest")}
-                value={oldest ? relativeTime(oldest.placedAt ?? oldest.orderCreatedAt) : "—"}
-                hint={oldest ? `${oldest.orderName} · ${formatDate(oldest.placedAt ?? oldest.orderCreatedAt)}` : undefined}
+                value={oldest?.at ? relativeTime(oldest.at) : "—"}
+                hint={oldest?.at ? `${oldest.orderName} · ${formatDate(oldest.at)}` : undefined}
               />
               <Stat
                 label={t("payments.stat.overdue")}
@@ -298,7 +299,7 @@ export default function PaymentsPage() {
         <Layout.Section>
           <Card padding="0">
             <Tabs tabs={tabs} selected={selectedTab} onSelect={selectTab} />
-            {queue.items.length === 0 ? (
+            {queue.count === 0 ? (
               <EmptyScreen heading={t("payments.empty")} body={t("payments.emptyBody")} action={{ content: t("payments.viewOrders"), url: "/app/orders" }} />
             ) : items.length === 0 ? (
               <EmptyScreen heading={t("payments.emptyTab")} body={t("payments.emptyTabBody")} action={{ content: t("payments.viewAllUnpaid"), onAction: () => selectTab(0) }} />
@@ -430,6 +431,11 @@ export default function PaymentsPage() {
                 })}
               </IndexTable>
             )}
+            {queue.total > queue.pageSize && (
+              <Box padding="300">
+                <Paginator page={queue.page} pageSize={queue.pageSize} total={queue.total} />
+              </Box>
+            )}
           </Card>
         </Layout.Section>
 
@@ -438,7 +444,7 @@ export default function PaymentsPage() {
             <BlockStack gap="200">
               <SectionHeader title={t("payments.howItWorks.title")} />
               <Text as="p" tone="subdued">
-                {t("payments.howItWorks.body")}
+                {t("orders.payments.howItWorks.body")}
               </Text>
             </BlockStack>
           </Card>

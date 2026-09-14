@@ -186,6 +186,19 @@ describe("a new fulfilment request", () => {
     expect(mocks.prisma.fulfillmentRequest.update).toHaveBeenLastCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "ACCEPTED" }) }));
   });
 
+  it("with approval off, does not claim a supplier order was placed when it only went to the extension queue", async () => {
+    shopifyAnswers({ live: rawFulfillmentOrder("SUBMITTED") });
+    mocks.placeSupplierOrders.mockResolvedValue({ orderId: "order1", ok: true, purchaseOrderIds: ["po1"], awaitingPlacementIds: ["po1"] });
+
+    await service.handleFulfillmentRequest(makeShop({ requireApprovalOnFulfillmentRequest: false }), "T", { submitted_fulfillment_order: { id: FO_ID } });
+
+    expect(mocks.acceptFulfillmentRequest).toHaveBeenCalledWith(expect.anything(), FO_ID, expect.stringMatching(/waiting to be placed/));
+    expect(mocks.logActivity).toHaveBeenCalledWith(
+      "shop1",
+      expect.objectContaining({ action: "fulfillment_service.accepted", message: expect.stringMatching(/waiting to be placed with the extension \(nothing ordered yet\)/) }),
+    );
+  });
+
   it("with approval off, holds a request whose placement failed instead of accepting it", async () => {
     shopifyAnswers({ live: rawFulfillmentOrder("SUBMITTED") });
     mocks.placeSupplierOrders.mockResolvedValue({ orderId: "order1", ok: false, purchaseOrderIds: [], error: "Supplier timed out" });
@@ -231,6 +244,20 @@ describe("the merchant's decision", () => {
 
     expect(outcome.ok).toBe(true);
     expect(mocks.acceptFulfillmentRequest).toHaveBeenCalledWith(expect.anything(), FO_ID, expect.any(String));
+  });
+
+  it("approving an order that only went to the extension queue says so, to Shopify and in the log", async () => {
+    mocks.prisma.fulfillmentRequest.findFirst.mockResolvedValue(requestRow());
+    shopifyAnswers({ live: rawFulfillmentOrder("SUBMITTED") });
+    mocks.placeSupplierOrders.mockResolvedValue({ orderId: "order1", ok: true, purchaseOrderIds: ["po1"], awaitingPlacementIds: ["po1"] });
+
+    const outcome = await service.approveFulfillmentRequest(makeShop(), "req1", "merchant@example.com");
+
+    expect(outcome).toMatchObject({ ok: true, awaitingPlacementIds: ["po1"] });
+    expect(mocks.acceptFulfillmentRequest).toHaveBeenCalledWith(expect.anything(), FO_ID, expect.stringMatching(/waiting to be placed with the Chrome extension/));
+    const logged = mocks.logActivity.mock.calls.map(([, entry]) => entry.message).join(" ");
+    expect(logged).toMatch(/waiting to be placed with the extension/);
+    expect(logged).not.toMatch(/approved and placed|supplier order placed/);
   });
 
   it("approving a request the merchant withdrew in Shopify orders nothing", async () => {

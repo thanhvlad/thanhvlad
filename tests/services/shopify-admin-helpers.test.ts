@@ -17,7 +17,7 @@ import {
   type FulfillmentOrderInfo,
 } from "~/services/shopify/orders.server";
 import { createProduct, fetchProduct, setInventoryQuantities, summariseMedia, type PushProductInput } from "~/services/shopify/products.server";
-import { assignVariantToLocation } from "~/services/shopify/fulfillment-service.server";
+import { assignVariantToLocation, createFulfillmentService, listFulfillmentServices, updateFulfillmentServiceCallback } from "~/services/shopify/fulfillment-service.server";
 
 vi.mock("~/shopify.server", () => ({ unauthenticated: {} }));
 vi.mock("~/lib/logger.server", () => ({
@@ -489,5 +489,51 @@ describe("summariseMedia", () => {
         { id: "3", alt: null, status: "FAILED", mediaErrors: [] },
       ]),
     ).toEqual({ failedMedia: [{ id: "3", alt: null, message: "Shopify could not process this image." }], processingMediaCount: 1 });
+  });
+});
+
+describe("fulfilment service registration", () => {
+  // The app sends tracking with each fulfilment and has no list for Shopify's
+  // hourly /fetch_tracking_numbers call, so it must never claim to answer it.
+  it("registers without tracking support", async () => {
+    const { client, calls } = fakeClient(() => ({
+      data: {
+        fulfillmentServiceCreate: {
+          fulfillmentService: { id: "gid://shopify/FulfillmentService/1", serviceName: "DropshipHub", handle: "dropshiphub", callbackUrl: "https://app.example.com/api/fulfillment-service", trackingSupport: false, location: { id: "gid://shopify/Location/9", name: "DropshipHub" } },
+          userErrors: [],
+        },
+      },
+    }));
+
+    const service = await createFulfillmentService(client, { name: "DropshipHub", callbackUrl: "https://app.example.com/api/fulfillment-service" });
+
+    expect(calls[0].operation).toBe("DropshipFulfillmentServiceCreate");
+    expect(calls[0].variables).toMatchObject({ trackingSupport: false, inventoryManagement: false });
+    expect(service).toMatchObject({ locationId: "gid://shopify/Location/9", trackingSupport: false });
+  });
+
+  it("turns tracking support off whenever it re-points an existing registration", async () => {
+    const { client, calls } = fakeClient(() => ({ data: { fulfillmentServiceUpdate: { fulfillmentService: null, userErrors: [] } } }));
+
+    await updateFulfillmentServiceCallback(client, "gid://shopify/FulfillmentService/1", "https://app.example.com/api/fulfillment-service");
+
+    expect(calls[0].operation).toBe("DropshipFulfillmentServiceUpdate");
+    expect(calls[0].variables).toMatchObject({ id: "gid://shopify/FulfillmentService/1", trackingSupport: false });
+  });
+
+  it("reports what an existing registration claims, so an old one can be corrected", async () => {
+    const { client } = fakeClient(() => ({
+      data: {
+        shop: {
+          fulfillmentServices: [
+            { id: "gid://shopify/FulfillmentService/1", serviceName: "DropshipHub", handle: "dropshiphub", callbackUrl: null, trackingSupport: true, type: "THIRD_PARTY", location: null },
+          ],
+        },
+      },
+    }));
+
+    const [service] = await listFulfillmentServices(client);
+
+    expect(service.trackingSupport).toBe(true);
   });
 });

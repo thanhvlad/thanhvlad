@@ -79,7 +79,12 @@ describe.skipIf(!TEST_DB)("full dropshipping flow (postgres + mock supplier)", (
     expect(result.ok).toBe(true);
     productId = result.productId!;
     expect(fake.calls.map((c) => c.operation)).toContain("DropshipProductSet");
-    expect(fake.calls.map((c) => c.operation)).toContain("DropshipPublish");
+    // A Demo supplier product is never put on sale: it goes up as a tagged
+    // draft and is not published, whatever the push settings say.
+    expect(result.demo).toBe(true);
+    expect(fake.calls.map((c) => c.operation)).not.toContain("DropshipPublish");
+    const productSet = fake.calls.find((c) => c.operation === "DropshipProductSet");
+    expect(JSON.stringify(productSet?.variables)).toContain("dropshiphub-demo");
 
     const { getProduct } = await import("~/services/products.server");
     const product = await getProduct(shop.id, productId);
