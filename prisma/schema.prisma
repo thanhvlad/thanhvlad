@@ -816,6 +816,10 @@ model OrderLineItem {
 enum PurchaseOrderStatus {
   DRAFT
   SUBMITTING
+  /// Priced and approved, but nothing has been sent upstream: the merchant's
+  /// browser places it on the supplier's site through the Chrome extension,
+  /// because this shop has no supplier API connection that could.
+  AWAITING_PLACEMENT
   PLACED
   AWAITING_PAYMENT
   PAID

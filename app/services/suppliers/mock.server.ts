@@ -15,12 +15,21 @@ import type {
 import { d, money } from "~/lib/money";
 
 /**
- * Deterministic in-memory supplier used for development, demos and tests.
+ * Deterministic in-memory supplier used for development, demos and tests: the
+ * "Demo supplier", platform MOCK.
  *
  * - Product ids are stable, so mappings survive restarts.
  * - Orders move PLACED -> PAID -> SHIPPED -> DELIVERED as wall-clock time passes,
  *   so the tracking sync job has something to do.
  * - Stock and price wobble slightly per hour to exercise the auto-update rules.
+ *
+ * Everything here is invented, and it has to read that way wherever it lands.
+ * It used to link to real aliexpress.com item pages (unrelated products), wrote
+ * "30-day buyer protection" into descriptions that were published to live
+ * storefronts, and produced Cainiao-looking tracking numbers with a real
+ * global.cainiao.com link that reached buyers in shipping emails. Links now
+ * point at example.com, descriptions say they are samples, and tracking numbers
+ * start with DEMO- and carry no url.
  */
 
 interface MockProductSeed {
@@ -97,6 +106,15 @@ function image(productId: string, index: number): string {
   return `https://placehold.co/800x800/${swatch}/white.png?text=${encodeURIComponent(`${productId}-${index + 1}`)}`;
 }
 
+/**
+ * Where "View on supplier site" goes for a demo product. Never aliexpress.com:
+ * these ids are not those products, and a link there dressed invented data up
+ * as a real listing.
+ */
+function demoUrl(productId: string): string {
+  return `https://example.com/dropshiphub-demo-supplier/item/${productId}`;
+}
+
 function cartesian(options: Array<{ name: string; values: string[] }>): string[][] {
   return options.reduce<string[][]>(
     (acc, option) => acc.flatMap((combo) => option.values.map((v) => [...combo, v])),
@@ -139,14 +157,16 @@ function buildProduct(seed: MockProductSeed): SupplierProductDetail {
     externalId: seed.id,
     platform: "MOCK",
     title: seed.title,
-    descriptionHtml: `<p>${seed.title}.</p><ul><li>Category: ${seed.category}</li><li>Ships from CN warehouse within 48 hours.</li><li>30-day buyer protection.</li></ul><p>Visit <a href="https://example.com/store">our store</a> for more.</p>`,
-    url: `https://www.aliexpress.com/item/${seed.id}.html`,
+    // No shipping or buyer-protection promises: this text is published to the
+    // storefront, and a sample product cannot keep a promise to a buyer.
+    descriptionHtml: `<p>${seed.title}.</p><ul><li>Category: ${seed.category}</li></ul><p>Sample product from the DropshipHub demo catalogue, for testing the app.</p>`,
+    url: demoUrl(seed.id),
     images: Array.from({ length: seed.images }, (_, i) => image(seed.id, i)),
     currency: "USD",
     optionNames: seed.options.map((o) => o.name),
     variants,
     storeName: seed.store,
-    storeUrl: `https://www.aliexpress.com/store/${hash(seed.store) % 100000}`,
+    storeUrl: null,
     storeId: String(hash(seed.store) % 100000),
     rating: seed.rating,
     orderCount: seed.orders,
@@ -159,6 +179,7 @@ function buildProduct(seed: MockProductSeed): SupplierProductDetail {
 export class MockSupplierAdapter implements SupplierAdapter {
   readonly platform = "MOCK" as const;
   readonly displayName = "Demo supplier";
+  readonly simulated = true;
   readonly capabilities = {
     search: true,
     imageSearch: false,
@@ -212,7 +233,7 @@ export class MockSupplierAdapter implements SupplierAdapter {
       items: slice.map((p) => ({
         externalId: p.id,
         title: p.title,
-        url: `https://www.aliexpress.com/item/${p.id}.html`,
+        url: demoUrl(p.id),
         image: image(p.id, 0),
         price: money(p.basePrice),
         originalPrice: money(p.basePrice * 1.6),
@@ -304,7 +325,8 @@ export class MockSupplierAdapter implements SupplierAdapter {
       shippingCost: money(shippingCost),
       totalCost: money(itemsCost.plus(shippingCost)),
       currency: "USD",
-      paymentUrl: `https://example.com/pay/${externalOrderId}`,
+      // There is nothing to pay; a link would send the merchant to a dead page.
+      paymentUrl: null,
       // AliExpress cancels an unpaid order after 24 hours and the Payments page
       // counts down to it. Without a deadline here the countdown, the
       // "expiring soon" tally and the reminder job all have nothing to show, so
@@ -319,11 +341,10 @@ export class MockSupplierAdapter implements SupplierAdapter {
 
   async getOrder(externalOrderId: string): Promise<SupplierOrderStatus | null> {
     const entry = ORDERS.get(externalOrderId);
-    if (!entry) {
-      // Orders placed by a previous process: synthesize a plausible lifecycle from the id.
-      if (!externalOrderId.startsWith("MOCK-")) return null;
-      return { externalOrderId, status: "SHIPPED", raw: { synthetic: true } };
-    }
+    // An order this process did not place (a restart, or a separate worker
+    // process) is unknown, and says so. It used to be reported SHIPPED on the
+    // spot, which skipped payment and sent invented tracking to Shopify.
+    if (!entry) return null;
     if (entry.canceled) return { externalOrderId, status: "CANCELED" };
     const ageMinutes = (Date.now() - entry.placedAt) / 60_000;
     const status = ageMinutes < 1 ? "AWAITING_PAYMENT" : ageMinutes < 3 ? "PAID" : ageMinutes < 30 ? "SHIPPED" : "DELIVERED";
@@ -351,13 +372,16 @@ export class MockSupplierAdapter implements SupplierAdapter {
   async getTracking(externalOrderId: string): Promise<SupplierTracking[]> {
     const status = await this.getOrder(externalOrderId);
     if (!status || !["SHIPPED", "DELIVERED"].includes(status.status)) return [];
-    const number = `LP${String(hash(externalOrderId)).padStart(11, "0")}CN`;
+    // Unmistakably fake, with no carrier url: a number shaped like a real
+    // Cainiao parcel and linked to Cainiao's tracker is indistinguishable from
+    // a real shipment to whoever reads it.
+    const number = `DEMO-${String(hash(externalOrderId)).padStart(10, "0")}`;
     return [
       {
         number,
-        carrierCode: "CAINIAO_STANDARD",
-        carrierName: "AliExpress Standard Shipping",
-        url: `https://global.cainiao.com/detail.htm?mailNoList=${number}`,
+        carrierCode: "DEMO",
+        carrierName: "Demo carrier",
+        url: null,
         status: status.status === "DELIVERED" ? "DELIVERED" : "IN_TRANSIT",
         lastEvent: status.status === "DELIVERED" ? "Delivered" : "Departed from origin facility",
         lastEventAt: new Date(),

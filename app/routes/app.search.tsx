@@ -26,11 +26,11 @@ import { SectionHeader } from "~/components/SectionHeader";
 import { PlatformBadge } from "~/components/StatusBadge";
 import { Thumb } from "~/components/Thumb";
 import { readForm, requireShop } from "~/lib/auth.server";
-import { errorMessage } from "~/lib/errors";
+import { AppError, errorMessage } from "~/lib/errors";
 import { formatMoney, formatNumber, pageParam, truncate } from "~/lib/format";
 import { useErrorMessage, useT } from "~/lib/use-t";
 import { addToImportList, pushImportedProduct } from "~/services/import.server";
-import { adapterForShop, listPlatforms } from "~/services/suppliers/index.server";
+import { SUPPLIER_API_UNAVAILABLE, adapterForShop, listPlatforms } from "~/services/suppliers/index.server";
 import type { SupplierPlatform, SupplierSearchResult } from "~/services/suppliers/types";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -45,15 +45,20 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   let results: SupplierSearchResult | null = null;
   let error: string | null = null;
+  // Set when the platform has no API connection here. The page then explains
+  // the extension instead of showing a bare error, because for AliExpress that
+  // is the intended way in, not a fault.
+  let needsExtension = false;
   if (q.trim() || imageUrl.trim()) {
     try {
       const { adapter } = await adapterForShop(shop.id, platform);
       results = await adapter.searchProducts({ query: q, page, pageSize: 24, sort, shipToCountry: shop.country ?? "US", imageUrl: imageUrl || undefined });
     } catch (e) {
-      error = errorMessage(e);
+      if (platform === "ALIEXPRESS" && e instanceof AppError && e.code === SUPPLIER_API_UNAVAILABLE) needsExtension = true;
+      else error = errorMessage(e);
     }
   }
-  return { q, platform, sort, page, imageUrl, platforms, results, error, currency: shop.currency };
+  return { q, platform, sort, page, imageUrl, platforms, results, error, needsExtension, currency: shop.currency };
 };
 
 interface SearchActionData {
@@ -193,9 +198,23 @@ export default function SearchPage() {
           </Card>
         </Layout.Section>
 
-        {(data.error || data.results?.notice) && (
+        {(data.error || data.results?.notice || data.needsExtension || data.platform === "MOCK") && (
           <Layout.Section>
             <BlockStack gap="300">
+              {data.needsExtension && (
+                <Banner
+                  tone="info"
+                  title={t("search.extension.title")}
+                  action={{ content: t("search.start.action"), url: "/app/settings/advanced" }}
+                >
+                  <p>{t("search.extension.body")}</p>
+                </Banner>
+              )}
+              {data.platform === "MOCK" && (
+                <Banner tone="warning" title={t("search.demo.title")}>
+                  <p>{t("search.demo.body")}</p>
+                </Banner>
+              )}
               {data.error && (
                 <Banner tone="critical" title={t("search.failed")}>
                   <p>{data.error}</p>
@@ -211,7 +230,7 @@ export default function SearchPage() {
         )}
 
         <Layout.Section>
-          {!data.results && !data.error && (
+          {!data.results && !data.error && !data.needsExtension && (
             <EmptyScreen
               heading={t("search.start.heading")}
               body={t("search.start.body")}
@@ -335,6 +354,9 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
   const pushedId = added ? result?.productId : undefined;
   const importId = added ? result?.id : undefined;
 
+  // Ratings and order counts are social proof. The Demo supplier's are invented,
+  // so they are not shown as if buyers had produced them.
+  const demo = platform === "MOCK";
   const proof: string[] = [];
   if (item.rating) proof.push(`★ ${item.rating.toFixed(1)}`);
   if (item.orderCount) proof.push(t("search.card.orders", { count: formatNumber(item.orderCount) }));
@@ -355,7 +377,17 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
             // A native img, not Polaris Image: `loading` is not on ImageProps in
             // this version, and a page of 24 full-size supplier photos loading
             // at once inside the admin iframe is worth the one exception.
-            <img src={item.image} alt={item.title} loading="lazy" style={{ width: "100%", display: "block" }} />
+            // Square and contained, with intrinsic dimensions: supplier photos
+            // come in every proportion, and a box sized by the photo grew each
+            // card as it loaded and pushed the grid down (layout shift).
+            <img
+              src={item.image}
+              alt={item.title}
+              loading="lazy"
+              width={480}
+              height={480}
+              style={{ width: "100%", height: "auto", aspectRatio: "1 / 1", objectFit: "contain", display: "block" }}
+            />
           ) : (
             <Box paddingBlock="1600">
               <Thumb src={null} alt={t("search.card.noImage")} size="large" />
@@ -379,9 +411,11 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
                 </Text>
               )}
             </InlineStack>
-            <Text as="p" variant="bodySm" tone="subdued" numeric>
-              {proof.length > 0 ? proof.join(" · ") : t("search.card.noStats")}
-            </Text>
+            {!demo && (
+              <Text as="p" variant="bodySm" tone="subdued" numeric>
+                {proof.length > 0 ? proof.join(" · ") : t("search.card.noStats")}
+              </Text>
+            )}
             <Text as="p" variant="bodySm" tone="subdued" numeric>
               {shippingParts.join(" · ")}
             </Text>
@@ -389,7 +423,8 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
 
           <InlineStack gap="200" blockAlign="center">
             <PlatformBadge platform={platform} />
-            {item.storeName && (
+            {demo && <Badge tone="warning">{t("search.demo.badge")}</Badge>}
+            {item.storeName && !demo && (
               <Text as="span" variant="bodySm" tone="subdued">
                 {truncate(item.storeName, 28)}
               </Text>
@@ -416,9 +451,13 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
               </Button>
             )}
             <InlineStack align="space-between" blockAlign="center" gap="200">
-              <Link url={item.url} external target="_blank" removeUnderline>
-                {t("search.card.viewSource")}
-              </Link>
+              {demo ? (
+                <span />
+              ) : (
+                <Link url={item.url} external target="_blank" removeUnderline>
+                  {t("search.card.viewSource")}
+                </Link>
+              )}
               {pushedId ? (
                 <InlineStack gap="200" blockAlign="center">
                   <Badge tone="success">{t("search.inShop")}</Badge>

@@ -40,6 +40,13 @@ export const en = {
   "search.bulk.summary": "{ok} of {total} added to the import list",
   "search.bulk.added": "Added",
   "search.bulk.failed": "Failed",
+
+  // ---- Where the results come from ----------------------------------------
+  "search.demo.title": "Demo supplier: sample data",
+  "search.demo.body": "These products, prices and stores are invented for trying the app. Nothing can be bought from them, and the Demo supplier never places a real customer's order.",
+  "search.demo.badge": "Sample data",
+  "search.extension.title": "Add AliExpress products with the Chrome extension",
+  "search.extension.body": "This app is not connected to the AliExpress API, so it cannot search AliExpress or import by link. Open a product on AliExpress and use the DropshipHub panel on that page: it adds the real product, prices and variants.",
 } as const;
 
 export const vi: Partial<Record<keyof typeof en, string>> = {
@@ -73,4 +80,10 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   "search.bulk.summary": "Đã thêm {ok}/{total} vào danh sách nhập",
   "search.bulk.added": "Đã thêm",
   "search.bulk.failed": "Lỗi",
+
+  "search.demo.title": "Nhà cung cấp mẫu: dữ liệu mẫu",
+  "search.demo.body": "Sản phẩm, giá và cửa hàng ở đây đều là dữ liệu dựng sẵn để dùng thử app. Không thể mua hàng từ đây, và Nhà cung cấp mẫu không bao giờ đặt đơn cho khách thật.",
+  "search.demo.badge": "Dữ liệu mẫu",
+  "search.extension.title": "Thêm sản phẩm AliExpress bằng tiện ích Chrome",
+  "search.extension.body": "App chưa kết nối API AliExpress nên không tìm kiếm hay nhập bằng link AliExpress được. Hãy mở sản phẩm trên AliExpress và dùng khung DropshipHub ngay trên trang đó: tiện ích sẽ thêm đúng sản phẩm, giá và biến thể thật.",
 };

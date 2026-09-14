@@ -213,7 +213,7 @@ export default function FulfillmentServiceSettings() {
             <List.Item>
               {t("settings.fulfillmentService.how.step2Before")} <strong>{t("settings.fulfillmentService.how.step2Rejects")}</strong> {t("settings.fulfillmentService.how.step2After")}
             </List.Item>
-            <List.Item>{t("settings.fulfillmentService.how.step3")}</List.Item>
+            <List.Item>{t("orders.fulfillmentRequest.how.step3")}</List.Item>
             <List.Item>
               {t("settings.fulfillmentService.how.step4Before")} <Link to="/app/payments">{t("nav.payments")}</Link>
               {t("settings.fulfillmentService.how.step4After")}

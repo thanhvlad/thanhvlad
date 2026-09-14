@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { Link, useFetcher, useLoaderData, useNavigate, useSearchParams } from "@remix-run/react";
 import type { PurchaseOrderStatus, SupplierPlatform } from "@prisma/client";
-import { Badge, Banner, BlockStack, Button, Card, IndexTable, InlineGrid, InlineStack, Layout, Page, Tabs, Text, Tooltip, useIndexResourceState } from "@shopify/polaris";
+import { Badge, Banner, BlockStack, Button, Card, IndexTable, InlineGrid, InlineStack, Layout, Link as PolarisLink, Page, Tabs, Text, Tooltip, useIndexResourceState } from "@shopify/polaris";
 import { EmptyScreen } from "~/components/EmptyScreen";
 import { SectionHeader } from "~/components/SectionHeader";
 import { Stat } from "~/components/Stat";
@@ -68,7 +68,7 @@ type TabId = (typeof TABS)[number];
 
 /** Supplier platform as the merchant names it; PlatformBadge keeps the same wording. */
 function platformName(platform: SupplierPlatform): string {
-  return platform === "ALIEXPRESS" ? "AliExpress" : platform === "CJ_DROPSHIPPING" ? "CJ" : platform === "MOCK" ? "Mock" : platform;
+  return platform === "ALIEXPRESS" ? "AliExpress" : platform === "CJ_DROPSHIPPING" ? "CJ" : platform === "MOCK" ? "Demo" : platform;
 }
 
 export default function PaymentsPage() {
@@ -114,17 +114,38 @@ export default function PaymentsPage() {
   };
 
   /**
-   * Pay opens one supplier tab per order. Browsers block a burst of popups, so
-   * the tabs are opened in sequence and the ones that were opened are remembered
-   * to help the merchant keep their place.
+   * Pay selected opens the first supplier payment page, and only that one.
+   *
+   * A browser grants one popup per click. Opening ten tabs from timers let the
+   * first through and silently blocked the rest, while every row still flipped
+   * to "Opened", so the merchant believed orders were being paid that never
+   * reached a payment page. The remaining pages are listed as links, each its
+   * own click, and a row is marked opened only when its page really opened.
    */
-  const openSelected = () => {
-    const targets = items.filter((i) => selectedResources.includes(i.id) && i.paymentUrl).slice(0, 10);
-    targets.forEach((item, index) => {
-      setTimeout(() => window.open(item.paymentUrl!, "_blank", "noopener"), index * 350);
-    });
-    setOpened((prev) => [...new Set([...prev, ...targets.map((target) => target.id)])]);
+  const [toOpen, setToOpen] = useState<string[]>([]);
+  const [blocked, setBlocked] = useState(false);
+  const markOpened = (id: string) => {
+    setOpened((prev) => [...new Set([...prev, id])]);
+    setToOpen((prev) => prev.filter((other) => other !== id));
   };
+  const openSelected = () => {
+    const targets = items.filter((i) => selectedResources.includes(i.id) && i.paymentUrl);
+    const [first, ...rest] = targets;
+    if (!first) return;
+    // Without "noopener" so the result says whether the tab opened; the opener
+    // link is cut straight after, which is what "noopener" was there for.
+    const tab = window.open(first.paymentUrl!, "_blank");
+    if (tab) {
+      tab.opener = null;
+      setOpened((prev) => [...new Set([...prev, first.id])]);
+      setToOpen(rest.map((item) => item.id));
+      setBlocked(false);
+    } else {
+      setToOpen(targets.map((item) => item.id));
+      setBlocked(true);
+    }
+  };
+  const stillToOpen = queue.items.filter((item) => toOpen.includes(item.id) && item.paymentUrl);
 
   // ---- Stat strip: everything here comes from the queue the loader already built.
   const oldest = queue.items.reduce<(typeof queue.items)[number] | null>((best, item) => {
@@ -158,7 +179,7 @@ export default function PaymentsPage() {
       ]}
     >
       <Layout>
-        {(actionMessage || actionError || queue.overdue > 0 || queue.expiringSoon > 0) && (
+        {(actionMessage || actionError || stillToOpen.length > 0 || queue.overdue > 0 || queue.expiringSoon > 0 || queue.awaitingPlacement > 0) && (
           <Layout.Section>
             <BlockStack gap="300">
               {actionMessage && (
@@ -171,6 +192,24 @@ export default function PaymentsPage() {
                   <p>{actionError}</p>
                 </Banner>
               )}
+              {stillToOpen.length > 0 && (
+                <Banner
+                  tone={blocked ? "warning" : "info"}
+                  title={t(blocked ? "orders.payments.blockedTitle" : "orders.payments.moreTitle", { n: stillToOpen.length })}
+                  onDismiss={() => setToOpen([])}
+                >
+                  <BlockStack gap="200">
+                    <p>{t("orders.payments.moreBody")}</p>
+                    <InlineStack gap="300" wrap>
+                      {stillToOpen.map((item) => (
+                        <PolarisLink key={item.id} url={item.paymentUrl!} external onClick={() => markOpened(item.id)}>
+                          {t("orders.payments.payOrder", { order: item.orderName, amount: formatMoney(item.totalCost, item.currency) })}
+                        </PolarisLink>
+                      ))}
+                    </InlineStack>
+                  </BlockStack>
+                </Banner>
+              )}
               {queue.overdue > 0 && (
                 <Banner tone="critical" title={t("payments.banner.overdue", { n: queue.overdue })}>
                   <p>
@@ -181,6 +220,17 @@ export default function PaymentsPage() {
               {queue.expiringSoon > 0 && queue.overdue === 0 && (
                 <Banner tone="warning" title={t("payments.banner.dueSoon", { n: queue.expiringSoon })}>
                   <p>{t("payments.autoCancelWarning")}</p>
+                </Banner>
+              )}
+              {/* Counted apart from the unpaid orders: they do not exist at the
+                  supplier yet, so there is nothing to pay and no link to pay it with. */}
+              {queue.awaitingPlacement > 0 && (
+                <Banner
+                  tone="info"
+                  title={t("orders.placement.paymentsBannerTitle", { n: queue.awaitingPlacement })}
+                  action={{ content: t("orders.placement.setUpExtension"), url: "/app/settings/advanced" }}
+                >
+                  <p>{t("orders.placement.paymentsBannerBody")}</p>
                 </Banner>
               )}
             </BlockStack>
@@ -366,7 +416,7 @@ export default function PaymentsPage() {
                       <IndexTable.Cell>
                         <InlineStack gap="100" wrap={false}>
                           {item.paymentUrl && (
-                            <Button size="slim" variant={wasOpened ? "secondary" : "primary"} url={item.paymentUrl} external onClick={() => setOpened((p) => [...new Set([...p, item.id])])}>
+                            <Button size="slim" variant={wasOpened ? "secondary" : "primary"} url={item.paymentUrl} external onClick={() => markOpened(item.id)}>
                               {wasOpened ? t("payments.opened") : t("payments.pay")}
                             </Button>
                           )}

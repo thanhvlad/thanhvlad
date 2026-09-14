@@ -36,11 +36,21 @@ import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { adminUrl, formatDate, formatMoney, legacyId } from "~/lib/format";
 import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
-import { addManualTracking, cancelPurchaseOrder, markPurchaseOrderManual, placeSupplierOrders, retryPurchaseOrder, syncPendingTracking, syncPurchaseOrder } from "~/services/fulfillment.server";
+import {
+  addManualTracking,
+  cancelPurchaseOrder,
+  isSimulatedPurchaseOrder,
+  markPurchaseOrderManual,
+  placeSupplierOrders,
+  retryPurchaseOrder,
+  syncPendingTracking,
+  syncPurchaseOrder,
+} from "~/services/fulfillment.server";
 import { evaluateAndStoreOrder, getOrderDetail, refreshOrderFromShopify, setLineItemIgnored, updateOrderAddress } from "~/services/orders.server";
 import { listActivity } from "~/services/activity.server";
 import { getComparison } from "~/services/supplier-comparison.server";
 import { approveFulfillmentRequest, declineFulfillmentRequest, pendingApproval } from "~/services/fulfillment-service.server";
+import { placementModeForShop, supplierProductUrl, type PlacementMode } from "~/services/suppliers/index.server";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
@@ -86,6 +96,15 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   }
 
   const approval = await pendingApproval(shop.id, order.id);
+
+  // Whether "Check status" can mean anything: an order placed from the browser
+  // has no API to ask, and pretending to check it would only echo its status.
+  const modes = new Map<string, PlacementMode>();
+  for (const platform of new Set(order.purchaseOrders.map((po) => po.platform))) {
+    modes.set(platform, await placementModeForShop(shop.id, platform));
+  }
+  // A Demo supplier order is only a problem where a real customer is waiting.
+  const demoAllowed = order.isTest || shop.isDevelopmentStore;
 
   return {
     shopDomain: shop.domain,
@@ -141,8 +160,20 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
         estimatedDays: po.estimatedDeliveryDays,
         errorMessage: po.errorMessage,
         placedAt: po.placedAt,
-        paymentUrl: (po.raw as { paymentUrl?: string } | null)?.paymentUrl ?? null,
-        items: po.items.map((i) => ({ id: i.id, title: i.title, quantity: i.quantity, unitCost: i.unitCost.toString(), externalSkuId: i.externalSkuId })),
+        // The column is where placement stores the link; the raw copy is what
+        // older purchase orders carried.
+        paymentUrl: po.paymentUrl ?? (po.raw as { paymentUrl?: string } | null)?.paymentUrl ?? null,
+        canSync: Boolean(po.externalOrderId) && !isSimulatedPurchaseOrder(po) && ["api", "demo"].includes(modes.get(po.platform) ?? ""),
+        simulated: isSimulatedPurchaseOrder(po),
+        simulatedOnRealOrder: isSimulatedPurchaseOrder(po) && (po.platform !== "MOCK" || !demoAllowed),
+        items: po.items.map((i) => ({
+          id: i.id,
+          title: i.title,
+          quantity: i.quantity,
+          unitCost: i.unitCost.toString(),
+          externalSkuId: i.externalSkuId,
+          productUrl: supplierProductUrl(po.platform, i.externalProductId),
+        })),
         trackings: po.trackings.map((t) => ({ id: t.id, number: t.number, carrier: t.carrierName ?? t.carrierCode, url: t.trackingUrl, synced: t.syncedToShopify, syncError: t.syncError, status: t.status })),
       })),
     },
@@ -158,7 +189,13 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     switch (intent) {
       case "place": {
         const outcome = await placeSupplierOrders(shop, id, { actor, force: get("force") === "true" });
-        return outcome.ok ? { ok: true, messageKey: "msg.supplierOrdersPlaced", messageVars: { n: outcome.purchaseOrderIds.length } } : { ok: false, error: outcome.error, issues: outcome.issues };
+        if (!outcome.ok) return { ok: false, error: outcome.error, issues: outcome.issues };
+        // Never "placed" for an order that is only priced and waiting for the
+        // extension: the merchant would believe it went out.
+        if (outcome.awaitingPlacementIds?.length) {
+          return { ok: true, messageKey: "orders.placement.readyMessage", messageVars: { n: outcome.awaitingPlacementIds.length } };
+        }
+        return { ok: true, messageKey: "msg.supplierOrdersPlaced", messageVars: { n: outcome.purchaseOrderIds.length } };
       }
       case "approve-fulfillment": {
         const outcome = await approveFulfillmentRequest(shop, get("requestId"), actor);
@@ -243,6 +280,7 @@ const TOAST_KEYS = new Set(["msg.addressSaved", "msg.lineItemUpdated", "msg.trac
  */
 function toneFor(messageKey: string | undefined): "success" | "info" | "warning" {
   if (messageKey === "msg.trackingSyncedWithFailures") return "warning";
+  if (messageKey === "orders.placement.readyMessage") return "info";
   if (messageKey === "msg.fulfillmentDeclined") return "info";
   return "success";
 }
@@ -275,7 +313,10 @@ export default function OrderDetailPage() {
 
   const errors = order.issues.filter((i) => i.severity === "error");
   const warnings = order.issues.filter((i) => i.severity === "warning");
-  const canPlace = order.stage === "AWAITING_ORDER" || order.stage === "PENDING" || order.stage === "FAILED";
+  const awaitingPlacement = order.purchaseOrders.filter((po) => po.status === "AWAITING_PLACEMENT");
+  // A pending order whose lines are all waiting for the extension has nothing
+  // left to send; offering "Send" there only re-reports the same purchase order.
+  const canPlace = order.stage === "AWAITING_ORDER" || order.stage === "FAILED" || (order.stage === "PENDING" && awaitingPlacement.length === 0);
   const force = order.stage === "PENDING";
   const busy = fetcher.state !== "idle";
   const submit = (payload: Record<string, string>) => fetcher.submit(payload, { method: "post" });
@@ -335,6 +376,11 @@ export default function OrderDetailPage() {
                 ) : null}
               </Banner>
             )}
+            {awaitingPlacement.length > 0 && (
+              <Banner tone="warning" title={t("orders.placement.title")} action={{ content: t("orders.placement.setUpExtension"), url: "/app/settings/advanced" }}>
+                <p>{t("orders.placement.body")}</p>
+              </Banner>
+            )}
             {errors.length > 0 && (
               <Banner tone="critical" title={t("orders.detail.blockedTitle")}>
                 <List>
@@ -374,6 +420,12 @@ export default function OrderDetailPage() {
                   </InlineStack>
                   <Text as="p" tone="subdued">
                     {t("orders.detail.approvalHelp")}
+                  </Text>
+                  {/* Shopify is told nothing until the merchant decides, and it
+                      expects an answer within a day, so the deadline the app
+                      enforces is said out loud rather than discovered. */}
+                  <Text as="p" variant="bodySm">
+                    {t("orders.fulfillmentRequest.decideBy", { when: formatDate(approval.decideBy) })}
                   </Text>
                   {approval.requestMessage && (
                     <Text as="p" variant="bodySm">
@@ -601,25 +653,29 @@ export default function OrderDetailPage() {
                               {t("action.pay")}
                             </Button>
                           )}
-                          {po.externalOrderId && (
+                          {po.canSync && (
                             <Button size="slim" loading={busy} onClick={() => submit({ intent: "sync-po", purchaseOrderId: po.id })}>
                               {t("orders.detail.checkStatus")}
                             </Button>
                           )}
-                          {!po.externalOrderId && (
+                          {/* A simulated id under a real platform names no order anywhere, so the
+                              real one can replace it once the merchant has placed it. */}
+                          {(!po.externalOrderId || (po.simulated && po.platform !== "MOCK")) && (
                             <Button size="slim" onClick={() => { setManualId(""); setLinkPo(po.id); }}>
                               {t("orders.detail.linkSupplierOrder")}
                             </Button>
                           )}
-                          <Button size="slim" onClick={() => { setTracking({ number: "", carrier: "", url: "" }); setTrackingPo(po.id); }}>
-                            {t("orders.detail.addTracking")}
-                          </Button>
+                          {po.status !== "AWAITING_PLACEMENT" && (
+                            <Button size="slim" onClick={() => { setTracking({ number: "", carrier: "", url: "" }); setTrackingPo(po.id); }}>
+                              {t("orders.detail.addTracking")}
+                            </Button>
+                          )}
                           {(po.status === "FAILED" || po.status === "CANCELED") && (
                             <Button size="slim" loading={busy} onClick={() => submit({ intent: "retry-po", purchaseOrderId: po.id })}>
                               {t("action.retry")}
                             </Button>
                           )}
-                          {["PLACED", "AWAITING_PAYMENT", "PAID"].includes(po.status) && (
+                          {(["AWAITING_PLACEMENT", "PLACED", "AWAITING_PAYMENT", "PAID"].includes(po.status) || (po.simulatedOnRealOrder && po.status !== "CANCELED")) && (
                             <Button size="slim" tone="critical" onClick={() => setCancelPo(po.id)}>
                               {t("action.cancel")}
                             </Button>
@@ -629,6 +685,11 @@ export default function OrderDetailPage() {
                       {po.errorMessage && (
                         <Banner tone="critical">
                           <p>{po.errorMessage}</p>
+                        </Banner>
+                      )}
+                      {po.simulatedOnRealOrder && po.status !== "CANCELED" && (
+                        <Banner tone="critical" title={t("orders.simulated.title")}>
+                          <p>{t("orders.simulated.body")}</p>
                         </Banner>
                       )}
                       <InlineGrid columns={{ xs: 3 }} gap="200">
@@ -645,6 +706,14 @@ export default function OrderDetailPage() {
                                 <Text as="span" tone="subdued" variant="bodySm">
                                   {` · SKU ${i.externalSkuId}`}
                                 </Text>
+                                {po.status === "AWAITING_PLACEMENT" && i.productUrl && (
+                                  <>
+                                    {" · "}
+                                    <PolarisLink url={i.productUrl} target="_blank">
+                                      {t("orders.placement.openProduct")}
+                                    </PolarisLink>
+                                  </>
+                                )}
                               </Text>
                               <Text as="span" variant="bodySm" numeric>
                                 {formatMoney(i.unitCost, po.currency)}

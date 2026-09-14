@@ -17,6 +17,7 @@ import { formatDate, formatMoney, pageParam } from "~/lib/format";
 import { useJobRun } from "~/lib/use-job-run";
 import { useErrorMessage, useT } from "~/lib/use-t";
 import { createJobRun } from "~/services/jobs.server";
+import { countAwaitingPlacement } from "~/services/fulfillment.server";
 import { enqueue } from "~/services/jobs/index.server";
 import { countOrdersByStage, listOrders } from "~/services/orders.server";
 
@@ -26,12 +27,17 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const stage = (url.searchParams.get("stage") ?? "ALL") as OrderStage | "ALL";
   const search = url.searchParams.get("q") ?? "";
   const page = pageParam(url.searchParams.get("page"));
-  const [list, counts] = await Promise.all([listOrders(shop.id, { stage, search, page, pageSize: shop.parsedSettings.ui.ordersPageSize }), countOrdersByStage(shop.id)]);
+  const [list, counts, awaitingPlacement] = await Promise.all([
+    listOrders(shop.id, { stage, search, page, pageSize: shop.parsedSettings.ui.ordersPageSize }),
+    countOrdersByStage(shop.id),
+    countAwaitingPlacement(shop.id),
+  ]);
   return {
     currency: shop.currency,
     stage,
     search,
     counts,
+    awaitingPlacement,
     list: {
       ...list,
       items: list.items.map((o) => ({
@@ -148,6 +154,17 @@ export default function OrdersPage() {
             {errorText && (
               <Banner tone="critical">
                 <p>{errorText}</p>
+              </Banner>
+            )}
+            {/* These orders sit in no stage that says "your move": they are priced,
+                not ordered, and nothing happens until the extension places them. */}
+            {data.awaitingPlacement > 0 && (
+              <Banner
+                tone="warning"
+                title={t("orders.placement.listBannerTitle", { n: data.awaitingPlacement })}
+                action={{ content: t("orders.placement.setUpExtension"), url: "/app/settings/advanced" }}
+              >
+                <p>{t("orders.placement.listBannerBody")}</p>
               </Banner>
             )}
             <InlineGrid columns={{ xs: 2, md: 4 }} gap="400">

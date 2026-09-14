@@ -7,7 +7,17 @@ import { logger } from "~/lib/logger.server";
 import { AliExpressAdapter } from "./aliexpress.server";
 import { CjDropshippingAdapter } from "./cj.server";
 import { MockSupplierAdapter } from "./mock.server";
-import type { SupplierAdapter, SupplierCredentials, SupplierPlatform } from "./types";
+import type {
+  PlaceOrderResult,
+  SupplierAdapter,
+  SupplierCredentials,
+  SupplierOrderStatus,
+  SupplierPlatform,
+  SupplierProductDetail,
+  SupplierSearchResult,
+  SupplierShippingQuote,
+  SupplierTracking,
+} from "./types";
 
 export interface PlatformInfo {
   platform: SupplierPlatform;
@@ -20,13 +30,110 @@ export interface PlatformInfo {
 
 const mock = new MockSupplierAdapter();
 
+/** Error code for a platform this server cannot reach through an API. */
+export const SUPPLIER_API_UNAVAILABLE = "SUPPLIER_API_UNAVAILABLE";
+
+const PLATFORM_NAMES: Record<SupplierPlatform, string> = {
+  ALIEXPRESS: "AliExpress",
+  CJ_DROPSHIPPING: "CJ Dropshipping",
+  TEMU: "Temu",
+  MANUAL: "Manual supplier",
+  MOCK: "Demo supplier",
+};
+
 /**
- * Instantiate the adapter for a platform. With SUPPLIER_DRIVER=mock every
- * platform is served by the in-memory mock, so the whole app can be exercised
- * without upstream credentials.
+ * Stands in for a real platform the server has no API connection to.
+ *
+ * Every call fails with a reason the merchant can act on. This replaces the
+ * old behaviour, where SUPPLIER_DRIVER=mock (and TEMU/MANUAL under any driver)
+ * silently handed back the mock: a real AliExpress product captured by the
+ * extension was then "ordered" through it, got a MOCK- order id and a fake
+ * payment link, and invented tracking was pushed into a real Shopify
+ * fulfilment that emailed the buyer. Nothing ever reached AliExpress.
+ *
+ * `getProduct` throws rather than returning null on purpose: null means "the
+ * supplier removed this product", which marks every variant out of stock and
+ * lets the inventory job unpublish a product that is perfectly fine.
+ */
+export class UnavailableSupplierAdapter implements SupplierAdapter {
+  readonly displayName: string;
+  readonly simulated = false;
+  readonly capabilities = {
+    search: false,
+    imageSearch: false,
+    oauth: false,
+    placeOrder: false,
+    cancelOrder: false,
+    tracking: false,
+    shippingQuotes: false,
+  };
+
+  constructor(readonly platform: SupplierPlatform) {
+    this.displayName = PLATFORM_NAMES[platform];
+  }
+
+  isConfigured() {
+    return false;
+  }
+
+  parseProductReference(input: string): string | null {
+    // Recognising a link needs no API, and the extension's capture route relies
+    // on it to file a product under the right platform.
+    if (this.platform === "ALIEXPRESS") return new AliExpressAdapter().parseProductReference(input);
+    if (this.platform === "CJ_DROPSHIPPING") return new CjDropshippingAdapter().parseProductReference(input);
+    return null;
+  }
+
+  private refuse(): never {
+    throw new SupplierError(SUPPLIER_API_UNAVAILABLE, unavailableReason(this.platform));
+  }
+
+  async searchProducts(): Promise<SupplierSearchResult> {
+    return this.refuse();
+  }
+
+  async getProduct(): Promise<SupplierProductDetail | null> {
+    return this.refuse();
+  }
+
+  async getShippingQuotes(): Promise<SupplierShippingQuote[]> {
+    return this.refuse();
+  }
+
+  async placeOrder(): Promise<PlaceOrderResult> {
+    return this.refuse();
+  }
+
+  async getOrder(): Promise<SupplierOrderStatus | null> {
+    return this.refuse();
+  }
+
+  async getTracking(): Promise<SupplierTracking[]> {
+    return this.refuse();
+  }
+}
+
+/** What the merchant should do instead, for a platform with no API connection. */
+export function unavailableReason(platform: SupplierPlatform): string {
+  if (platform === "ALIEXPRESS") {
+    return "AliExpress is not connected through its API on this server. Open the product on AliExpress and use the DropshipHub Chrome extension on that page to add it; supplier orders are placed from the extension too.";
+  }
+  return `${PLATFORM_NAMES[platform]} cannot be reached from DropshipHub yet. Place this order on the supplier's own site, then link its order id on the order page.`;
+}
+
+/**
+ * Instantiate the adapter for a platform.
+ *
+ * The Demo supplier (MOCK) is served by the in-memory mock under any driver.
+ * A real platform is served by its real adapter only under SUPPLIER_DRIVER=live;
+ * otherwise, and for platforms with no integration at all, it gets an adapter
+ * that refuses every call with a clear reason. The mock is never handed to a
+ * real platform: whatever it answers is invented, and on a real platform that
+ * invention reaches real merchants and buyers.
  */
 export function getAdapter(platform: SupplierPlatform, credentials: SupplierCredentials = {}): SupplierAdapter {
-  if (env().SUPPLIER_DRIVER === "mock" || platform === "MOCK") return mock;
+  if (platform === "MOCK") return mock;
+  if (env().SUPPLIER_DRIVER !== "live") return new UnavailableSupplierAdapter(platform);
   switch (platform) {
     case "ALIEXPRESS":
       return new AliExpressAdapter(credentials);
@@ -35,10 +142,70 @@ export function getAdapter(platform: SupplierPlatform, credentials: SupplierCred
     case "MANUAL":
     case "TEMU":
     default:
-      // Not yet integrated platforms behave like the mock so mappings and
-      // orders still flow; the purchase order is left for manual placement.
-      return mock;
+      return new UnavailableSupplierAdapter(platform);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Placement mode
+// ---------------------------------------------------------------------------
+
+/**
+ * How a supplier order for one platform gets placed for one shop.
+ *
+ * - `api`: the app places it upstream itself.
+ * - `demo`: the Demo supplier simulates it (platform MOCK only).
+ * - `extension`: the app prices it and holds it as AWAITING_PLACEMENT; the
+ *   merchant's browser places it on the supplier's site through the extension.
+ * - `unavailable`: nothing can place it; placement fails with the reason.
+ */
+export type PlacementMode = "api" | "demo" | "extension" | "unavailable";
+
+/** Platforms the app has an ordering API integration for. */
+const API_PLATFORMS = new Set<SupplierPlatform>(["ALIEXPRESS", "CJ_DROPSHIPPING"]);
+/** Platforms the Chrome extension can place orders on. */
+const EXTENSION_PLATFORMS = new Set<SupplierPlatform>(["ALIEXPRESS"]);
+
+/**
+ * The single rule for placement mode. Pure, so every combination is tested.
+ *
+ * "api" needs all three of: the live driver, server keys for the platform, and
+ * a supplier account this shop has connected. Any one missing means an API
+ * call would fail or - as happened under the mock driver - be answered by
+ * something other than the supplier.
+ */
+export function decidePlacementMode(input: {
+  platform: SupplierPlatform;
+  driver: "mock" | "live";
+  apiConfigured: boolean;
+  hasConnectedAccount: boolean;
+}): PlacementMode {
+  if (input.platform === "MOCK") return "demo";
+  if (input.driver === "live" && API_PLATFORMS.has(input.platform) && input.apiConfigured && input.hasConnectedAccount) {
+    return "api";
+  }
+  return EXTENSION_PLATFORMS.has(input.platform) ? "extension" : "unavailable";
+}
+
+/** Placement mode for a shop, reading its connected supplier accounts. */
+export async function placementModeForShop(shopId: string, platform: SupplierPlatform): Promise<PlacementMode> {
+  if (platform === "MOCK") return "demo";
+  const account = (await connectedAccountsFor(shopId, platform))[0] ?? null;
+  let apiConfigured = false;
+  if (platform === "ALIEXPRESS") apiConfigured = new AliExpressAdapter().isConfigured();
+  // CJ authenticates per account with an API key, stored as its access token.
+  if (platform === "CJ_DROPSHIPPING") apiConfigured = Boolean(account?.accessToken) || new CjDropshippingAdapter().isConfigured();
+  return decidePlacementMode({ platform, driver: env().SUPPLIER_DRIVER, apiConfigured, hasConnectedAccount: Boolean(account) });
+}
+
+/** The product page on the supplier's own site, for the merchant to open. */
+export function supplierProductUrl(platform: SupplierPlatform, externalProductId: string | null, storedUrl?: string | null): string | null {
+  if (platform === "MOCK") return null;
+  if (storedUrl && /^https:\/\//i.test(storedUrl)) return storedUrl;
+  if (platform === "ALIEXPRESS" && externalProductId && /^\d{6,}$/.test(externalProductId)) {
+    return `https://www.aliexpress.com/item/${externalProductId}.html`;
+  }
+  return null;
 }
 
 export function listPlatforms(): PlatformInfo[] {
@@ -64,7 +231,7 @@ export function listPlatforms(): PlatformInfo[] {
     {
       platform: "MOCK",
       displayName: "Demo supplier",
-      description: "Built-in sample catalogue that behaves like AliExpress, for trying the full flow without credentials.",
+      description: "Sample catalogue for trying the app. Products, prices and tracking are invented, and nothing is ever ordered.",
       authMode: "none",
       configured: true,
       capabilities: mock.capabilities,
@@ -184,11 +351,21 @@ async function clearAuthFailure(accountId: string) {
 /**
  * Pick the supplier account a shop should use for a platform: the shop's own
  * default first, then any account on the parent Account, else a credential-less
- * adapter (fine for search in mock mode; live calls will raise NOT_AUTHORIZED).
+ * adapter (live calls will raise NOT_AUTHORIZED; a platform with no API
+ * connection refuses with the reason).
  */
 export async function adapterForShop(shopId: string, platform: SupplierPlatform) {
+  const candidates = await connectedAccountsFor(shopId, platform);
+  const chosen = candidates[0];
+  if (!chosen) return { adapter: getAdapter(platform), account: null };
+  const { adapter, account } = await adapterForAccount(chosen.id);
+  return { adapter, account };
+}
+
+/** A shop's usable supplier accounts for a platform, best first. */
+async function connectedAccountsFor(shopId: string, platform: SupplierPlatform) {
   const shop = await prisma.shop.findUnique({ where: { id: shopId }, select: { accountId: true } });
-  const candidates = await prisma.supplierAccount.findMany({
+  return prisma.supplierAccount.findMany({
     where: {
       platform,
       isActive: true,
@@ -203,10 +380,6 @@ export async function adapterForShop(shopId: string, platform: SupplierPlatform)
       { lastUsedAt: { sort: "desc", nulls: "last" } },
     ],
   });
-  const chosen = candidates[0];
-  if (!chosen) return { adapter: getAdapter(platform), account: null };
-  const { adapter, account } = await adapterForAccount(chosen.id);
-  return { adapter, account };
 }
 
 /** Which platform a pasted URL or id belongs to. */

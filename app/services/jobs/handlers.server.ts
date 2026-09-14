@@ -2,7 +2,8 @@ import prisma from "~/db.server";
 import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
 import { refreshRates } from "../currency.server";
-import { placeSupplierOrders, syncOpenPurchaseOrders, syncPendingTracking } from "../fulfillment.server";
+import { fetchFulfillmentRouting, fulfillmentServiceRouting, placeSupplierOrders, syncOpenPurchaseOrders, syncPendingTracking } from "../fulfillment.server";
+import { reconcileFulfillmentRequests, type ReconcileResult } from "../fulfillment-service.server";
 import { landingExamples, rewriteImportedProduct } from "../landing-rewrite.server";
 import { addToImportList, pushImportedProduct } from "../import.server";
 import { runInventorySync } from "../inventory-sync.server";
@@ -14,7 +15,7 @@ import { checkPayments, sendPaymentReminders } from "../payments.server";
 import { syncOrdersFromShopify } from "../orders.server";
 import { rollupRange } from "../reports.server";
 import { getShopById } from "../shop.server";
-import { offlineClient } from "../shopify/graphql.server";
+import { offlineClient, type GraphqlClient } from "../shopify/graphql.server";
 import { processWebhookEvent } from "../webhooks.server";
 import { enqueue, registerHandler } from "./queue.server";
 
@@ -186,27 +187,72 @@ export function registerAllHandlers() {
   registerHandler("auto-place-orders", async ({ shopId }) => {
     const shop = await getShopById(shopId);
     if (!shop || !shop.isActive) return;
+
+    // Fulfilment requests are settled first and whatever the auto-place setting
+    // says: this tick is what declines a request nobody approved before
+    // Shopify's response window closes, and what picks up a request whose
+    // webhook was lost. It is the only schedule every installed shop runs on.
+    let requests: ReconcileResult | null = null;
+    if (shop.fulfillmentLocationId) {
+      requests = await reconcileFulfillmentRequests(shop).catch((error) => {
+        logger.error("Fulfilment request reconciliation failed", { shopId, error });
+        return null;
+      });
+    }
+
     const settings = shop.parsedSettings.orders;
-    if (!settings.autoPlaceOrders) return;
+    if (!settings.autoPlaceOrders) return { requests };
     // A downgrade after the setting was switched on must not keep placing.
     if (!(await hasFeature(shop, "autoPlaceOrders"))) {
       logger.info("Auto-place skipped: not included in the plan", { shopId });
-      return;
+      return { requests };
     }
     const cutoff = new Date(Date.now() - settings.autoPlaceDelayMinutes * 60_000);
     const ready = await prisma.order.findMany({
       where: { shopId, stage: "AWAITING_ORDER", shopifyCreatedAt: { lte: cutoff }, isTest: false },
-      select: { id: true },
+      select: { id: true, shopifyOrderId: true, lineItems: { select: { shopifyLineItemId: true } } },
       take: 50,
     });
+
+    // Lines Shopify routed to the app's fulfilment-service location are the
+    // merchant's to request. Auto-place ordered them upstream anyway, so the
+    // supplier was paid for goods the merchant had never asked the app to
+    // fulfil, and the request that did come later found them already placed.
+    // Without a client the routing cannot be checked, so nothing is placed
+    // rather than everything; a failed routing read skips just that order.
+    let client: GraphqlClient | null = null;
+    if (shop.fulfillmentLocationId && ready.length > 0) {
+      try {
+        client = await offlineClient(shop.domain);
+      } catch (error) {
+        logger.warn("Auto-place skipped: fulfilment routing cannot be checked", { shopId, error });
+        return { placed: 0, requests };
+      }
+    }
+    let placed = 0;
+    let heldForRequest = 0;
     for (const order of ready) {
       try {
-        await placeSupplierOrders(shop, order.id, { actor: "auto-place" });
+        let scope: string[] | undefined;
+        if (client) {
+          const routing = fulfillmentServiceRouting(await fetchFulfillmentRouting(client, order.shopifyOrderId), shop.fulfillmentLocationId);
+          if (routing.serviceLineItemIds.size > 0) {
+            scope = order.lineItems.map((li) => li.shopifyLineItemId).filter((id) => !routing.serviceLineItemIds.has(id));
+            // An empty scope means "every line" to placement, the opposite of
+            // what is wanted here.
+            if (scope.length === 0) {
+              heldForRequest += 1;
+              continue;
+            }
+          }
+        }
+        await placeSupplierOrders(shop, order.id, { actor: "auto-place", shopifyLineItemIds: scope });
+        placed += 1;
       } catch (error) {
         logger.error("Auto-place failed", { orderId: order.id, error });
       }
     }
-    return { placed: ready.length };
+    return { placed, heldForRequest, requests };
   });
 
   registerHandler("payment-reminders", async ({ shopId }) => {

@@ -58,6 +58,24 @@ describe("MockSupplierAdapter", () => {
     expect((await adapter.getOrder(first.externalOrderId))?.status).toBe("CANCELED");
   });
 
+  it("reports an order it did not place as unknown, never as shipped", async () => {
+    // A restart or a separate worker process used to see every MOCK- id as
+    // SHIPPED at once, skipping payment and pushing invented tracking.
+    expect(await adapter.getOrder("MOCK-FROM-ANOTHER-PROCESS-1")).toBeNull();
+    expect(await adapter.getTracking("MOCK-FROM-ANOTHER-PROCESS-1")).toEqual([]);
+  });
+
+  it("keeps its sample data from passing for a real listing", async () => {
+    const product = await adapter.getProduct(MOCK_CATALOG_IDS[0]);
+    expect(product!.url).not.toMatch(/aliexpress/i);
+    expect(product!.storeUrl ?? "").not.toMatch(/aliexpress/i);
+    expect(product!.descriptionHtml).not.toMatch(/buyer protection|within 48 hours|example\.com\/store/i);
+    const page = await adapter.searchProducts({ query: "" });
+    expect(page.items.every((i) => !/aliexpress/i.test(i.url))).toBe(true);
+    // The parse still works on the demo link, so "Add to import list" does too.
+    expect(adapter.parseProductReference(page.items[0].url)).toBe(page.items[0].externalId);
+  });
+
   it("rejects unknown SKUs", async () => {
     await expect(
       adapter.placeOrder({
@@ -86,9 +104,14 @@ describe("supplier registry", () => {
     expect((invented!.raw as { mockSynthetic?: boolean } | undefined)?.mockSynthetic).toBe(true);
   });
 
-  it("serves the mock adapter for every platform in mock mode", () => {
-    expect(getAdapter("ALIEXPRESS").platform).toBe("MOCK");
-    expect(getAdapter("CJ_DROPSHIPPING").platform).toBe("MOCK");
+  it("never serves the mock for a real platform, whatever the driver", () => {
+    // Under SUPPLIER_DRIVER=mock every platform used to get the mock, so a real
+    // AliExpress order was "placed" with a MOCK- id and invented tracking.
+    expect(getAdapter("ALIEXPRESS").platform).toBe("ALIEXPRESS");
+    expect(getAdapter("ALIEXPRESS").simulated).toBeFalsy();
+    expect(getAdapter("CJ_DROPSHIPPING").platform).toBe("CJ_DROPSHIPPING");
+    expect(getAdapter("CJ_DROPSHIPPING").simulated).toBeFalsy();
+    expect(getAdapter("MOCK").simulated).toBe(true);
   });
 
   it("lists platforms with configuration state", () => {

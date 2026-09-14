@@ -63,6 +63,32 @@ export const en = {
   "orders.detail.placedAt": "Placed",
   "orders.detail.activityEmptyBody": "Everything that happens to this order is recorded here.",
   "orders.detail.approvalRequested": "Requested",
+
+  // ---- Placement with the Chrome extension ------------------------------------
+  "orders.placement.badge": "Waiting to be placed",
+  "orders.placement.title": "Waiting to be placed with the extension",
+  "orders.placement.body": "Nothing has been ordered from the supplier yet. Open the DropshipHub extension in Chrome, choose Orders to place, and buy each item on its product page. This order moves to Awaiting payment once the extension reports it placed.",
+  "orders.placement.openProduct": "Open on AliExpress",
+  "orders.placement.readyMessage": "{n} supplier order(s) priced and waiting to be placed with the Chrome extension. Nothing has been ordered yet.",
+  "orders.placement.listBannerTitle": "{n} supplier order(s) are waiting to be placed with the Chrome extension",
+  "orders.placement.listBannerBody": "They are priced but not ordered. Open the DropshipHub extension in Chrome and choose Orders to place.",
+  "orders.placement.setUpExtension": "Set up the extension",
+  "orders.placement.paymentsBannerTitle": "{n} more supplier order(s) must be placed with the Chrome extension before they can be paid",
+  "orders.placement.paymentsBannerBody": "They are not in this queue because they do not exist at the supplier yet.",
+
+  // ---- Simulated supplier orders -----------------------------------------------
+  "orders.simulated.title": "Simulated supplier order",
+  "orders.simulated.body": "This supplier order was made up by the Demo supplier. Nothing was ordered or paid for, and its tracking is never sent to a real customer. Cancel it, then send the order to a real supplier.",
+
+  // ---- Fulfilment requests from Shopify ------------------------------------------
+  "orders.fulfillmentRequest.decideBy": "Shopify has not been answered yet. Unless you approve it, the request is declined automatically on {when}.",
+  "orders.fulfillmentRequest.how.step3": "With approval on (the default), it prices the order and waits for you: approving places the supplier order and accepts the request, declining rejects it, and a request nobody approves within 20 hours is declined automatically so Shopify is never left waiting. With approval off, it places the supplier order and accepts straight away.",
+
+  // ---- Paying several supplier orders ---------------------------------------------
+  "orders.payments.moreTitle": "{n} more payment page(s) to open",
+  "orders.payments.blockedTitle": "Your browser blocked the payment page. {n} page(s) to open",
+  "orders.payments.moreBody": "A browser opens one new tab per click, so open the rest one at a time.",
+  "orders.payments.payOrder": "Pay {order} ({amount})",
 } as const;
 
 export const vi: Partial<Record<keyof typeof en, string>> = {
@@ -125,4 +151,30 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   "orders.detail.placedAt": "Đặt lúc",
   "orders.detail.activityEmptyBody": "Mọi việc xảy ra với đơn này đều được ghi lại ở đây.",
   "orders.detail.approvalRequested": "Yêu cầu lúc",
+
+  // ---- Placement with the Chrome extension ------------------------------------
+  "orders.placement.badge": "Chờ đặt đơn",
+  "orders.placement.title": "Đang chờ đặt đơn qua tiện ích Chrome",
+  "orders.placement.body": "Chưa có gì được đặt với nhà cung cấp. Mở tiện ích DropshipHub trên Chrome, chọn Đơn cần đặt, rồi mua từng món ngay trên trang sản phẩm. Đơn sẽ chuyển sang Chờ thanh toán khi tiện ích báo đã đặt xong.",
+  "orders.placement.openProduct": "Mở trên AliExpress",
+  "orders.placement.readyMessage": "Đã tính giá {n} đơn nhà cung cấp, đang chờ bạn đặt qua tiện ích Chrome. Chưa có đơn nào được đặt.",
+  "orders.placement.listBannerTitle": "{n} đơn nhà cung cấp đang chờ đặt qua tiện ích Chrome",
+  "orders.placement.listBannerBody": "Các đơn này đã có giá nhưng chưa được đặt. Mở tiện ích DropshipHub trên Chrome và chọn Đơn cần đặt.",
+  "orders.placement.setUpExtension": "Cài tiện ích",
+  "orders.placement.paymentsBannerTitle": "Còn {n} đơn nhà cung cấp phải đặt qua tiện ích Chrome trước khi thanh toán được",
+  "orders.placement.paymentsBannerBody": "Các đơn này không nằm trong danh sách vì chưa hề tồn tại bên nhà cung cấp.",
+
+  // ---- Simulated supplier orders -----------------------------------------------
+  "orders.simulated.title": "Đơn nhà cung cấp giả lập",
+  "orders.simulated.body": "Đơn này do Nhà cung cấp mẫu tự tạo ra. Không có gì được đặt hay thanh toán, và mã vận đơn của nó không bao giờ được gửi cho khách thật. Hãy huỷ đơn này rồi gửi đơn hàng cho một nhà cung cấp thật.",
+
+  // ---- Fulfilment requests from Shopify ------------------------------------------
+  "orders.fulfillmentRequest.decideBy": "Shopify vẫn đang chờ trả lời. Nếu bạn không duyệt, yêu cầu sẽ tự động bị từ chối vào {when}.",
+  "orders.fulfillmentRequest.how.step3": "Khi bật duyệt (mặc định), app tính giá rồi chờ bạn: duyệt thì app đặt đơn nhà cung cấp và nhận yêu cầu, từ chối thì app báo từ chối, còn yêu cầu không ai duyệt trong 20 giờ sẽ tự động bị từ chối để Shopify không phải chờ mãi. Khi tắt duyệt, app đặt đơn nhà cung cấp và nhận yêu cầu ngay.",
+
+  // ---- Paying several supplier orders ---------------------------------------------
+  "orders.payments.moreTitle": "Còn {n} trang thanh toán cần mở",
+  "orders.payments.blockedTitle": "Trình duyệt đã chặn trang thanh toán. Còn {n} trang cần mở",
+  "orders.payments.moreBody": "Mỗi lần bấm, trình duyệt chỉ cho mở một thẻ mới, nên hãy mở lần lượt từng trang còn lại.",
+  "orders.payments.payOrder": "Thanh toán {order} ({amount})",
 };

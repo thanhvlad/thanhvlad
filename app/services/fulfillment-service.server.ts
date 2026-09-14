@@ -1,4 +1,5 @@
-import { Prisma, type FulfillmentRequestStatus } from "@prisma/client";
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { Prisma, type FulfillmentRequest, type FulfillmentRequestStatus } from "@prisma/client";
 import prisma from "~/db.server";
 import { errorMessage } from "~/lib/errors";
 import { env } from "~/lib/env.server";
@@ -9,7 +10,7 @@ import { notify } from "./notifications.server";
 import { cancelPurchaseOrder, placeSupplierOrders, quoteSupplierOrders, type SupplierQuote } from "./fulfillment.server";
 import { evaluateAndStoreOrder, orderIssues, refreshOrderFromShopify } from "./orders.server";
 import type { ShopWithSettings } from "./shop.server";
-import { gid, offlineClient, type GraphqlClient } from "./shopify/graphql.server";
+import { assertNoUserErrors, gid, gql, offlineClient, type GraphqlClient, type UserError } from "./shopify/graphql.server";
 import {
   acceptCancellationRequest,
   acceptFulfillmentRequest,
@@ -28,9 +29,17 @@ import {
  * The app as a Shopify fulfilment service.
  *
  * Once registered, every Shopify order containing a product stocked at the app's
- * location shows a native **Request fulfillment** button. Pressing it sends a
- * `fulfillment_orders/fulfillment_request_submitted` webhook; we accept it, place
- * the supplier order, and later fulfil with the tracking number.
+ * location shows a native **Request fulfillment** button. Pressing it reaches the
+ * app two ways: the `fulfillment_orders/fulfillment_request_submitted` webhook
+ * and a POST to `<callbackUrl>/fulfillment_order_notification`. Neither carries
+ * the order, so both only prompt the app to read the fulfilment order from
+ * Shopify and act on what Shopify says now.
+ *
+ * A request is answered in Shopify only once the app knows the answer. With the
+ * approval gate on (the default) it is priced and left SUBMITTED while the
+ * merchant decides: approving places the supplier order and then accepts,
+ * declining rejects, and a request nobody approves is rejected before Shopify's
+ * response window closes.
  */
 
 const SERVICE_NAME = "DropshipHub";
@@ -199,141 +208,346 @@ export async function locationsForVariant(client: GraphqlClient, inventoryItemId
 }
 
 // ---------------------------------------------------------------------------
-// Webhook handling
+// Timing
 // ---------------------------------------------------------------------------
 
-interface RequestPayload {
-  kind: "REQUEST" | "CANCELLATION";
-  shopifyOrderId: string | null;
-  fulfillmentOrderId: string;
-  message: string | null;
-  lineItems: Array<{ fulfillmentOrderLineItemId: string; shopifyLineItemId: string | null; quantity: number }>;
-}
+/**
+ * How long a request may wait for the merchant before the app declines it.
+ *
+ * Built for Shopify 5.8.6 counts a fulfilment request as answered only once it
+ * is accepted or rejected, and wants that within 24 hours. The sweep that
+ * enforces this runs every ten minutes and can itself be delayed by a restart,
+ * so the app gives up well inside the window rather than at its edge.
+ */
+export const APPROVAL_WINDOW_MS = 20 * 60 * 60_000;
+
+/** When the merchant is reminded that a request is still waiting. */
+export const APPROVAL_REMINDER_MS = 12 * 60 * 60_000;
 
 /**
- * Shopify's fulfilment-order webhooks carry the fulfilment order under a few
- * different shapes depending on topic and API version, so the payload is read
- * defensively and the parts we cannot find are simply left null.
+ * A SUBMITTED row younger than this is taken to be in the hands of another run
+ * (the webhook and the callback arrive together). An older one was left behind
+ * by a crash and is picked up again.
  */
-export function parseFulfillmentRequestPayload(topic: string, payload: Record<string, unknown>): RequestPayload | null {
-  const fo = (payload.fulfillment_order ?? payload) as Record<string, unknown>;
-  const rawId = fo.id ?? (payload as Record<string, unknown>).fulfillment_order_id;
-  if (!rawId) return null;
-  const fulfillmentOrderId = gid("FulfillmentOrder", String(rawId));
-  const orderIdRaw = fo.order_id ?? (payload as Record<string, unknown>).order_id;
-  const rawItems = (fo.line_items ?? (payload as Record<string, unknown>).fulfillment_order_line_items ?? []) as Array<
-    Record<string, unknown>
-  >;
+const IN_FLIGHT_MS = 5 * 60_000;
+
+export function approvalDeadline(requestedAt: Date): Date {
+  return new Date(requestedAt.getTime() + APPROVAL_WINDOW_MS);
+}
+
+// ---------------------------------------------------------------------------
+// Reading fulfilment orders from Shopify
+// ---------------------------------------------------------------------------
+
+const LIVE_FULFILLMENT_ORDER_FIELDS = `
+  id
+  status
+  requestStatus
+  orderId
+  assignedLocation { location { id } }
+  lineItems(first: 100) { nodes { id totalQuantity lineItem { id } } }
+  merchantRequests(first: 5, kind: FULFILLMENT_REQUEST) { nodes { message kind sentAt } }
+`;
+
+const FULFILLMENT_ORDER_QUERY = `#graphql
+  query DropshipFulfillmentOrderForRequest($id: ID!) {
+    fulfillmentOrder(id: $id) {
+      ${LIVE_FULFILLMENT_ORDER_FIELDS}
+    }
+  }
+`;
+
+const ASSIGNED_FULFILLMENT_ORDERS_QUERY = `#graphql
+  query DropshipAssignedFulfillmentOrders($status: FulfillmentOrderAssignmentStatus, $locationIds: [ID!], $after: String) {
+    assignedFulfillmentOrders(first: 50, after: $after, assignmentStatus: $status, locationIds: $locationIds) {
+      nodes {
+        ${LIVE_FULFILLMENT_ORDER_FIELDS}
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+`;
+
+// Kept beside the flow that needs it: the accept-first design never had a way
+// to hand an accepted order back, which is why "Decline" called reject on an
+// order Shopify no longer allowed to be rejected.
+const CLOSE_FULFILLMENT_ORDER = `#graphql
+  mutation DropshipCloseFulfillmentOrder($id: ID!, $message: String) {
+    fulfillmentOrderClose(id: $id, message: $message) {
+      fulfillmentOrder { id status requestStatus }
+      userErrors { field message }
+    }
+  }
+`;
+
+interface RawLiveFulfillmentOrder {
+  id: string;
+  status: string;
+  requestStatus: string;
+  orderId: string;
+  assignedLocation: { location: { id: string } | null } | null;
+  lineItems: { nodes: Array<{ id: string; totalQuantity: number; lineItem: { id: string } }> };
+  merchantRequests: { nodes: Array<{ message: string | null; kind: string; sentAt: string }> };
+}
+
+interface AssignedPage {
+  assignedFulfillmentOrders: { nodes: RawLiveFulfillmentOrder[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } };
+}
+
+/** A fulfilment order as Shopify holds it right now. */
+export interface LiveFulfillmentOrder {
+  id: string;
+  /** FulfillmentOrderStatus: OPEN, IN_PROGRESS, CLOSED, INCOMPLETE, ... */
+  status: string;
+  /** FulfillmentOrderRequestStatus: SUBMITTED, ACCEPTED, CANCELLATION_REQUESTED, ... */
+  requestStatus: string;
+  orderId: string;
+  locationId: string | null;
+  lineItems: Array<{ fulfillmentOrderLineItemId: string; shopifyLineItemId: string; quantity: number }>;
+  /** The note the merchant typed in the most recent request dialog. */
+  requestMessage: string | null;
+}
+
+function toLive(raw: RawLiveFulfillmentOrder): LiveFulfillmentOrder {
+  const latest = [...raw.merchantRequests.nodes].sort((a, b) => b.sentAt.localeCompare(a.sentAt))[0];
   return {
-    kind: topic.includes("CANCELLATION") ? "CANCELLATION" : "REQUEST",
-    shopifyOrderId: orderIdRaw ? gid("Order", String(orderIdRaw)) : null,
-    fulfillmentOrderId,
-    message: (payload.message as string) ?? (fo.request_message as string) ?? null,
-    lineItems: rawItems.map((li) => ({
-      fulfillmentOrderLineItemId: gid("FulfillmentOrderLineItem", String(li.id ?? "")),
-      shopifyLineItemId: li.line_item_id ? gid("LineItem", String(li.line_item_id)) : null,
-      quantity: Number(li.quantity ?? 0),
+    id: raw.id,
+    status: raw.status,
+    requestStatus: raw.requestStatus,
+    orderId: raw.orderId,
+    locationId: raw.assignedLocation?.location?.id ?? null,
+    lineItems: raw.lineItems.nodes.map((li) => ({
+      fulfillmentOrderLineItemId: li.id,
+      shopifyLineItemId: li.lineItem.id,
+      quantity: li.totalQuantity,
     })),
+    requestMessage: latest?.message || null,
   };
 }
 
+export async function fetchLiveFulfillmentOrder(client: GraphqlClient, fulfillmentOrderId: string): Promise<LiveFulfillmentOrder | null> {
+  const data = await gql<{ fulfillmentOrder: RawLiveFulfillmentOrder | null }>(client, FULFILLMENT_ORDER_QUERY, { id: fulfillmentOrderId });
+  return data.fulfillmentOrder ? toLive(data.fulfillmentOrder) : null;
+}
+
 /**
- * Handle "Request fulfillment": record it, accept it in Shopify, then place the
- * supplier order when the merchant has auto-placement on (or the order is
- * otherwise ready).
+ * Every fulfilment order at the app's location in the given assignment state.
+ *
+ * `complete` is false when the page cap was hit, so a caller never concludes
+ * that a request has gone from Shopify only because it was on a page not read.
+ */
+export async function listAssignedFulfillmentOrders(
+  client: GraphqlClient,
+  status: "FULFILLMENT_REQUESTED" | "CANCELLATION_REQUESTED",
+  locationId: string,
+  maxPages = 5,
+): Promise<{ orders: LiveFulfillmentOrder[]; complete: boolean }> {
+  const orders: LiveFulfillmentOrder[] = [];
+  let after: string | null = null;
+  for (let page = 0; page < maxPages; page += 1) {
+    const data: AssignedPage = await gql<AssignedPage>(client, ASSIGNED_FULFILLMENT_ORDERS_QUERY, { status, locationIds: [locationId], after });
+    orders.push(...data.assignedFulfillmentOrders.nodes.map(toLive));
+    if (!data.assignedFulfillmentOrders.pageInfo.hasNextPage) return { orders, complete: true };
+    after = data.assignedFulfillmentOrders.pageInfo.endCursor;
+  }
+  return { orders, complete: false };
+}
+
+export async function closeFulfillmentOrder(client: GraphqlClient, fulfillmentOrderId: string, message: string) {
+  const data = await gql<{ fulfillmentOrderClose: { userErrors: UserError[] } }>(client, CLOSE_FULFILLMENT_ORDER, {
+    id: fulfillmentOrderId,
+    message,
+  });
+  assertNoUserErrors(data.fulfillmentOrderClose.userErrors, "fulfillmentOrderClose");
+}
+
+/**
+ * The fulfilment order a webhook is about.
+ *
+ * `fulfillment_request_submitted` puts it under `submitted_fulfillment_order`,
+ * `cancellation_request_submitted` under `fulfillment_order`. Neither carries
+ * the order id or the line items: the old parser looked for both, found
+ * neither, and every real webhook was dropped as "unknown order".
+ */
+export function fulfillmentOrderIdFromPayload(payload: Record<string, unknown>): string | null {
+  const candidates = [payload.submitted_fulfillment_order, payload.fulfillment_order, payload.original_fulfillment_order];
+  for (const candidate of candidates) {
+    const id = (candidate as { id?: unknown } | null | undefined)?.id;
+    if (id !== undefined && id !== null && String(id)) return gid("FulfillmentOrder", String(id));
+  }
+  const bare = payload.fulfillment_order_id ?? payload.id;
+  return bare !== undefined && bare !== null && String(bare) ? gid("FulfillmentOrder", String(bare)) : null;
+}
+
+/**
+ * Whether a callback request really came from Shopify.
+ *
+ * Shopify signs `fulfillment_order_notification` the way it signs webhooks: a
+ * base64 HMAC-SHA256 of the raw body under the app's secret. Anything else
+ * could make the app spend Admin API calls on demand for whoever asks.
+ */
+export function verifyShopifyHmac(rawBody: string | Buffer, header: string | null, secret: string): boolean {
+  if (!header || !secret) return false;
+  const expected = createHmac("sha256", secret).update(rawBody).digest();
+  const given = Buffer.from(header, "base64");
+  return given.length === expected.length && timingSafeEqual(given, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Acting on requests
+// ---------------------------------------------------------------------------
+
+/** Fulfilment orders being worked on in this process, so two triggers do not race. */
+const inFlight = new Set<string>();
+
+/**
+ * Handle a fulfilment-order webhook: read the fulfilment order it names from
+ * Shopify and act on its current state.
  */
 export async function handleFulfillmentRequest(shop: ShopWithSettings, topic: string, payload: Record<string, unknown>) {
-  const parsed = parseFulfillmentRequestPayload(topic, payload);
-  if (!parsed) {
+  const fulfillmentOrderId = fulfillmentOrderIdFromPayload(payload);
+  if (!fulfillmentOrderId) {
     logger.warn("Unrecognised fulfilment-order webhook payload", { topic });
     return;
   }
   const client = await offlineClient(shop.domain);
-
-  // Make sure we have the order before responding to Shopify.
-  let order = parsed.shopifyOrderId
-    ? await prisma.order.findUnique({ where: { shopId_shopifyOrderId: { shopId: shop.id, shopifyOrderId: parsed.shopifyOrderId } } })
-    : null;
-  if (!order && parsed.shopifyOrderId) {
-    order = await refreshOrderFromShopify(shop, client, parsed.shopifyOrderId);
-  }
-  if (!order) {
-    logger.warn("Fulfilment request for an unknown order", { fulfillmentOrderId: parsed.fulfillmentOrderId });
+  const live = await fetchLiveFulfillmentOrder(client, fulfillmentOrderId);
+  if (!live) {
+    logger.warn("Fulfilment order from a webhook no longer exists", { topic, fulfillmentOrderId });
     return;
   }
+  await processFulfillmentOrder(shop, client, live);
+}
 
-  if (parsed.kind === "CANCELLATION") {
-    await prisma.fulfillmentRequest.updateMany({
-      where: { orderId: order.id, shopifyFulfillmentOrderId: parsed.fulfillmentOrderId },
-      data: { status: "CANCELLATION_REQUESTED" },
-    });
-    // Only a live supplier order can block a cancellation. Counting tracking
-    // across every purchase order on the Shopify order, cancelled ones
-    // included, let old history veto a new cancellation.
-    const livePurchaseOrders = await prisma.purchaseOrder.findMany({
-      where: { orderId: order.id, status: { notIn: ["CANCELED", "FAILED"] } },
-      select: { id: true },
-    });
-    const shipped = livePurchaseOrders.length
-      ? await prisma.trackingNumber.count({ where: { purchaseOrderId: { in: livePurchaseOrders.map((p) => p.id) } } })
-      : 0;
-
-    if (shipped === 0) {
-      await acceptCancellationRequest(client, parsed.fulfillmentOrderId, "Cancelled before the supplier shipped.");
-
-      // Cancel upstream as well. Accepting in Shopify while leaving the supplier
-      // order open kept it in the payment queue and in payment reminders, so the
-      // merchant was chased to pay for an order Shopify had already abandoned.
-      for (const po of livePurchaseOrders) {
-        try {
-          await cancelPurchaseOrder(shop, po.id, "Cancelled by the merchant in Shopify", "fulfillment-service");
-        } catch (error) {
-          logger.warn("Could not cancel the supplier order after a Shopify cancellation", {
-            purchaseOrderId: po.id,
-            error,
-          });
-        }
-      }
-
-      await prisma.fulfillmentRequest.updateMany({
-        where: { orderId: order.id, shopifyFulfillmentOrderId: parsed.fulfillmentOrderId },
-        data: { status: "CANCELLED", respondedAt: new Date() },
-      });
-      await logActivity(shop.id, {
-        action: "fulfillment_service.cancelled",
-        entity: "Order",
-        entityId: order.id,
-        message: `${order.name}: fulfilment cancelled at the merchant's request.`,
-      });
-    } else {
-      // Shopify has to be told. Writing only a log line left the cancellation
-      // request pending in the admin forever, with nothing on the other end.
-      const message = `Already shipped: the supplier has ${shipped} tracking number(s) for this order.`;
-      await rejectCancellationRequest(client, parsed.fulfillmentOrderId, message);
-      await prisma.fulfillmentRequest.updateMany({
-        where: { orderId: order.id, shopifyFulfillmentOrderId: parsed.fulfillmentOrderId },
-        data: { status: "CLOSED", responseMessage: message, respondedAt: new Date() },
-      });
-      await logActivity(shop.id, {
-        action: "fulfillment_service.cancel_rejected",
-        entity: "Order",
-        entityId: order.id,
-        level: "warn",
-        message: `${order.name}: cancellation refused, the supplier already shipped.`,
-      });
+/**
+ * Act on one fulfilment order according to what Shopify says about it now.
+ *
+ * Reading the state rather than trusting the trigger makes the webhook, the
+ * callback and the periodic sweep safe to deliver the same request twice.
+ */
+export async function processFulfillmentOrder(shop: ShopWithSettings, client: GraphqlClient, live: LiveFulfillmentOrder) {
+  // Only requests routed to this app's own location are ours to answer.
+  if (shop.fulfillmentLocationId && live.locationId && live.locationId !== shop.fulfillmentLocationId) return;
+  if (live.requestStatus !== "SUBMITTED" && live.requestStatus !== "CANCELLATION_REQUESTED") return;
+  if (inFlight.has(live.id)) return;
+  inFlight.add(live.id);
+  try {
+    let order = await prisma.order.findUnique({ where: { shopId_shopifyOrderId: { shopId: shop.id, shopifyOrderId: live.orderId } } });
+    if (!order) order = await refreshOrderFromShopify(shop, client, live.orderId);
+    if (!order) {
+      logger.warn("Fulfilment request for an unknown order", { fulfillmentOrderId: live.id });
+      return;
     }
-    return;
+    if (live.requestStatus === "CANCELLATION_REQUESTED") {
+      await handleCancellation(shop, client, order, live);
+    } else {
+      await handleSubmitted(shop, client, order, live);
+    }
+  } finally {
+    inFlight.delete(live.id);
   }
+}
 
+async function handleCancellation(
+  shop: ShopWithSettings,
+  client: GraphqlClient,
+  order: { id: string; name: string },
+  live: LiveFulfillmentOrder,
+) {
+  await prisma.fulfillmentRequest.updateMany({
+    where: { orderId: order.id, shopifyFulfillmentOrderId: live.id },
+    data: { status: "CANCELLATION_REQUESTED" },
+  });
+  // Only a live supplier order can block a cancellation. Counting tracking
+  // across every purchase order on the Shopify order, cancelled ones
+  // included, let old history veto a new cancellation.
+  const livePurchaseOrders = await prisma.purchaseOrder.findMany({
+    where: { orderId: order.id, status: { notIn: ["CANCELED", "FAILED"] } },
+    select: { id: true },
+  });
+  const shipped = livePurchaseOrders.length
+    ? await prisma.trackingNumber.count({ where: { purchaseOrderId: { in: livePurchaseOrders.map((p) => p.id) } } })
+    : 0;
+
+  if (shipped === 0) {
+    await acceptCancellationRequest(client, live.id, "Cancelled before the supplier shipped.");
+
+    // Cancel upstream as well. Accepting in Shopify while leaving the supplier
+    // order open kept it in the payment queue and in payment reminders, so the
+    // merchant was chased to pay for an order Shopify had already abandoned.
+    for (const po of livePurchaseOrders) {
+      try {
+        await cancelPurchaseOrder(shop, po.id, "Cancelled by the merchant in Shopify", "fulfillment-service");
+      } catch (error) {
+        logger.warn("Could not cancel the supplier order after a Shopify cancellation", {
+          purchaseOrderId: po.id,
+          error,
+        });
+      }
+    }
+
+    await prisma.fulfillmentRequest.updateMany({
+      where: { orderId: order.id, shopifyFulfillmentOrderId: live.id },
+      data: { status: "CANCELLED", respondedAt: new Date() },
+    });
+    await logActivity(shop.id, {
+      action: "fulfillment_service.cancelled",
+      entity: "Order",
+      entityId: order.id,
+      message: `${order.name}: fulfilment cancelled at the merchant's request.`,
+    });
+  } else {
+    // Shopify has to be told. Writing only a log line left the cancellation
+    // request pending in the admin forever, with nothing on the other end.
+    const message = `Already shipped: the supplier has ${shipped} tracking number(s) for this order.`;
+    await rejectCancellationRequest(client, live.id, message);
+    await prisma.fulfillmentRequest.updateMany({
+      where: { orderId: order.id, shopifyFulfillmentOrderId: live.id },
+      data: { status: "ACCEPTED", responseMessage: message, respondedAt: new Date() },
+    });
+    await logActivity(shop.id, {
+      action: "fulfillment_service.cancel_rejected",
+      entity: "Order",
+      entityId: order.id,
+      level: "warn",
+      message: `${order.name}: cancellation refused, the supplier already shipped.`,
+    });
+  }
+}
+
+async function handleSubmitted(
+  shop: ShopWithSettings,
+  client: GraphqlClient,
+  order: { id: string; name: string },
+  live: LiveFulfillmentOrder,
+) {
+  const key = { orderId_shopifyFulfillmentOrderId: { orderId: order.id, shopifyFulfillmentOrderId: live.id } };
+  const existing = await prisma.fulfillmentRequest.findUnique({ where: key });
+  // Already waiting on the merchant: the sweep owns its reminder and deadline,
+  // and pricing it again would move the number they are looking at.
+  if (existing?.status === "AWAITING_APPROVAL") return;
+  if (existing?.status === "SUBMITTED" && Date.now() - existing.requestedAt.getTime() < IN_FLIGHT_MS) return;
+
+  const lineItems = live.lineItems as unknown as Prisma.InputJsonValue;
+  // A row in any other state is an earlier request that was answered; Shopify
+  // saying SUBMITTED again means the merchant asked again, so it starts over
+  // with a fresh clock.
   const request = await prisma.fulfillmentRequest.upsert({
-    where: { orderId_shopifyFulfillmentOrderId: { orderId: order.id, shopifyFulfillmentOrderId: parsed.fulfillmentOrderId } },
-    create: {
-      orderId: order.id,
-      shopifyFulfillmentOrderId: parsed.fulfillmentOrderId,
-      requestMessage: parsed.message,
-      lineItems: parsed.lineItems as unknown as Prisma.InputJsonValue,
+    where: key,
+    create: { orderId: order.id, shopifyFulfillmentOrderId: live.id, requestMessage: live.requestMessage, lineItems },
+    update: {
+      status: "SUBMITTED",
+      requestMessage: live.requestMessage,
+      lineItems,
+      requestedAt: existing?.status === "SUBMITTED" ? undefined : new Date(),
+      responseMessage: null,
+      respondedAt: null,
+      quote: Prisma.JsonNull,
+      quotedAt: null,
+      quoteError: null,
+      approvedAt: null,
+      approvedBy: null,
     },
-    update: { status: "SUBMITTED", requestMessage: parsed.message, respondedAt: null },
   });
 
   // Decide before answering Shopify: rejecting with a reason is far more useful
@@ -350,7 +564,7 @@ export async function handleFulfillmentRequest(shop: ShopWithSettings, topic: st
   // with no rejection to prompt the merchant and no retry.
   if (blocking.length > 0) {
     const message = `Not fulfillable yet: ${blocking[0].message}`;
-    await rejectFulfillmentRequest(client, parsed.fulfillmentOrderId, message, reasonFor(blocking));
+    await rejectFulfillmentRequest(client, live.id, message, reasonFor(blocking));
     await prisma.fulfillmentRequest.update({
       where: { id: request.id },
       data: { status: "REJECTED", responseMessage: message, respondedAt: new Date() },
@@ -361,34 +575,25 @@ export async function handleFulfillmentRequest(shop: ShopWithSettings, topic: st
       title: `${order.name}: fulfilment request rejected`,
       body: message,
       link: `/app/orders/${order.id}`,
-      dedupeKey: `fo-reject:${request.id}`,
+      dedupeKey: `fo-reject:${request.id}:${request.requestedAt.getTime()}`,
     });
     return;
   }
 
-  await acceptFulfillmentRequest(client, parsed.fulfillmentOrderId, "Received by DropshipHub.");
-  await logActivity(shop.id, {
-    action: "fulfillment_service.accepted",
-    entity: "Order",
-    entityId: order.id,
-    message: `${order.name}: fulfilment request accepted from Shopify.`,
-  });
-
-  // Only the lines Shopify actually asked about. parsed.lineItems was stored
-  // on the request row and never read, so a request covering one fulfilment
-  // order placed every outstanding line on the whole order upstream.
-  const requestedLineIds = parsed.lineItems
-    .map((li) => li.shopifyLineItemId)
-    .filter((id): id is string => Boolean(id));
+  const deadline = approvalDeadline(request.requestedAt);
 
   // The merchant's own money is about to be spent on the strength of a button
   // pressed in a different product. Unless they have said otherwise, price the
   // order and stop here so the spend is a decision they take knowingly.
+  //
+  // Nothing is said to Shopify yet. Accepting first and asking afterwards left
+  // "Decline" calling reject on an order Shopify had already seen accepted,
+  // which it refuses, and the order sat accepted and unfulfilled.
   if (shop.parsedSettings.orders.requireApprovalOnFulfillmentRequest) {
     let quote: SupplierQuote | null = null;
     let quoteError: string | null = null;
     try {
-      quote = await quoteSupplierOrders(shop, order.id, { shopifyLineItemIds: requestedLineIds });
+      quote = await quoteSupplierOrders(shop, order.id, { shopifyLineItemIds: live.lineItems.map((li) => li.shopifyLineItemId) });
     } catch (error) {
       quoteError = errorMessage(error);
       logger.warn("Could not price a fulfilment request", { requestId: request.id, error });
@@ -401,7 +606,6 @@ export async function handleFulfillmentRequest(shop: ShopWithSettings, topic: st
         quote: (quote as unknown as Prisma.InputJsonValue) ?? Prisma.JsonNull,
         quotedAt: new Date(),
         quoteError,
-        respondedAt: new Date(),
       },
     });
 
@@ -409,34 +613,104 @@ export async function handleFulfillmentRequest(shop: ShopWithSettings, topic: st
       type: "order.failed",
       severity: "info",
       title: `${order.name}: waiting for you to approve the supplier order`,
-      body: quote
-        ? `${quote.totalCost} ${quote.currency} — ${quote.itemsCost} of items plus ${quote.shippingCost} shipping.`
-        : `The cost could not be worked out: ${quoteError ?? "unknown reason"}.`,
+      body:
+        (quote
+          ? `${quote.totalCost} ${quote.currency} — ${quote.itemsCost} of items plus ${quote.shippingCost} shipping.`
+          : `The cost could not be worked out: ${quoteError ?? "unknown reason"}.`) +
+        ` Declined automatically at ${deadline.toISOString()} unless you approve it.`,
       link: `/app/orders/${order.id}`,
-      dedupeKey: `fo-approve:${request.id}`,
+      dedupeKey: `fo-approve:${request.id}:${request.requestedAt.getTime()}`,
     });
     return;
   }
 
-  await prisma.fulfillmentRequest.update({
-    where: { id: request.id },
-    data: { status: "ACCEPTED", respondedAt: new Date() },
-  });
-
-  const outcome = await placeSupplierOrders(shop, order.id, {
-    actor: "fulfillment-request",
-    shopifyLineItemIds: requestedLineIds,
-  });
-  if (!outcome.ok) {
+  const outcome = await commitRequest(shop, client, request, live, "fulfillment-request");
+  if (outcome.ok) {
+    await logActivity(shop.id, {
+      action: "fulfillment_service.accepted",
+      entity: "Order",
+      entityId: order.id,
+      message: `${order.name}: supplier order placed and Shopify's fulfilment request accepted.`,
+    });
+  } else {
+    // Held for the merchant rather than rejected: a supplier timeout is not a
+    // reason to send the order back to Shopify, and the deadline still makes
+    // sure Shopify gets an answer.
+    await prisma.fulfillmentRequest.update({
+      where: { id: request.id },
+      data: { status: "AWAITING_APPROVAL", quoteError: outcome.error },
+    });
     await notify(shop.id, {
       type: "order.failed",
       severity: "critical",
       title: `${order.name}: could not place the supplier order`,
-      body: outcome.error,
+      body: `${outcome.error} Fix it and approve the request, or decline it. It is declined automatically at ${deadline.toISOString()}.`,
       link: `/app/orders/${order.id}`,
-      dedupeKey: `fo-place:${request.id}`,
+      dedupeKey: `fo-place:${request.id}:${request.requestedAt.getTime()}`,
     });
   }
+}
+
+/**
+ * Place the supplier order for a request, then accept it in Shopify.
+ *
+ * Placement comes first so a failure leaves the request SUBMITTED, which the
+ * merchant can still decline. Accepting is repeated safely: when the supplier
+ * order already exists, placement is a no-op and only the acceptance runs.
+ */
+async function commitRequest(
+  shop: ShopWithSettings,
+  client: GraphqlClient,
+  request: Pick<FulfillmentRequest, "id" | "orderId">,
+  live: LiveFulfillmentOrder,
+  actor: string,
+): Promise<{ ok: true; purchaseOrderIds: string[] } | { ok: false; error: string; issues?: string[] }> {
+  const outcome = await placeSupplierOrders(shop, request.orderId, {
+    actor,
+    shopifyLineItemIds: live.lineItems.map((li) => li.shopifyLineItemId),
+  });
+  if (!outcome.ok) return { ok: false, error: outcome.error ?? "Could not place the supplier order", issues: outcome.issues };
+
+  if (live.requestStatus === "SUBMITTED") {
+    try {
+      await acceptFulfillmentRequest(client, live.id, "Accepted by DropshipHub: the supplier order has been created.");
+    } catch (error) {
+      // Another run may have accepted it a moment earlier; only a request that
+      // is still not accepted is a failure.
+      const now = await fetchLiveFulfillmentOrder(client, live.id).catch(() => null);
+      if (now?.requestStatus !== "ACCEPTED") {
+        return {
+          ok: false,
+          error: `The supplier order was created, but Shopify did not accept the fulfilment request: ${errorMessage(error)}`,
+        };
+      }
+    }
+  }
+
+  await prisma.fulfillmentRequest.update({
+    where: { id: request.id },
+    data: { status: "ACCEPTED", approvedAt: new Date(), approvedBy: actor, quoteError: null, respondedAt: new Date() },
+  });
+  return { ok: true, purchaseOrderIds: outcome.purchaseOrderIds };
+}
+
+/** The request as Shopify holds it, or a reason to stop. */
+async function liveRequestFor(client: GraphqlClient, request: Pick<FulfillmentRequest, "shopifyFulfillmentOrderId">) {
+  const live = await fetchLiveFulfillmentOrder(client, request.shopifyFulfillmentOrderId);
+  if (live?.requestStatus === "SUBMITTED") return { live, answerable: "reject" as const };
+  // Accepted and still in progress: a request held under the old accept-first
+  // flow. Only fulfillmentOrderClose can hand one of those back.
+  if (live?.requestStatus === "ACCEPTED" && live.status === "IN_PROGRESS") return { live, answerable: "close" as const };
+  return { live, answerable: null };
+}
+
+const WITHDRAWN_MESSAGE = "Shopify no longer asks for this fulfilment: it was withdrawn or already answered.";
+
+async function markWithdrawn(request: Pick<FulfillmentRequest, "id">) {
+  await prisma.fulfillmentRequest.update({
+    where: { id: request.id },
+    data: { status: "CLOSED", responseMessage: WITHDRAWN_MESSAGE, respondedAt: new Date() },
+  });
 }
 
 /**
@@ -458,33 +732,61 @@ export async function approveFulfillmentRequest(shop: ShopWithSettings, requestI
     return { ok: false as const, error: `This request is ${request.status.toLowerCase().replace(/_/g, " ")}, not waiting for approval.` };
   }
 
-  const lineItems = (request.lineItems ?? []) as unknown as Array<{ shopifyLineItemId: string | null }>;
-  const shopifyLineItemIds = lineItems.map((li) => li.shopifyLineItemId).filter((id): id is string => Boolean(id));
+  const client = await offlineClient(shop.domain);
+  // Checked before anything is ordered: a merchant who withdrew the request in
+  // Shopify must not find a supplier order placed for it.
+  const { live, answerable } = await liveRequestFor(client, request);
+  if (!live || !answerable) {
+    await markWithdrawn(request);
+    return { ok: false as const, error: `${WITHDRAWN_MESSAGE} Nothing was ordered.` };
+  }
 
-  const outcome = await placeSupplierOrders(shop, request.orderId, {
-    actor: actor ?? "approval",
-    shopifyLineItemIds,
-  });
-
+  const outcome = await commitRequest(shop, client, request, live, actor ?? "approval");
   if (!outcome.ok) {
     // The request stays AWAITING_APPROVAL so the merchant can fix the reason
     // and press approve again, rather than losing the request entirely.
-    await prisma.fulfillmentRequest.update({ where: { id: request.id }, data: { quoteError: outcome.error ?? null } });
-    return { ok: false as const, error: outcome.error ?? "Could not place the supplier order", issues: outcome.issues };
+    await prisma.fulfillmentRequest.update({ where: { id: request.id }, data: { quoteError: outcome.error } });
+    return { ok: false as const, error: outcome.error, issues: outcome.issues };
   }
 
-  await prisma.fulfillmentRequest.update({
-    where: { id: request.id },
-    data: { status: "ACCEPTED", approvedAt: new Date(), approvedBy: actor ?? null, quoteError: null, respondedAt: new Date() },
-  });
   await logActivity(shop.id, {
     actor,
     action: "fulfillment_service.approved",
     entity: "Order",
     entityId: request.orderId,
-    message: `${request.order.name}: supplier order approved and placed.`,
+    message: `${request.order.name}: supplier order approved and placed; Shopify's fulfilment request accepted.`,
   });
   return { ok: true as const, purchaseOrderIds: outcome.purchaseOrderIds };
+}
+
+/**
+ * Answer a request the app will not carry out, the only way Shopify allows for
+ * its current state: reject one still SUBMITTED, close one already accepted.
+ */
+async function refuseRequest(
+  client: GraphqlClient,
+  request: Pick<FulfillmentRequest, "id" | "shopifyFulfillmentOrderId">,
+  message: string,
+): Promise<"rejected" | "closed" | "withdrawn"> {
+  const { answerable } = await liveRequestFor(client, request);
+  if (answerable === "reject") {
+    await rejectFulfillmentRequest(client, request.shopifyFulfillmentOrderId, message, "OTHER");
+    await prisma.fulfillmentRequest.update({
+      where: { id: request.id },
+      data: { status: "REJECTED", responseMessage: message, respondedAt: new Date() },
+    });
+    return "rejected";
+  }
+  if (answerable === "close") {
+    await closeFulfillmentOrder(client, request.shopifyFulfillmentOrderId, message);
+    await prisma.fulfillmentRequest.update({
+      where: { id: request.id },
+      data: { status: "CLOSED", responseMessage: message, respondedAt: new Date() },
+    });
+    return "closed";
+  }
+  await markWithdrawn(request);
+  return "withdrawn";
 }
 
 /**
@@ -500,14 +802,16 @@ export async function declineFulfillmentRequest(shop: ShopWithSettings, requestI
     include: { order: { select: { id: true, name: true } } },
   });
   if (!request) return { ok: false as const, error: "Fulfilment request not found" };
+  if (request.status !== "AWAITING_APPROVAL" && request.status !== "SUBMITTED") {
+    return { ok: false as const, error: `This request is ${request.status.toLowerCase().replace(/_/g, " ")}; there is nothing to decline.` };
+  }
 
   const message = reason.trim() || "The merchant declined this fulfilment.";
   const client = await offlineClient(shop.domain);
-  await rejectFulfillmentRequest(client, request.shopifyFulfillmentOrderId, message, "OTHER");
-  await prisma.fulfillmentRequest.update({
-    where: { id: request.id },
-    data: { status: "REJECTED", responseMessage: message, respondedAt: new Date() },
-  });
+  const answer = await refuseRequest(client, request, message);
+  if (answer === "withdrawn") {
+    return { ok: false as const, error: WITHDRAWN_MESSAGE };
+  }
   await logActivity(shop.id, {
     actor,
     action: "fulfillment_service.declined",
@@ -517,6 +821,115 @@ export async function declineFulfillmentRequest(shop: ShopWithSettings, requestI
     message: `${request.order.name}: fulfilment request declined — ${message}`,
   });
   return { ok: true as const };
+}
+
+export interface ReconcileResult {
+  skipped?: "not registered";
+  processed: number;
+  failed: number;
+  expired: number;
+  withdrawn: number;
+  reminded: number;
+}
+
+/**
+ * Bring the app's requests in line with Shopify's, and answer what is overdue.
+ *
+ * Runs on the callback, on a schedule, and whenever the webhook path could have
+ * missed something (webhooks are dropped on a restart of the inline queue). It
+ * picks up every submitted and cancellation-requested fulfilment order at the
+ * app's location, forgets requests the merchant withdrew, reminds about ones
+ * waiting half a day, and declines ones no one approved in time.
+ */
+export async function reconcileFulfillmentRequests(
+  shop: ShopWithSettings,
+  options: { client?: GraphqlClient; now?: Date } = {},
+): Promise<ReconcileResult> {
+  const result: ReconcileResult = { processed: 0, failed: 0, expired: 0, withdrawn: 0, reminded: 0 };
+  if (!shop.fulfillmentLocationId) return { ...result, skipped: "not registered" };
+  const client = options.client ?? (await offlineClient(shop.domain));
+  const now = options.now ?? new Date();
+
+  const submitted = await listAssignedFulfillmentOrders(client, "FULFILLMENT_REQUESTED", shop.fulfillmentLocationId);
+  const cancellations = await listAssignedFulfillmentOrders(client, "CANCELLATION_REQUESTED", shop.fulfillmentLocationId);
+  for (const live of [...submitted.orders, ...cancellations.orders]) {
+    try {
+      await processFulfillmentOrder(shop, client, live);
+      result.processed += 1;
+    } catch (error) {
+      result.failed += 1;
+      logger.error("Could not act on a fulfilment request", { shopId: shop.id, fulfillmentOrderId: live.id, error });
+    }
+  }
+
+  const waiting = await prisma.fulfillmentRequest.findMany({
+    where: { order: { shopId: shop.id }, status: { in: ["SUBMITTED", "AWAITING_APPROVAL"] } },
+    include: { order: { select: { id: true, name: true } } },
+    orderBy: { requestedAt: "asc" },
+    take: 100,
+  });
+  const stillSubmitted = new Set(submitted.orders.map((fo) => fo.id));
+
+  for (const request of waiting) {
+    try {
+      const age = now.getTime() - request.requestedAt.getTime();
+      if (age >= APPROVAL_WINDOW_MS) {
+        const message = "Not approved in DropshipHub in time. Request fulfilment again when you are ready to approve it.";
+        const answer = await refuseRequest(client, request, message);
+        if (answer === "withdrawn") {
+          result.withdrawn += 1;
+          continue;
+        }
+        result.expired += 1;
+        await logActivity(shop.id, {
+          action: "fulfillment_service.expired",
+          entity: "Order",
+          entityId: request.orderId,
+          level: "warn",
+          message: `${request.order.name}: fulfilment request declined automatically, nobody approved it within ${APPROVAL_WINDOW_MS / 3_600_000} hours.`,
+        });
+        await notify(shop.id, {
+          type: "order.failed",
+          severity: "warning",
+          title: `${request.order.name}: fulfilment request declined automatically`,
+          body: "Nobody approved it in time, so Shopify was told no. Request fulfilment again in Shopify when you are ready.",
+          link: `/app/orders/${request.orderId}`,
+          dedupeKey: `fo-expired:${request.id}:${request.requestedAt.getTime()}`,
+        });
+        continue;
+      }
+
+      // A merchant can withdraw a request Shopify has not seen answered. Only a
+      // complete listing can prove it is gone; rows held by the old accept-first
+      // flow are ACCEPTED in Shopify and never appear in it, so they are checked
+      // one by one.
+      if (submitted.complete && !stillSubmitted.has(request.shopifyFulfillmentOrderId)) {
+        const { answerable } = await liveRequestFor(client, request);
+        if (!answerable) {
+          await markWithdrawn(request);
+          result.withdrawn += 1;
+          continue;
+        }
+      }
+
+      if (request.status === "AWAITING_APPROVAL" && age >= APPROVAL_REMINDER_MS) {
+        await notify(shop.id, {
+          type: "order.failed",
+          severity: "warning",
+          title: `${request.order.name}: still waiting for your approval`,
+          body: `Declined automatically at ${approvalDeadline(request.requestedAt).toISOString()} unless you approve it.`,
+          link: `/app/orders/${request.orderId}`,
+          dedupeKey: `fo-remind:${request.id}:${request.requestedAt.getTime()}`,
+          dedupeMinutes: 24 * 60,
+        });
+        result.reminded += 1;
+      }
+    } catch (error) {
+      result.failed += 1;
+      logger.error("Could not settle a waiting fulfilment request", { shopId: shop.id, requestId: request.id, error });
+    }
+  }
+  return result;
 }
 
 /** The request still waiting on the merchant for this order, if there is one. */
@@ -529,6 +942,7 @@ export async function pendingApproval(shopId: string, orderId: string) {
   return {
     id: request.id,
     requestedAt: request.requestedAt,
+    decideBy: approvalDeadline(request.requestedAt),
     requestMessage: request.requestMessage,
     quote: (request.quote as unknown as SupplierQuote | null) ?? null,
     quoteError: request.quoteError,

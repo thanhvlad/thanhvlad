@@ -3,19 +3,34 @@
   <head>
     <meta charset="utf-8" />
     <style>
-      body { font: 14px/1.4 -apple-system, Segoe UI, Roboto, sans-serif; width: 300px; padding: 12px; margin: 0; color: #202223; }
+      body { font: 14px/1.4 -apple-system, Segoe UI, Roboto, sans-serif; width: 320px; padding: 12px; margin: 0; color: #202223; }
       button { width: 100%; padding: 10px; border: 0; border-radius: 8px; background: #008060; color: #fff; font-weight: 600; cursor: pointer; }
       button:disabled { background: #c9cccf; cursor: default; }
-      #status { margin-top: 10px; min-height: 1.4em; }
+      button.secondary { background: #f1f2f3; color: #202223; }
+      #status, #orders-status { margin-top: 10px; min-height: 1.4em; }
       .ok { color: #008060; } .err { color: #d72c0d; }
       a { color: #2c6ecb; }
       small { color: #6d7175; }
+      h2 { font-size: 13px; margin: 14px 0 6px; text-transform: uppercase; letter-spacing: .04em; color: #6d7175; }
+      hr { border: 0; border-top: 1px solid #e1e3e5; margin: 12px 0; }
+      ul { list-style: none; padding: 0; margin: 0; }
+      li.order { padding: 8px 0; border-bottom: 1px solid #f1f2f3; }
+      li.order:last-child { border-bottom: 0; }
+      .order-name { font-weight: 600; }
+      li.item { margin-top: 4px; }
+      li.item a { cursor: pointer; }
     </style>
   </head>
   <body>
     <div id="url"><small>Reading current tab…</small></div>
     <p><button id="add" disabled>Add to import list</button></p>
     <div id="status"></div>
+
+    <hr />
+    <h2 id="orders-heading">Orders to place</h2>
+    <div id="orders-status"><small>Loading…</small></div>
+    <ul id="orders"></ul>
+
     <p><small><a href="#" id="options">Configure app URL &amp; token</a></small></p>
     <script src="popup.js"></script>
   </body>
