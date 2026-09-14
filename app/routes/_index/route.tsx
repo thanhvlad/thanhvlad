@@ -1,59 +1,68 @@
 import type { LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
-import { Form, useLoaderData } from "@remix-run/react";
-import { login } from "../../shopify.server";
+import { Link } from "@remix-run/react";
+import { APP_LISTING_URL, OPEN_IN_ADMIN_URL } from "~/components/PublicPage";
 import styles from "./styles.module.css";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const url = new URL(request.url);
 
+  // Installs and admin launches arrive with ?shop=; send those straight in.
   if (url.searchParams.get("shop")) {
     throw redirect(`/app?${url.searchParams.toString()}`);
   }
 
-  return { showForm: Boolean(login) };
+  return null;
 };
 
-export default function App() {
-  const { showForm } = useLoaderData<typeof loader>();
-
+/**
+ * The app's public URL, which reviewers and search engines open directly.
+ *
+ * It used to render a "Shop domain" form posting to /auth/login. App Store
+ * requirement 2.3.1 forbids asking for a myshopify.com domain anywhere in
+ * installation or configuration: installs start from Shopify. So this page only
+ * describes the app and points at the listing.
+ *
+ * The copy says what production does today, and nothing more. It used to
+ * promise search and import from AliExpress through its API, "hundreds of
+ * orders in one click", and supplier price and stock changes flowing into
+ * Shopify — none of which a reviewer could see working.
+ */
+export default function Landing() {
   return (
     <div className={styles.index}>
       <div className={styles.content}>
         <h1 className={styles.heading}>DropshipHub</h1>
         <p className={styles.text}>
-          Import products from AliExpress and other suppliers, map variants, place
-          hundreds of orders in one click and sync tracking back to Shopify.
+          Bring AliExpress products into your Shopify store with the DropshipHub Chrome extension, edit them before they go live, and keep every
+          supplier order next to the Shopify order it belongs to.
         </p>
-        {showForm && (
-          <Form className={styles.form} method="post" action="/auth/login">
-            <label className={styles.label}>
-              <span>Shop domain</span>
-              <input className={styles.input} type="text" name="shop" placeholder="my-shop.myshopify.com" />
-            </label>
-            <button className={styles.button} type="submit">
-              Log in
-            </button>
-          </Form>
-        )}
+        <p className={styles.actions}>
+          <a className={styles.button} href={APP_LISTING_URL}>
+            View on the Shopify App Store
+          </a>
+          <a href={OPEN_IN_ADMIN_URL}>Already installed? Open it in your Shopify admin</a>
+        </p>
         <ul className={styles.list}>
           <li>
-            <strong>Import list</strong>. Edit titles, images, variants and pricing before a
-            product ever reaches your store.
+            <strong>Import from the product page</strong>. Open a product on AliExpress and press Add to import list in the extension; the title,
+            images, variants, prices and description come from that page.
           </li>
           <li>
-            <strong>Mapping</strong>. Basic, Advanced (per-country ranked suppliers), BOGO and
-            Bundle mapping so every order routes to the right SKU.
+            <strong>Edit before you publish</strong>. Change titles, images, variants and pricing on the import list before a product reaches your
+            store.
           </li>
           <li>
-            <strong>Bulk orders</strong>. Place supplier orders in bulk, choose shipping
-            automatically and sync tracking numbers to Shopify.
+            <strong>Pricing rules</strong>. Turn the supplier cost into your selling price the same way for every product.
           </li>
           <li>
-            <strong>Auto updates</strong>. Supplier price and stock changes flow into Shopify
-            on your rules.
+            <strong>Orders with the extension</strong>. Paid Shopify orders wait in the app; you place each one on AliExpress with the extension and
+            pay for it there, and the app keeps the supplier order with its Shopify order.
           </li>
         </ul>
+        <p className={styles.footer}>
+          <Link to="/support">Support</Link> · <Link to="/privacy">Privacy</Link> · <Link to="/terms">Terms</Link>
+        </p>
       </div>
     </div>
   );

@@ -8,6 +8,13 @@
  * ones the redesigned home screen added on top of them. Sentences carry
  * `{placeholders}` rather than being glued together at the call site, so the
  * Vietnamese can put the number where Vietnamese puts it.
+ *
+ * Copy here describes what production does today. Products come in through the
+ * Chrome extension on the AliExpress page and orders are placed with it; the
+ * welcome banner and hints used to send merchants to "Connect AliExpress" and to
+ * search AliExpress through an API that is not switched on, which a reviewer
+ * following them could not complete. `dashboard.welcome.body` overrides the
+ * older wording in the core dictionary for that reason.
  */
 export const en = {
   // ---- Page ---------------------------------------------------------------
@@ -16,11 +23,12 @@ export const en = {
   "dashboard.actions.syncOrders.hint": "Pull the last 30 days of orders from Shopify",
   "dashboard.actions.checkSupplierOrders.hint": "Refresh payment and shipping status from your suppliers",
   "dashboard.jobsRunning": "{n} background job(s) running",
+  "dashboard.welcome.body": "Install the DropshipHub Chrome extension, open a product on AliExpress and add it to your import list, then set a pricing rule before you push it to your store. Orders from the last 30 days are being synced in the background; new orders arrive automatically.",
 
   // ---- Onboarding checklist ----------------------------------------------
   "dashboard.onboarding.progress": "{done} of {total} steps done",
   "dashboard.onboarding.next": "Up next",
-  "dashboard.onboarding.supplier.hint": "Orders can only be placed through a connected AliExpress or CJ account.",
+  "dashboard.onboarding.supplier.hint": "Optional today: products are imported and AliExpress orders are placed with the Chrome extension, without a connected account.",
   "dashboard.onboarding.pricing.hint": "Sets the selling price from the supplier cost, so every import is priced the same way.",
   "dashboard.onboarding.shipping.hint": "Which shipping method to pick for each destination when an order is placed.",
   "dashboard.onboarding.fulfillmentService.hint": "Lets Shopify hand new orders to the app instead of waiting for you.",
@@ -41,7 +49,7 @@ export const en = {
   "dashboard.attention.warning": "Warning",
 
   // ---- Quick actions ------------------------------------------------------
-  "dashboard.quick.findImport.hint": "Search AliExpress and CJ, or paste a product link",
+  "dashboard.quick.findImport.hint": "Open a product on AliExpress and add it with the Chrome extension",
   "dashboard.quick.reviewImportList.hint": "Check price, variants and images before pushing to your store",
   "dashboard.quick.placeReady": "Place ready orders",
   "dashboard.quick.placeReady.hint": "Send paid Shopify orders to the supplier",
@@ -60,10 +68,11 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   "dashboard.actions.syncOrders.hint": "Lấy đơn hàng 30 ngày gần nhất từ Shopify",
   "dashboard.actions.checkSupplierOrders.hint": "Cập nhật trạng thái thanh toán và vận chuyển từ nhà cung cấp",
   "dashboard.jobsRunning": "{n} tác vụ nền đang chạy",
+  "dashboard.welcome.body": "Cài tiện ích DropshipHub cho Chrome, mở một sản phẩm trên AliExpress và thêm vào danh sách nhập, rồi đặt quy tắc giá trước khi đẩy lên cửa hàng. Đơn hàng 30 ngày gần nhất đang được đồng bộ ngầm; đơn mới sẽ tự động về.",
 
   "dashboard.onboarding.progress": "Xong {done}/{total} bước",
   "dashboard.onboarding.next": "Bước tiếp theo",
-  "dashboard.onboarding.supplier.hint": "Chỉ đặt được đơn khi đã kết nối tài khoản AliExpress hoặc CJ.",
+  "dashboard.onboarding.supplier.hint": "Hiện chưa bắt buộc: sản phẩm được nhập và đơn AliExpress được đặt bằng tiện ích Chrome, không cần kết nối tài khoản.",
   "dashboard.onboarding.pricing.hint": "Tự tính giá bán từ giá nhập, để mọi sản phẩm nhập về đều được định giá theo cùng một cách.",
   "dashboard.onboarding.shipping.hint": "Chọn sẵn phương thức vận chuyển cho từng quốc gia khi đặt đơn.",
   "dashboard.onboarding.fulfillmentService.hint": "Để Shopify tự chuyển đơn mới sang app thay vì chờ bạn bấm tay.",
@@ -80,7 +89,7 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   "dashboard.attention.urgent": "Khẩn",
   "dashboard.attention.warning": "Cảnh báo",
 
-  "dashboard.quick.findImport.hint": "Tìm trên AliExpress và CJ, hoặc dán link sản phẩm",
+  "dashboard.quick.findImport.hint": "Mở sản phẩm trên AliExpress và thêm bằng tiện ích Chrome",
   "dashboard.quick.reviewImportList.hint": "Kiểm tra giá, biến thể và hình ảnh trước khi đẩy lên cửa hàng",
   "dashboard.quick.placeReady": "Đặt các đơn đã sẵn sàng",
   "dashboard.quick.placeReady.hint": "Gửi đơn Shopify đã thanh toán sang nhà cung cấp",

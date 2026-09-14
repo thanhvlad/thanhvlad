@@ -1,11 +1,13 @@
 import type { ImportStatus, ImportedProduct, ImportedVariant, Prisma, SupplierProduct, SupplierVariant } from "@prisma/client";
 import prisma, { chunkedTransaction } from "~/db.server";
 import { computePrice } from "~/domain/pricing/engine";
+import { resolveVariantWeightGrams } from "~/domain/settings/shop-settings";
 import { fallbackSku, storefrontVendor } from "~/domain/suppliers/listing";
 import type { PricingRuleInput } from "~/domain/pricing/types";
 import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
 import { d, money } from "~/lib/money";
+import { sanitizeDescriptionHtml } from "~/lib/sanitize-html.server";
 import { logActivity } from "./activity.server";
 import { PlanLimitError, assertWithinPlan } from "./billing.server";
 import { convertToShopCurrency } from "./currency.server";
@@ -155,7 +157,11 @@ async function buildVariantRows(
       shippingCost: "0",
       price: priced.price,
       compareAtPrice: priced.compareAtPrice,
-      weightGrams: sv.weightGrams ?? null,
+      // AliExpress product pages carry no package weight anywhere in their
+      // model, so a captured variant arrives with none. Pushed as-is it became
+      // 0 kg in Shopify and every weight-based shipping rate was computed on
+      // nothing; the merchant's default weight stands in until they enter one.
+      weightGrams: resolveVariantWeightGrams(sv.weightGrams, settings.products.defaultWeightGrams),
       inventory: settings.products.trackInventory ? Math.min(settings.products.initialInventory, Math.max(0, sv.stock)) : settings.products.initialInventory,
       isEnabled: sv.isAvailable,
     });
@@ -163,17 +169,17 @@ async function buildVariantRows(
   return rows;
 }
 
-/** Strip supplier self-promotion and scripts from imported HTML. */
+/**
+ * Make imported description HTML safe to store, and optionally strip supplier
+ * self-promotion.
+ *
+ * The allowlist sanitizer runs whatever `aggressive` says. This used to be a
+ * regex that removed only `<script>`, `<style>` and double-quoted `on*="..."`
+ * attributes, so an `<img src=x onerror=...>` in a supplier description was
+ * stored as-is and ran inside the admin when the import editor previewed it.
+ */
 export function cleanDescription(html: string, aggressive: boolean): string {
-  let out = html ?? "";
-  out = out.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "");
-  out = out.replace(/\son\w+="[^"]*"/gi, "");
-  if (aggressive) {
-    out = out.replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, "$1");
-    out = out.replace(/(aliexpress|alibaba|cjdropshipping|taobao|1688)\.[a-z.]+/gi, "");
-    out = out.replace(/<p>\s*<\/p>/gi, "");
-  }
-  return out.trim();
+  return sanitizeDescriptionHtml(html, { stripSupplierLinks: aggressive });
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +252,9 @@ export async function updateImportedProduct(shopId: string, id: string, patch: I
     where: { id },
     data: {
       ...(patch.title !== undefined ? { title: patch.title.trim().slice(0, 255) } : {}),
-      ...(patch.description !== undefined ? { description: patch.description } : {}),
+      // The editor posts whatever is in its textarea, and a form post can be
+      // forged, so saving sanitizes exactly as importing does.
+      ...(patch.description !== undefined ? { description: sanitizeDescriptionHtml(patch.description) } : {}),
       ...(patch.vendor !== undefined ? { vendor: patch.vendor } : {}),
       ...(patch.productType !== undefined ? { productType: patch.productType } : {}),
       ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
@@ -435,7 +443,9 @@ export async function pushImportedProduct(shop: ShopWithSettings, client: Graphq
       // a second listing of the same item. `productSet` upserts on this id.
       id: product.shopifyProductId,
       title: product.title,
-      descriptionHtml: product.description,
+      // Rows stored before descriptions were sanitized on the way in are still
+      // in the database; none of them reaches the storefront unsanitized.
+      descriptionHtml: sanitizeDescriptionHtml(product.description),
       vendor: product.vendor,
       productType: product.productType,
       tags: product.tags,
@@ -449,7 +459,8 @@ export async function pushImportedProduct(shop: ShopWithSettings, client: Graphq
         price: money(v.price),
         compareAtPrice: v.compareAtPrice ? money(v.compareAtPrice) : null,
         cost: money(v.cost),
-        weightGrams: v.weightGrams,
+        // Rows imported before the default weight existed have none stored.
+        weightGrams: resolveVariantWeightGrams(v.weightGrams, settings.defaultWeightGrams),
         inventoryQuantity: v.inventory,
         imageUrl: v.image,
       })),

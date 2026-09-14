@@ -92,6 +92,13 @@ export const shopSettingsSchema = z.object({
       maxImages: z.number().int().min(1).max(250).default(20),
       /** Weight unit for variants pushed to Shopify. */
       weightUnit: z.enum(["GRAMS", "KILOGRAMS", "OUNCES", "POUNDS"]).default("GRAMS"),
+      /**
+       * Shipping weight, in grams, given to an imported variant whose supplier
+       * reported none; 0 = leave it without a weight. AliExpress product pages
+       * carry no package weight at all, and a product pushed without one is 0 kg
+       * to every weight-based shipping rate in the store.
+       */
+      defaultWeightGrams: z.number().min(0).max(100_000).default(0),
     })
     .default({}),
 
@@ -143,6 +150,19 @@ export function parseShopSettings(raw: unknown): ShopSettings {
   if (result.success) return result.data;
   // Never let one bad key take the whole settings page down.
   return shopSettingsSchema.parse({});
+}
+
+/**
+ * The weight a variant is imported and pushed with: the supplier's own figure
+ * when it gave a positive one, otherwise the shop's default, otherwise none.
+ *
+ * A supplier weight of 0 counts as missing. No product ships weighing nothing,
+ * and a 0 stored here reached Shopify as a real 0 kg that shipping rates trust.
+ */
+export function resolveVariantWeightGrams(supplierGrams: number | null | undefined, defaultGrams: number): number | null {
+  if (typeof supplierGrams === "number" && Number.isFinite(supplierGrams) && supplierGrams > 0) return Math.round(supplierGrams);
+  if (Number.isFinite(defaultGrams) && defaultGrams > 0) return Math.round(defaultGrams);
+  return null;
 }
 
 /** Deep-merge a partial update into an existing settings object. */

@@ -8,7 +8,7 @@ export const meta: MetaFunction = () => [{ title: "Terms of service · DropshipH
 
 export const loader = async () => ({
   supportEmail: env().SUPPORT_EMAIL ?? null,
-  updated: "2026-09-08",
+  updated: "2026-09-14",
   plans: PLAN_ORDER.map((id) => ({ name: PLANS[id].displayName, price: PLANS[id].monthlyPrice, trialDays: PLANS[id].trialDays })),
 });
 
@@ -21,14 +21,14 @@ export default function TermsPage() {
     <PublicPage title="Terms of service" subtitle={`Last updated ${updated}. Tiếng Việt ở phía dưới.`}>
       <Section heading="The service">
         <p>
-          DropshipHub ("the app") is software that connects a Shopify store to dropshipping suppliers. By installing it you agree to these terms. The app
-          places orders with suppliers on your instruction, using supplier accounts you connect; the contract for each supplier order is between you and the
-          supplier.
+          DropshipHub ("the app") is software that helps a Shopify store work with dropshipping suppliers. By installing it you agree to these terms.
+          Supplier orders are placed on your instruction, from your own supplier account — today with the DropshipHub Chrome extension on the
+          supplier's site; the contract for each supplier order is between you and the supplier.
         </p>
       </Section>
       <Section heading="Your responsibilities">
         <ul>
-          <li>You are responsible for the supplier accounts you connect and for complying with the supplier's and Shopify's terms.</li>
+          <li>You are responsible for the supplier accounts you use with the app and for complying with the supplier's and Shopify's terms.</li>
           <li>Supplier orders are paid by you on the supplier's site. The app never charges your supplier account and does not hold funds.</li>
           <li>You are responsible for the products you list, their descriptions, pricing and legality in the markets you sell to.</li>
           <li>Automatic actions (auto-place, auto price and stock updates) run on the rules you configure; review them before enabling.</li>
@@ -73,14 +73,14 @@ export default function TermsPage() {
 
       <Section heading="Điều khoản dịch vụ">
         <p>
-          DropshipHub ("ứng dụng") là phần mềm kết nối cửa hàng Shopify với các nhà cung cấp dropshipping. Cài ứng dụng là bạn đồng ý với các điều khoản
-          này. Ứng dụng đặt đơn với nhà cung cấp theo chỉ dẫn của bạn, bằng tài khoản nhà cung cấp bạn kết nối; hợp đồng cho mỗi đơn nhà cung cấp là giữa bạn
-          và nhà cung cấp.
+          DropshipHub ("ứng dụng") là phần mềm giúp cửa hàng Shopify làm việc với các nhà cung cấp dropshipping. Cài ứng dụng là bạn đồng ý với các điều
+          khoản này. Đơn nhà cung cấp được đặt theo chỉ dẫn của bạn, từ tài khoản nhà cung cấp của chính bạn — hiện tại bằng tiện ích DropshipHub cho
+          Chrome trên trang của nhà cung cấp; hợp đồng cho mỗi đơn nhà cung cấp là giữa bạn và nhà cung cấp.
         </p>
       </Section>
       <Section heading="Trách nhiệm của bạn">
         <ul>
-          <li>Bạn chịu trách nhiệm về tài khoản nhà cung cấp bạn kết nối và việc tuân thủ điều khoản của nhà cung cấp và Shopify.</li>
+          <li>Bạn chịu trách nhiệm về tài khoản nhà cung cấp bạn dùng với ứng dụng và việc tuân thủ điều khoản của nhà cung cấp và Shopify.</li>
           <li>Đơn nhà cung cấp do bạn thanh toán trên trang của nhà cung cấp. Ứng dụng không bao giờ trừ tiền tài khoản nhà cung cấp của bạn và không giữ tiền.</li>
           <li>Bạn chịu trách nhiệm về sản phẩm bạn đăng bán, mô tả, giá và tính hợp pháp tại thị trường bạn bán.</li>
           <li>Các thao tác tự động (tự đặt đơn, tự cập nhật giá/tồn kho) chạy theo quy tắc bạn cấu hình; hãy xem kỹ trước khi bật.</li>

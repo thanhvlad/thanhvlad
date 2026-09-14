@@ -3,6 +3,14 @@ import { Link } from "@remix-run/react";
 import styles from "~/routes/_index/styles.module.css";
 
 /**
+ * Where a merchant installs the app, and where one who already has opens it.
+ * Public pages link here instead of asking for a shop domain (App Store
+ * requirement 2.3.1: installs start from a Shopify-owned surface).
+ */
+export const APP_LISTING_URL = "https://apps.shopify.com/ws-fullfill-app";
+export const OPEN_IN_ADMIN_URL = "https://admin.shopify.com/?redirect=/apps/ws-fullfill-app";
+
+/**
  * Frame for the pages that live outside the Shopify admin — privacy policy,
  * terms, support. They are linked from the App Store listing and from the
  * app, so they render without App Bridge, Polaris or a session, in both
