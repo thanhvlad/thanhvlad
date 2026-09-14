@@ -28,7 +28,8 @@ import { gid } from "./shopify/graphql.server";
  * is handled by eraseOrderPersonalData below.
  *
  * Retention (applyRetention, daily):
- *   - a store still uninstalled after RETENTION_DAYS is erased;
+ *   - a store still uninstalled after RETENTION_DAYS is erased, once its own
+ *     records confirm it has not authenticated since;
  *   - an order the app never fulfils (no line linked to a managed product and
  *     no supplier order) keeps no customer data at all;
  *   - a fulfilled, cancelled or ignored order loses its customer data
@@ -388,6 +389,24 @@ export async function handleCustomerDataRequest(shop: ShopRef, payload: Record<s
 // Erasure
 // ---------------------------------------------------------------------------
 
+/**
+ * The bulk "place orders" runs that included an order.
+ *
+ * The orders screen records the run as JobRun.payload { ids } and only the
+ * queued job carries { orderIds }. Filtering on orderIds alone matched no run
+ * ever written, so supplier errors quoting the consignee survived both erasure
+ * and retention. Both names are matched, so a run recorded either way is found.
+ * Exported so the test can pin the JSON path, which the in-memory Prisma would
+ * otherwise evaluate as leniently as whatever fixture it is given.
+ */
+export function placeOrdersRunsWhere(shopId: string, orderId: string): Prisma.JobRunWhereInput {
+  return {
+    shopId,
+    type: "place-orders",
+    OR: [{ payload: { path: ["ids"], array_contains: [orderId] } }, { payload: { path: ["orderIds"], array_contains: [orderId] } }],
+  };
+}
+
 const ORDER_PERSONAL_SELECT = {
   id: true,
   shopifyOrderId: true,
@@ -485,7 +504,7 @@ async function eraseOrderPersonalData(shopId: string, order: OrderPersonalRow, e
 
   // Bulk "place orders" runs keep each order's supplier error in their result.
   const runs = await prisma.jobRun.findMany({
-    where: { shopId, type: "place-orders", payload: { path: ["orderIds"], array_contains: [order.id] } },
+    where: placeOrdersRunsWhere(shopId, order.id),
     select: { id: true, result: true, error: true },
   });
   for (const run of runs) {
@@ -569,6 +588,9 @@ export async function redactShop(shop: ShopRef, reason: string): Promise<void> {
   const { domain, accountId } = shop;
   await prisma.session.deleteMany({ where: { shop: domain } });
   await prisma.webhookEvent.deleteMany({ where: { shopId: null, payload: { path: ["shop_domain"], equals: domain } } });
+  // The AI rewrite counter is keyed by a plain string, not a relation, so no
+  // cascade reaches it. A store with no account counts under its own key.
+  await prisma.aiRewriteUsage.deleteMany({ where: { ownerKey: `shop:${shop.id}` } });
   await prisma.shop.delete({ where: { id: shop.id } }).catch(() => undefined);
   if (accountId) {
     const remaining = await prisma.shop.count({ where: { accountId } });
@@ -576,26 +598,76 @@ export async function redactShop(shop: ShopRef, reason: string): Promise<void> {
       // Cascades to StaffAccount and the account-scoped SupplierAccount rows
       // holding encrypted supplier tokens.
       await prisma.account.delete({ where: { id: accountId } }).catch(() => undefined);
+      // The account's shared rewrite counter goes with the account. While other
+      // stores remain on it the counter is theirs too: deleting it then would
+      // hand them a fresh monthly allowance for uninstalling a sibling store.
+      await prisma.aiRewriteUsage.deleteMany({ where: { ownerKey: accountId } });
     }
   }
   logger.info("Store data erased", { shop: domain, reason });
 }
 
+interface UninstallEvidence {
+  isActive: boolean;
+  uninstalledAt: Date | null;
+  lastAuthAt: Date | null;
+}
+
+/**
+ * Whether the app's own records still say the store is uninstalled.
+ *
+ * Only local evidence decides. A network probe of the store cannot: with
+ * expiring offline tokens every refusal after an uninstall looks like any other
+ * failure, so a probe either blocks every erasure or proves nothing. What the
+ * app knows for certain is that Shopify refuses a token exchange for an app
+ * that is not installed, so a successful auth (lastAuthAt) later than the
+ * recorded uninstall means the store came back, even when a missed afterAuth
+ * write or a late uninstall notice left isActive false.
+ */
+export function stillUninstalled(shop: UninstallEvidence, cutoff: Date): boolean {
+  if (shop.isActive || !shop.uninstalledAt) return false;
+  if (shop.uninstalledAt.getTime() >= cutoff.getTime()) return false;
+  if (shop.lastAuthAt && shop.lastAuthAt.getTime() > shop.uninstalledAt.getTime()) return false;
+  return true;
+}
+
 /**
  * Erase every store still uninstalled after the retention window. Returns the
- * domains erased. Idempotent and safe to run daily: a store that reinstalled is
- * active again and is not touched.
+ * domains erased, and those skipped because they authenticated after their
+ * recorded uninstall. Idempotent and safe to run daily.
+ *
+ * Each store is read again immediately before it is erased: a daily run over
+ * several stores takes time, and a merchant reinstalling in the meantime must
+ * not lose the store they just came back to.
  */
-export async function purgeUninstalledShops(now: Date = new Date(), retentionDays = RETENTION_DAYS): Promise<{ purged: string[] }> {
+export async function purgeUninstalledShops(now: Date = new Date(), retentionDays = RETENTION_DAYS): Promise<{ purged: string[]; skipped: string[] }> {
   const cutoff = new Date(now.getTime() - retentionDays * 86_400_000);
-  const stale = await prisma.shop.findMany({
+  const candidates = await prisma.shop.findMany({
     where: { isActive: false, uninstalledAt: { not: null, lt: cutoff } },
-    select: { id: true, domain: true, accountId: true },
+    select: { id: true },
   });
-  for (const shop of stale) {
+  const purged: string[] = [];
+  const skipped: string[] = [];
+  for (const { id } of candidates) {
+    const shop = await prisma.shop.findUnique({
+      where: { id },
+      select: { id: true, domain: true, accountId: true, isActive: true, uninstalledAt: true, lastAuthAt: true },
+    });
+    if (!shop) continue;
+    if (!stillUninstalled(shop, cutoff)) {
+      skipped.push(shop.domain);
+      logger.warn("Not erasing a store that authenticated after its recorded uninstall", {
+        shop: shop.domain,
+        uninstalledAt: shop.uninstalledAt,
+        lastAuthAt: shop.lastAuthAt,
+        isActive: shop.isActive,
+      });
+      continue;
+    }
     await redactShop(shop, `uninstalled more than ${retentionDays} days ago`);
+    purged.push(shop.domain);
   }
-  return { purged: stale.map((s) => s.domain) };
+  return { purged, skipped };
 }
 
 // ---------------------------------------------------------------------------
@@ -690,10 +762,19 @@ export async function applyRetention(now: Date = new Date()): Promise<RetentionR
     data: { payload: MINIMISED_PAYLOAD },
   });
   // One still unprocessed after a day has long outlived Shopify's retries, but
-  // a stuck queue may yet run it, so it keeps the ids its handler reads.
+  // a stuck queue may yet run it, so it keeps the ids its handler reads. Only
+  // the order and fulfilment topics are cut down: their handlers refetch the
+  // order by id, so nothing is lost. A pending privacy request is the opposite
+  // case - customers/redact cut down to {redacted:true} turns its retry into a
+  // request naming nobody, marked done with nothing erased - and the remaining
+  // topics carry no customer details. Those rows go at the 30-day deletion.
   let webhookPayloadsMinimised = minimised.count;
   const stuck = await prisma.webhookEvent.findMany({
-    where: { processedAt: null, createdAt: { lt: new Date(now.getTime() - WEBHOOK_PAYLOAD_RETENTION_HOURS * 3_600_000) } },
+    where: {
+      processedAt: null,
+      createdAt: { lt: new Date(now.getTime() - WEBHOOK_PAYLOAD_RETENTION_HOURS * 3_600_000) },
+      OR: [{ topic: { startsWith: "ORDERS_" } }, { topic: { startsWith: "FULFILLMENTS_" } }],
+    },
     select: { id: true, topic: true, payload: true },
     take: RETENTION_ORDER_LIMIT,
   });

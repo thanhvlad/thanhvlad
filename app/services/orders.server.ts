@@ -6,6 +6,7 @@ import type { ResolveResult } from "~/domain/mapping/types";
 import { logger } from "~/lib/logger.server";
 import { logActivity } from "./activity.server";
 import { resolveForVariant } from "./mapping.server";
+import { notify } from "./notifications.server";
 import type { ShopWithSettings } from "./shop.server";
 import type { GraphqlClient } from "./shopify/graphql.server";
 import { orderNeedsCustomerData } from "./compliance.server";
@@ -27,6 +28,14 @@ export type OrderWithItems = Order & { lineItems: OrderLineItem[]; purchaseOrder
  * full address book of customers this app would never ship to. An order that
  * later gains a managed line gets its details on the next webhook or refresh,
  * because Shopify still has them.
+ *
+ * Shopify can also withhold those details: until the app is approved for
+ * Protected customer data it answers name, email, phone and address as null,
+ * with an access error naming each field (snapshot.redactedFields). An empty
+ * value Shopify withheld is not the customer removing their address, so it
+ * never overwrites what is already stored - otherwise one refresh of a placed
+ * order erased the address its supplier order and any re-placement depend on.
+ * The withholding is recorded instead (recordWithheldCustomerData).
  */
 export async function upsertOrderFromSnapshot(shop: ShopWithSettings, snapshot: ShopifyOrderSnapshot): Promise<Order> {
   const address = snapshot.shippingAddress;
@@ -36,8 +45,16 @@ export async function upsertOrderFromSnapshot(shop: ShopWithSettings, snapshot: 
   });
   const variantByShopifyId = new Map(managedVariants.map((v) => [v.shopifyVariantId, v.id]));
 
-  const keepCustomerData = await needsCustomerData(shop.id, snapshot.id, managedVariants.length);
-  const customer = keepCustomerData ? customerFields(snapshot) : { customerName: null, customerEmail: null, phone: null, note: null, shippingAddress: minimalAddressJson(address) };
+  const stored = await prisma.order.findUnique({
+    where: { shopId_shopifyOrderId: { shopId: shop.id, shopifyOrderId: snapshot.id } },
+    select: { id: true, customerName: true, customerEmail: true, phone: true, shippingAddress: true },
+  });
+  const keepCustomerData = await needsCustomerData(stored?.id ?? null, managedVariants.length);
+  const withheld = withheldCustomerFields(snapshot.redactedFields);
+  const fresh: CustomerColumns = keepCustomerData
+    ? customerFields(snapshot)
+    : { customerName: null, customerEmail: null, phone: null, note: null, shippingAddress: minimalAddressJson(address) };
+  const { data: customer, kept } = keepWithheldCustomerData(fresh, stored, withheld, { personal: keepCustomerData });
 
   const order = await prisma.order.upsert({
     where: { shopId_shopifyOrderId: { shopId: shop.id, shopifyOrderId: snapshot.id } },
@@ -121,6 +138,8 @@ export async function upsertOrderFromSnapshot(shop: ShopWithSettings, snapshot: 
     });
   }
 
+  if (withheld.length > 0) await recordWithheldCustomerData(shop.id, order, withheld, kept);
+
   return evaluateAndStoreOrder(shop, order.id);
 }
 
@@ -128,18 +147,166 @@ export async function upsertOrderFromSnapshot(shop: ShopWithSettings, snapshot: 
  * Whether this order may hold the customer's details: it has a managed line, or
  * the stored copy already has a supplier order or fulfilment request behind it.
  */
-async function needsCustomerData(shopId: string, shopifyOrderId: string, managedLines: number): Promise<boolean> {
+async function needsCustomerData(storedOrderId: string | null, managedLines: number): Promise<boolean> {
   if (managedLines > 0) return true;
-  const existing = await prisma.order.findUnique({ where: { shopId_shopifyOrderId: { shopId, shopifyOrderId } }, select: { id: true } });
-  if (!existing) return false;
+  if (!storedOrderId) return false;
   const [purchaseOrders, fulfillmentRequests] = await Promise.all([
-    prisma.purchaseOrder.count({ where: { orderId: existing.id } }),
-    prisma.fulfillmentRequest.count({ where: { orderId: existing.id } }),
+    prisma.purchaseOrder.count({ where: { orderId: storedOrderId } }),
+    prisma.fulfillmentRequest.count({ where: { orderId: storedOrderId } }),
   ]);
   return orderNeedsCustomerData({ managedLines, purchaseOrders, fulfillmentRequests });
 }
 
-function customerFields(snapshot: ShopifyOrderSnapshot) {
+// ---------------------------------------------------------------------------
+// Customer data Shopify withheld
+// ---------------------------------------------------------------------------
+
+/** The Order columns that hold the customer's details. */
+export interface CustomerColumns {
+  customerName: string | null;
+  customerEmail: string | null;
+  phone: string | null;
+  note: string | null;
+  shippingAddress: Prisma.InputJsonValue;
+}
+
+/** Snapshot paths that carry protected customer data; "*" means Shopify did not say which field. */
+const CUSTOMER_DATA_PATHS = ["email", "phone", "customer", "shippingAddress"];
+
+/**
+ * The withheld paths that concern the customer's details, out of everything
+ * Shopify refused on the order. Exported for tests.
+ */
+export function withheldCustomerFields(redactedFields: string[] | undefined): string[] {
+  return (redactedFields ?? []).filter((path) => path === "*" || CUSTOMER_DATA_PATHS.some((prefix) => path === prefix || path.startsWith(`${prefix}.`)));
+}
+
+function isWithheld(withheld: string[], sources: string[]): boolean {
+  // A path withholds its children ("shippingAddress" covers its phone) and a
+  // withheld child makes its parent unreliable ("customer.defaultEmailAddress.emailAddress").
+  return withheld.some((path) => path === "*" || sources.some((source) => path === source || source.startsWith(`${path}.`) || path.startsWith(`${source}.`)));
+}
+
+/** Where each stored value comes from in the snapshot, mirroring customerFields and toAddressJson. */
+const COLUMN_SOURCES = {
+  customerName: ["shippingAddress.name", "shippingAddress.firstName", "shippingAddress.lastName", "customer.firstName", "customer.lastName"],
+  customerEmail: ["email", "customer.defaultEmailAddress"],
+  phone: ["shippingAddress.phone", "phone", "customer.defaultPhoneNumber"],
+} as const;
+
+const ADDRESS_SOURCES: Record<keyof ShippingAddress, string[]> = {
+  firstName: ["shippingAddress.firstName"],
+  lastName: ["shippingAddress.lastName"],
+  name: ["shippingAddress.name"],
+  company: ["shippingAddress.company"],
+  address1: ["shippingAddress.address1"],
+  address2: ["shippingAddress.address2"],
+  city: ["shippingAddress.city"],
+  province: ["shippingAddress.province"],
+  provinceCode: ["shippingAddress.provinceCode"],
+  zip: ["shippingAddress.zip"],
+  country: ["shippingAddress.country"],
+  countryCode: ["shippingAddress.countryCodeV2"],
+  phone: ["shippingAddress.phone", "phone", "customer.defaultPhoneNumber"],
+  // Read from the order's custom attributes, but only written when an address
+  // came back, so a withheld address drops it too.
+  taxNumber: ["shippingAddress.taxNumber", "customAttributes"],
+};
+
+function isEmpty(value: unknown): boolean {
+  return value === null || value === undefined || (typeof value === "string" && value.trim() === "");
+}
+
+function asObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+/**
+ * The customer columns to write, with every value Shopify withheld taken from
+ * the stored order instead of being cleared. Returns which fields were kept.
+ *
+ * Only a value that is empty now, that Shopify said it withheld, and that the
+ * order already holds is kept; a field Shopify returned is always written as
+ * returned. With `personal: false` (an order the app does not fulfil, which
+ * keeps no personal details by design) only the destination country is kept.
+ * Exported for tests.
+ */
+export function keepWithheldCustomerData(
+  next: CustomerColumns,
+  stored: { customerName: string | null; customerEmail: string | null; phone: string | null; shippingAddress: unknown } | null,
+  withheld: string[],
+  options: { personal: boolean },
+): { data: CustomerColumns; kept: string[] } {
+  if (!stored || withheld.length === 0) return { data: next, kept: [] };
+  const data: CustomerColumns = { ...next };
+  const kept: string[] = [];
+
+  if (options.personal) {
+    for (const column of Object.keys(COLUMN_SOURCES) as Array<keyof typeof COLUMN_SOURCES>) {
+      if (isEmpty(next[column]) && !isEmpty(stored[column]) && isWithheld(withheld, [...COLUMN_SOURCES[column]])) {
+        data[column] = stored[column];
+        kept.push(column);
+      }
+    }
+  }
+
+  const storedAddress = asObject(stored.shippingAddress);
+  const address = { ...asObject(next.shippingAddress) };
+  const keys = options.personal ? (Object.keys(ADDRESS_SOURCES) as Array<keyof ShippingAddress>) : (["countryCode"] as const);
+  for (const key of keys) {
+    if (isEmpty(address[key]) && !isEmpty(storedAddress[key]) && isWithheld(withheld, ADDRESS_SOURCES[key])) {
+      address[key] = storedAddress[key];
+      kept.push(`shippingAddress.${key}`);
+    }
+  }
+  if (kept.some((field) => field.startsWith("shippingAddress."))) data.shippingAddress = address as Prisma.InputJsonValue;
+  return { data, kept };
+}
+
+const WITHHELD_ACTION = "order.customer_data_withheld";
+/** One notification per shop for good: the cause is the app's approval, not any one order. */
+const WITHHELD_DEDUPE_KEY = "protected-customer-data-withheld";
+
+/**
+ * Say, once per order in its activity log and once per shop as a notification,
+ * that Shopify withheld the customer's details and why.
+ *
+ * Without this an order simply showed no address, which reads as a customer
+ * who gave none or a sync bug. Only field names are recorded, never values.
+ * Best effort: a failure to log must not fail the order sync.
+ */
+async function recordWithheldCustomerData(shopId: string, order: { id: string; name: string }, withheld: string[], kept: string[]): Promise<void> {
+  try {
+    const already = await prisma.activityLog.findFirst({ where: { shopId, action: WITHHELD_ACTION, entity: "Order", entityId: order.id }, select: { id: true } });
+    if (already) return;
+    const fields = withheld.includes("*") ? "customer details" : withheld.join(", ");
+    await logActivity(shopId, {
+      action: WITHHELD_ACTION,
+      entity: "Order",
+      entityId: order.id,
+      level: "warn",
+      message:
+        `Shopify withheld ${fields} on ${order.name} because the app is not approved for Protected customer data access.` +
+        (kept.length > 0 ? " The details already stored on the order were kept." : ""),
+      meta: { withheld, kept },
+    });
+    await notify(shopId, {
+      type: "system",
+      severity: "warning",
+      title: "Shopify is withholding customer details from orders",
+      body:
+        `Shopify returned ${order.name} without ${fields}. This happens until DropshipHub is approved for Protected customer data access ` +
+        "(name, email, phone and address) in the Shopify Partner Dashboard. Until then new orders arrive without the shipping address a supplier order needs; details already stored are kept.",
+      link: `/app/orders/${order.id}`,
+      dedupeKey: WITHHELD_DEDUPE_KEY,
+      dedupeMinutes: "forever",
+    });
+  } catch (error) {
+    logger.warn("Could not record withheld customer data", { shopId, orderId: order.id, error });
+  }
+}
+
+function customerFields(snapshot: ShopifyOrderSnapshot): CustomerColumns {
   const address = snapshot.shippingAddress;
   const fallbackName = [snapshot.customer?.firstName, snapshot.customer?.lastName].filter(Boolean).join(" ");
   return {

@@ -28,20 +28,30 @@ export interface NotifyInput {
   meta?: Record<string, unknown>;
   /** Collapse repeats of the same key within `dedupeMinutes`. */
   dedupeKey?: string;
-  dedupeMinutes?: number;
+  /**
+   * The window a repeat is collapsed within; 60 when omitted. "forever" raises
+   * a notification once per shop for good, for a standing condition the
+   * merchant only needs to hear about once (an archived one still counts).
+   */
+  dedupeMinutes?: number | "forever";
+}
+
+/** The where clause that finds an earlier notification with the same dedupe key. Exported for tests. */
+export function dedupeWhere(shopId: string, input: Pick<NotifyInput, "type" | "dedupeKey" | "dedupeMinutes">, now: Date = new Date()): Prisma.NotificationWhereInput {
+  const window = input.dedupeMinutes ?? 60;
+  return {
+    shopId,
+    type: input.type,
+    ...(window === "forever" ? {} : { createdAt: { gte: new Date(now.getTime() - window * 60_000) } }),
+    meta: { path: ["dedupeKey"], equals: input.dedupeKey },
+  };
 }
 
 export async function notify(shopId: string, input: NotifyInput) {
   try {
     if (input.dedupeKey) {
-      const since = new Date(Date.now() - (input.dedupeMinutes ?? 60) * 60_000);
       const dupe = await prisma.notification.findFirst({
-        where: {
-          shopId,
-          type: input.type,
-          createdAt: { gte: since },
-          meta: { path: ["dedupeKey"], equals: input.dedupeKey },
-        },
+        where: dedupeWhere(shopId, input),
         select: { id: true },
       });
       if (dupe) return dupe;
@@ -68,11 +78,32 @@ export async function notify(shopId: string, input: NotifyInput) {
   }
 }
 
+/** A notification as a screen may see it: never the export a data request carries. */
+export type ListedNotification = Omit<Notification, "meta"> & { meta: Prisma.JsonValue; hasExport: boolean };
+
+/**
+ * A notification row with any customer data export taken out.
+ *
+ * A data request's export (the customer's name, email, phone, addresses and
+ * supplier responses) is stored on its notification's meta. Screens list
+ * notifications for every role, and whatever a loader returns reaches the
+ * browser whether or not the page renders it, so the export went to read-only
+ * and staff members in the page data despite the admin-only download route.
+ * The list says only whether an export exists; the download route, which checks
+ * the role and logs the download, is the one way to read it.
+ */
+export function withoutExport(row: Notification): ListedNotification {
+  const meta = row.meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return { ...row, meta, hasExport: false };
+  const { dataRequest, ...rest } = meta as Record<string, Prisma.JsonValue>;
+  return { ...row, meta: rest, hasExport: dataRequest !== undefined && dataRequest !== null };
+}
+
 export async function listNotifications(
   shopId: string,
   options: { unreadOnly?: boolean; limit?: number; skip?: number } = {},
-) {
-  return prisma.notification.findMany({
+): Promise<ListedNotification[]> {
+  const rows = await prisma.notification.findMany({
     where: {
       shopId,
       archivedAt: null,
@@ -84,6 +115,7 @@ export async function listNotifications(
     skip: options.skip ?? 0,
     take: options.limit ?? 50,
   });
+  return rows.map(withoutExport);
 }
 
 /** How many the list would return, so a screen can page through them honestly. */
