@@ -156,6 +156,19 @@ function requestProduct(ackTimeoutMs = 2000, readTimeoutMs = 8000) {
   });
 }
 
+/**
+ * A note for a product with more variants than one capture carries. The reader
+ * stops at 250 because that is the most Shopify accepts in one push; saying so
+ * here means the merchant learns it now, not by finding colours missing from
+ * the store.
+ */
+function variantsLeftOut(captured) {
+  const sent = Array.isArray(captured?.variants) ? captured.variants.length : 0;
+  const offered = Number(captured?.variantCount);
+  if (!Number.isFinite(offered) || offered <= sent) return "";
+  return ` Only the first ${sent} of ${offered} variants were added, the most one import can send to Shopify.`;
+}
+
 async function send(button, msg) {
   button.disabled = true;
   msg.className = "msg";
@@ -191,7 +204,7 @@ async function send(button, msg) {
     if (body.ok) {
       msg.className = "msg ok";
       msg.textContent = captured
-        ? `Added from this page: ${body.title ?? "product"}.`
+        ? `Added from this page: ${body.title ?? "product"}.${variantsLeftOut(captured)}`
         : `Added by link only - the page could not be read, so the supplier account decided what was imported: ${body.title ?? "product"}.`;
       if (!captured) msg.className = "msg err";
       if (body.importListUrl) {

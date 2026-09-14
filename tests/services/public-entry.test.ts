@@ -10,7 +10,6 @@ vi.mock("~/shopify.server", () => ({ login, default: {} }));
 
 const landing = await import("~/routes/_index/route");
 const authLogin = await import("~/routes/auth.login/route");
-const { APP_LISTING_URL } = await import("~/components/PublicPage");
 
 async function thrownBy(run: () => unknown): Promise<Response> {
   try {
@@ -36,9 +35,9 @@ describe("public landing page", () => {
 });
 
 describe("/auth/login", () => {
-  it("sends a visitor without a shop to the App Store listing instead of a domain field", async () => {
+  it("sends a visitor without a shop to the public page, not to a domain field or an unpublished listing", async () => {
     const response = await thrownBy(() => authLogin.loader(args("https://app.example.com/auth/login")));
-    expect(response.headers.get("Location")).toBe(APP_LISTING_URL);
+    expect(response.headers.get("Location")).toBe("/");
     expect(login).not.toHaveBeenCalled();
   });
 
@@ -49,8 +48,14 @@ describe("/auth/login", () => {
     expect(result).toEqual({ errors: {} });
   });
 
-  it("answers an old form post with the listing too", async () => {
+  it("answers an old form post with the public page too", async () => {
     const response = await authLogin.action();
-    expect(response.headers.get("Location")).toBe(APP_LISTING_URL);
+    expect(response.headers.get("Location")).toBe("/");
+  });
+
+  it("lands on a page whose loader renders instead of redirecting again", async () => {
+    const response = await thrownBy(() => authLogin.loader(args("https://app.example.com/auth/login")));
+    const next = new URL(response.headers.get("Location") ?? "", "https://app.example.com");
+    expect(await landing.loader(args(next.toString()))).toBeNull();
   });
 });

@@ -13,6 +13,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { CapturedProduct } from "~/services/suppliers/captured.server";
 
 const SOURCE = readFileSync(resolve(__dirname, "../../extension/page-reader.js"), "utf8");
 
@@ -116,6 +117,21 @@ describe("page reader description capture", () => {
         : respond(JSON.stringify({ moduleList: [{ type: "image", data: { url: "https://ae01.alicdn.com/kf/m.jpg" } }, { type: "text", data: { content: "Line one\nLine <two>" } }] })),
     );
     expect(product?.descriptionHtml).toBe('<p><img src="https://ae01.alicdn.com/kf/m.jpg" alt=""></p>\n<p>Line one<br>Line &lt;two&gt;</p>');
+  });
+
+  it("stops at 250 variants, the most one Shopify input array takes, and says how many the page had", async () => {
+    const skuPaths = Array.from({ length: 260 }, (_, i) => ({ skuIdStr: String(13000000 + i), path: "14:691", skuStock: 5, salable: true }));
+    const skuPriceInfoMap = Object.fromEntries(skuPaths.map((row) => [row.skuIdStr, { salePriceLocal: "$3.50|3.5|", originalPrice: { value: 5, currency: "USD" } }]));
+    const base = model();
+    const product = await readProduct(
+      model({ SKU: { ...base.SKU, skuPaths }, PRICE: { skuPriceInfoMap }, PRODUCT_PROP_PC: undefined, DESC: {} }),
+      () => respond(""),
+    );
+    expect(product?.variants).toHaveLength(250);
+    expect(product?.variantCount).toBe(260);
+    // The server's capture schema must accept what the reader sends, or the whole capture is refused.
+    const parsed = CapturedProduct.safeParse(product);
+    expect(parsed.success).toBe(true);
   });
 
   it("still captures the product when every description request fails", async () => {

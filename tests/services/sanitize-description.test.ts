@@ -12,6 +12,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("~/shopify.server", () => ({ authenticate: {}, unauthenticated: {}, login: undefined, apiVersion: "2026-07", default: {} }));
 
 const { sanitizeDescriptionHtml } = await import("~/lib/sanitize-html.server");
+const { buildWritingContract } = await import("~/domain/copy/lumora-contract");
 const { cleanDescription } = await import("~/services/import.server");
 const { CapturedProduct, capturedToDetail } = await import("~/services/suppliers/captured.server");
 
@@ -87,6 +88,61 @@ describe("sanitizeDescriptionHtml", () => {
     expect(out).not.toContain("position");
   });
 
+  it("passes a contract-shaped rewritten page through unchanged", () => {
+    // The skeleton the AI landing contract prescribes: the wrapper, a hero image,
+    // an alternating feature row, the tinted "Before you buy" panel, the fixed
+    // specification table, the FAQ accordion, a scrolling size chart and the
+    // shipping panel with its mailto link. Anything the sanitizer drops here is
+    // lost on every save and push of every rewritten product.
+    const page = [
+      `<div style="max-width:1080px;margin:0 auto;color:#2b2b2b;line-height:1.7">`,
+      `<p style="color:#A84663;font-size:12px;letter-spacing:.18em;text-transform:uppercase;font-weight:700;margin:0 0 10px">The spoon is the scale</p>`,
+      `<h2 style="font-size:34px;line-height:1.25;font-weight:600;margin:0 0 16px">Two grams of yeast does not register on a kitchen scale.</h2>`,
+      `<img src="https://cdn.shopify.com/s/files/hero.jpg" alt="Hand holding the scale spoon over a bowl of flour" style="width:100%;border-radius:14px;display:block;margin:0 0 52px">`,
+      `<div style="display:flex;flex-wrap:wrap;gap:36px;align-items:center;margin:0 0 52px;flex-direction:row-reverse">`,
+      `<div style="flex:1 1 340px"><img src="https://cdn.shopify.com/s/files/row.jpg" alt="The display reading 2.1 g" style="width:100%;border-radius:14px;display:block"></div>`,
+      `<div style="flex:1 1 340px"><h2 style="font-size:28px;line-height:1.3;font-weight:600;margin:0 0 14px">It reads in 0.1 g steps.</h2><p style="margin:0">That is <strong>0.1 g steps</strong>, which is what you want for yeast.</p></div>`,
+      `</div>`,
+      `<div style="background:#f6f2ef;color:#2b2b2b;border-radius:14px;padding:30px 28px;margin:0 0 52px">`,
+      `<p style="color:#A84663;font-size:12px;letter-spacing:.18em;text-transform:uppercase;font-weight:700;margin:0 0 10px">Before you buy</p>`,
+      `<ul style="margin:0;padding-left:20px"><li style="margin-bottom:8px"><strong>It is not a calibrated balance.</strong> Use a lab scale for that.</li></ul>`,
+      `</div>`,
+      `<table style="width:100%;table-layout:fixed;border-collapse:collapse;margin:0 0 52px;font-size:15px">`,
+      `<tr><td style="padding:12px 0;border-bottom:1px solid #e8e2dd;width:38%;color:#6b6b6b">Capacity</td><td style="padding:12px 0;border-bottom:1px solid #e8e2dd">500 g (17.6 oz)</td></tr>`,
+      `</table>`,
+      `<div style="overflow-x:auto;overflow-y:hidden;margin:0 0 52px"><table style="width:100%;border-collapse:collapse"><tr><td style="vertical-align:top;border-top:1px solid #e8e2dd">S</td></tr></table></div>`,
+      `<div style="margin:0 0 52px"><details style="border-bottom:1px solid #e8e2dd;padding:14px 0"><summary style="cursor:pointer;font-weight:600;font-size:16px">Can I wash it?</summary><p style="margin:12px 0 0">No. Wipe it.</p></details></div>`,
+      `<div style="background:#f6f2ef;color:#2b2b2b;border-radius:14px;padding:30px 28px;margin:0 0 24px"><p style="margin:0"><strong>30-day returns.</strong> Email <a href="mailto:hello@example.com" style="color:#A84663">hello@example.com</a> to start a return.</p></div>`,
+      `</div>`,
+    ].join("\n");
+    // The serializer writes void elements self-closed; that is the only difference allowed.
+    const expected = page.replace(/<img([^>]*)>/g, "<img$1 />");
+    expect(sanitizeDescriptionHtml(page)).toBe(expected);
+    expect(cleanDescription(page, false)).toBe(expected);
+  });
+
+  it("keeps every CSS property the landing contract allows", () => {
+    const contract = buildWritingContract({ name: "Harbor & Pine", supportEmail: "hello@harborpine.com", signOffTagline: null });
+    const listed = /`(max-width, width, [^`]+)`/.exec(contract)?.[1];
+    expect(listed).toBeTruthy();
+    for (const property of (listed ?? "").split(",").map((p) => p.replace(/\(.*\)/, "").trim())) {
+      const html = `<div style="${property}:inherit">x</div>`;
+      expect(sanitizeDescriptionHtml(html), property).toBe(html);
+    }
+  });
+
+  it("lets background carry a colour but never an image, an image-set or an escape", () => {
+    const backslash = String.fromCharCode(92);
+    const out = sanitizeDescriptionHtml(
+      `<div style="background:#fff url(https://evil.example/a.png);color:red">a</div>` +
+        `<div style="background:image-set('https://evil.example/a.png' 1x)">b</div>` +
+        `<div style="background:-webkit-image-set('https://evil.example/a.png' 1x)">c</div>` +
+        `<div style="background:${backslash}75 rl(https://evil.example/a.png)">d</div>` +
+        `<div style="background:#f6f2ef">e</div>`,
+    );
+    expect(out).toBe(`<div style="color:red">a</div><div>b</div><div>c</div><div>d</div><div style="background:#f6f2ef">e</div>`);
+  });
+
   it("drops images it cannot load and upgrades protocol-relative ones", () => {
     expect(sanitizeDescriptionHtml(`<p><img src="/relative.jpg"><img src="//ae01.alicdn.com/kf/b.jpg"></p>`)).toBe(
       '<p><img src="https://ae01.alicdn.com/kf/b.jpg" /></p>',
@@ -119,6 +175,10 @@ describe("cleanDescription (the import path)", () => {
       true,
     );
     expect(out).toBe('<p>Visit shop. today our store</p><p><img src="https://ae01.alicdn.com/kf/a.jpg" /></p>');
+  });
+
+  it("drops a paragraph whose only content was a supplier link", () => {
+    expect(cleanDescription(`<p><a href="https://www.aliexpress.com/store/1">aliexpress.com</a></p><p>Kept</p>`, true)).toBe("<p>Kept</p>");
   });
 });
 

@@ -164,20 +164,30 @@ store. The automated review also checks that an unsigned webhook is rejected
 
 ## 5. The listing
 
-Prepare these before opening the listing form:
+Prepare these before opening the listing form. Every sentence in the listing is
+checked against what the reviewer can make the app do (listing accuracy), so the
+copy below describes only what runs. It no longer promises "import, order, track —
+automatically", AI variant mapping as a headline, bulk supplier orders or emails,
+none of which production does today. Revise it upward only when the AliExpress
+Dropshipping API path in section 0 is live.
 
-- **Name**: DropshipHub. **Tagline** (≤ 62 chars): *AliExpress dropshipping:
-  import, order, track — automatically.*
-- **Description**: adapt the feature overview in the README; lead with the
-  merchant's problem (fulfilling AliExpress orders by hand), then the four
-  jobs the app does: find & import, place supplier orders in bulk, sync tracking,
-  keep prices and stock in step. Mention the native Request fulfillment button,
-  multi-store accounts and the Vietnamese UI.
-- **Key features** (three): one-click import with pricing rules; bulk supplier
-  orders with automatic shipping selection and tracking sync; supplier comparison
-  with AI variant mapping.
-- **Screenshots** (1600×900): Find products with the Add to shop button; Import
-  list editor; Orders pipeline; the Payments page; Settings → Plan.
+- **Name**: DropshipHub. **Tagline** (≤ 62 chars): *Import AliExpress products and track every supplier order*.
+- **Description**: lead with the merchant's problem (keeping AliExpress products
+  and orders straight by hand). Then say what the app does: products are imported
+  from the AliExpress product page and edited on an import list before they reach
+  the store, pricing rules set the selling price, and for orders use the agreed
+  sentence exactly: *The Chrome extension lists the orders waiting to be placed and
+  opens each product on AliExpress. You place and pay for the order there, then
+  record the AliExpress order number in the extension; tracking you add there is
+  sent to Shopify.* Never write that the app or the extension places, pays for or
+  automatically fulfils orders. Mention multi-store accounts and the Vietnamese UI.
+  Do not mention email notifications while no email provider is configured.
+- **Key features** (three): import from the AliExpress product page with an import
+  list editor; pricing rules applied to every product; each AliExpress order and its
+  tracking kept with its Shopify order.
+- **Screenshots** (1600×900): Import list editor; a pushed product; Orders pipeline;
+  Pricing rules; Settings → Plan. No Find products search screenshot while that
+  screen runs on the Demo catalogue.
 - **Icon**: 1200×1200, no text.
 - **Categories**: Orders and shipping → Dropshipping; Finding products → Dropshipping.
 - **Support**: `SUPPORT_EMAIL`, `https://<app>/support`; privacy policy
@@ -186,26 +196,59 @@ Prepare these before opening the listing form:
 
 ### Instructions for the reviewer
 
-Paste into the "testing instructions" field:
+Paste into the "testing instructions" field. The Demo supplier walkthrough only
+works on a **development store** or with **test orders**: on a real customer's order
+the app refuses to place a Demo order and never sends its invented tracking to
+Shopify. Even on a test order the fulfilment is created silently, with no shipping
+email to the customer and no carrier link, so give the reviewer a development store
+and tell them to use test orders.
 
-> 1. Install on the test store. The dashboard shows a six-step checklist.
-> 2. Suppliers → connect the **Demo supplier** (no credentials; it is a built-in
->    catalogue that behaves like AliExpress: orders move from paid to shipped to
->    delivered over a few minutes and tracking numbers appear).
+> 1. Install on the development store. The dashboard shows a six-step checklist.
+> 2. Suppliers → connect the **Demo supplier** (no credentials). It is a built-in
+>    sample catalogue for trying the flow on development stores and test orders
+>    only: its orders move from paid to shipped over a few minutes and a sample
+>    tracking number appears. It never contacts AliExpress and never emails a
+>    customer.
 > 3. Find products → search "watch" → **Add to shop**. The product appears in the
 >    Shopify admin within seconds, priced by the default pricing rule.
-> 4. Create a test order for that product in the Shopify admin and mark it paid.
->    Orders → the order is in *Awaiting order* → **Place**. It moves to *Awaiting
->    payment*, then *Awaiting shipment*, and a tracking number is added to the
->    Shopify order as a fulfilment within about three minutes.
+> 4. In the Shopify admin create a **test order** for that product (for example with
+>    the Bogus Gateway) and mark it paid. Orders → the order is in *Awaiting order*
+>    → **Place**. It moves to *Awaiting payment*, then *Awaiting shipment*, and the
+>    sample tracking number is added to the Shopify order as a fulfilment within about
+>    three minutes, without a customer email.
 > 5. Settings → Plan → Upgrade to Advanced approves a **test** charge and returns
 >    to the app on the Advanced plan; Downgrade to Basic cancels it.
-> 6. Settings → Fulfilment service → Register, then on a Shopify order use
->    **Request fulfillment**: the request is accepted and the supplier order placed.
+> 6. Settings → Fulfilment service → Register, then on a test order use **Request
+>    fulfillment**: the request is accepted and the order waits on the Orders page.
 
 The Demo supplier is the `MOCK` platform and is always available, whatever
-`SUPPLIER_DRIVER` is set to, precisely so that reviewers and new merchants can
-try the full flow without an AliExpress account.
+`SUPPLIER_DRIVER` is set to, so that reviewers and new merchants can try the flow
+without an AliExpress account. It is not a way to fulfil real orders, and section 6
+says why it is not enough for the submission itself.
+
+### How ordering works with the Chrome extension
+
+This is the flow the owner's stores run today, and what the support page, the terms
+and the dashboard describe in the same words. The Chrome extension lists the orders
+waiting to be placed and opens each product on AliExpress. You place and pay for the
+order there, then record the AliExpress order number in the extension; tracking you
+add there is sent to Shopify.
+
+1. A paid Shopify order arrives by webhook and waits on the Orders page.
+2. In the extension popup, the order appears in the list of orders waiting to be
+   placed. Opening it opens each product on AliExpress.
+3. The merchant places and pays for the order on AliExpress, from their own buyer
+   account. The extension never presses the order or pay button.
+4. The merchant records the AliExpress order number (and optionally the total) with
+   **Mark as placed**; the extension sends it to
+   `POST /api/extension/orders/:id/placed`.
+5. When AliExpress shows tracking, **Add tracking** (number and optional carrier)
+   sends it to `POST /api/extension/orders/:id/tracking`, and the app adds it to the
+   Shopify fulfilment.
+
+Requirement 1.1.11 allows a browser extension only as an optional feature, so this
+flow cannot be the one a public listing depends on (section 0). Do not put it in the
+reviewer instructions until the extension is on the Chrome Web Store.
 
 ## 6. Submission checklist
 
@@ -252,7 +295,13 @@ Everything on Shopify's requirements list, and where this app meets it:
    ở Cài đặt → Gói dịch vụ. Phần giá trên listing phải khớp.
 5. **Kiểm tra webhook tuân thủ** bằng `shopify app webhook trigger` cho 3 topic.
 6. **Listing**: tên, mô tả, 3 tính năng chính, ảnh 1600×900, icon 1200×1200,
-   email hỗ trợ, ngôn ngữ Anh + Việt; dán hướng dẫn cho người duyệt ở mục 5
-   (dùng nhà cung cấp Demo, không cần tài khoản AliExpress).
-7. **Sau khi duyệt**: theo dõi `/healthz`, giữ `shopify app deploy` trong quy
+   email hỗ trợ, ngôn ngữ Anh + Việt. Không hứa "tự động", không hứa email, không
+   nói ứng dụng hay tiện ích tự đặt đơn. Dán hướng dẫn cho người duyệt ở mục 5:
+   nhà cung cấp Demo chỉ dùng trên development store hoặc đơn thử (test order), không
+   gửi email cho khách, không cần tài khoản AliExpress.
+7. **Đặt đơn bằng tiện ích Chrome** (luồng production hiện tại): tiện ích Chrome liệt
+   kê các đơn đang chờ đặt và mở từng sản phẩm trên AliExpress. Bạn tự đặt và thanh
+   toán đơn ngay trên AliExpress, rồi ghi mã đơn AliExpress vào tiện ích; mã vận đơn
+   bạn thêm ở đó sẽ được gửi sang Shopify.
+8. **Sau khi duyệt**: theo dõi `/healthz`, giữ `shopify app deploy` trong quy
    trình phát hành.

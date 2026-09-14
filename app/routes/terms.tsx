@@ -22,8 +22,9 @@ export default function TermsPage() {
       <Section heading="The service">
         <p>
           DropshipHub ("the app") is software that helps a Shopify store work with dropshipping suppliers. By installing it you agree to these terms.
-          Supplier orders are placed on your instruction, from your own supplier account — today with the DropshipHub Chrome extension on the
-          supplier's site; the contract for each supplier order is between you and the supplier.
+          Supplier orders are placed by you, from your own supplier account. For AliExpress, the Chrome extension lists the orders waiting to be
+          placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the
+          extension; tracking you add there is sent to Shopify. The contract for each supplier order is between you and the supplier.
         </p>
       </Section>
       <Section heading="Your responsibilities">
@@ -74,8 +75,9 @@ export default function TermsPage() {
       <Section heading="Điều khoản dịch vụ">
         <p>
           DropshipHub ("ứng dụng") là phần mềm giúp cửa hàng Shopify làm việc với các nhà cung cấp dropshipping. Cài ứng dụng là bạn đồng ý với các điều
-          khoản này. Đơn nhà cung cấp được đặt theo chỉ dẫn của bạn, từ tài khoản nhà cung cấp của chính bạn — hiện tại bằng tiện ích DropshipHub cho
-          Chrome trên trang của nhà cung cấp; hợp đồng cho mỗi đơn nhà cung cấp là giữa bạn và nhà cung cấp.
+          khoản này. Đơn nhà cung cấp do bạn đặt, từ tài khoản nhà cung cấp của chính bạn. Với AliExpress, tiện ích Chrome liệt kê các đơn đang chờ
+          đặt và mở từng sản phẩm trên AliExpress. Bạn tự đặt và thanh toán đơn ngay trên AliExpress, rồi ghi mã đơn AliExpress vào tiện ích; mã vận
+          đơn bạn thêm ở đó sẽ được gửi sang Shopify. Hợp đồng cho mỗi đơn nhà cung cấp là giữa bạn và nhà cung cấp.
         </p>
       </Section>
       <Section heading="Trách nhiệm của bạn">

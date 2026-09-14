@@ -13,7 +13,9 @@ in `shopify.app.toml`.
 
 For AliExpress, register the app on <https://openservice.aliexpress.com> under the
 *Dropshipping* solution and set the callback URL to
-`https://<your-app>/app/suppliers/callback/aliexpress`.
+`https://<your-app>/suppliers/callback/aliexpress`. The route lives outside `/app` on
+purpose: the supplier's redirect carries no Shopify session, and under `/app` it would be
+answered with the login page. `ALIEXPRESS_REDIRECT_URI` defaults to this URL.
 
 ## 2. Infrastructure
 
@@ -95,7 +97,7 @@ In production the app refuses to boot — with a message naming the variable —
 - [ ] Auto-update policy reviewed under **Auto updates** (defaults: notify on price,
       zero inventory when supplier is out of stock, unpublish when removed).
 - [ ] `SUPPORT_EMAIL` set; `/privacy`, `/terms`, `/support` open in a browser.
-- [ ] `EMAIL_FROM` + `RESEND_API_KEY` or `SMTP_URL` if merchants should get emails.
+- [ ] `EMAIL_FROM` + `RESEND_API_KEY` or `SMTP_URL` if merchants should get emails. Without them email is off (the settings screen says so) and no copy may promise it.
 - [ ] Billing tested on a development store (Settings → Plan → Upgrade, then Downgrade).
 - [ ] Compliance webhooks triggered once with `shopify app webhook trigger` (see
       `PUBLISHING.md`).

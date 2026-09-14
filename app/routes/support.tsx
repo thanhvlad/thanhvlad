@@ -15,6 +15,11 @@ export const loader = async () => ({ supportEmail: env().SUPPORT_EMAIL ?? null }
  * button), a Pay button that opened a sample URL, tracking checked "every 15
  * minutes" with customer emails, and a one-business-day reply promise — each a
  * support ticket, and a listing-accuracy rejection, waiting to happen.
+ *
+ * Ordering is described in the one sentence the landing page, the terms and the
+ * app's own screens share. An earlier version said orders are placed "with the
+ * extension", which a merchant reads as the extension placing them; it lists the
+ * orders and records what the merchant did on AliExpress, and nothing more.
  */
 export default function SupportPage() {
   const { supportEmail } = useLoaderData<typeof loader>();
@@ -41,20 +46,21 @@ export default function SupportPage() {
       </Section>
       <Section heading="Placing AliExpress orders">
         <p>
-          Paid Shopify orders wait on the Orders page. You place each AliExpress order with the DropshipHub Chrome extension and pay for it on AliExpress
-          yourself — AliExpress does not let apps charge your account.
+          Paid Shopify orders wait on the Orders page. The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress.
+          You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.
         </p>
+        <p>AliExpress does not let apps charge your account, so DropshipHub never pays for an order and never holds your money.</p>
       </Section>
       <Section heading="The Request fulfillment button">
         <p>
           Settings → Fulfilment service registers the app as a fulfilment service in Shopify. Products stocked at the app's location then show Request
-          fulfillment on the Shopify order page; clicking it sends the order to the app, where it waits for you to approve it and place it with the
-          supplier. Unmapped lines are rejected back with the reason.
+          fulfillment on the Shopify order page; clicking it sends the order to the app, where it waits to be placed on AliExpress as described
+          above. Unmapped lines are rejected back with the reason.
         </p>
       </Section>
       <Section heading="Tracking numbers">
         <p>
-          When a supplier order has a tracking number recorded, the app adds it to the Shopify fulfilment, and Shopify emails your customer if "Email the
+          When a tracking number is recorded for an AliExpress order, in the extension or on the order in the app, the app adds it to the Shopify fulfilment, and Shopify emails your customer if "Email the
           customer their tracking number" is on under Settings → General. A supplier order that ships as several parcels puts every number on the one
           fulfilment.
         </p>
@@ -90,20 +96,21 @@ export default function SupportPage() {
       </Section>
       <Section heading="Đặt đơn AliExpress">
         <p>
-          Đơn Shopify đã thanh toán nằm chờ ở trang Đơn hàng. Bạn đặt từng đơn AliExpress bằng tiện ích DropshipHub cho Chrome và tự thanh toán trên
-          AliExpress — AliExpress không cho phép ứng dụng trừ tiền tài khoản của bạn.
+          Đơn Shopify đã thanh toán nằm chờ ở trang Đơn hàng. Tiện ích Chrome liệt kê các đơn đang chờ đặt và mở từng sản phẩm trên AliExpress. Bạn tự
+          đặt và thanh toán đơn ngay trên AliExpress, rồi ghi mã đơn AliExpress vào tiện ích; mã vận đơn bạn thêm ở đó sẽ được gửi sang Shopify.
         </p>
+        <p>AliExpress không cho phép ứng dụng trừ tiền tài khoản của bạn, nên DropshipHub không bao giờ thanh toán đơn thay bạn và không giữ tiền của bạn.</p>
       </Section>
       <Section heading="Nút Request fulfillment">
         <p>
           Cài đặt → Dịch vụ giao hàng đăng ký ứng dụng làm fulfillment service trong Shopify. Sản phẩm để tồn kho ở địa điểm của ứng dụng sẽ có nút Request
-          fulfillment trên trang đơn hàng Shopify; bấm nút là đơn được gửi sang ứng dụng và chờ bạn duyệt rồi đặt với nhà cung cấp. Dòng chưa ghép sẽ bị trả
-          lại kèm lý do.
+          fulfillment trên trang đơn hàng Shopify; bấm nút là đơn được gửi sang ứng dụng và chờ được đặt trên AliExpress như mô tả ở trên. Dòng chưa ghép
+          sẽ bị trả lại kèm lý do.
         </p>
       </Section>
       <Section heading="Mã vận đơn">
         <p>
-          Khi đơn nhà cung cấp đã có mã vận đơn, ứng dụng thêm mã đó vào fulfillment trên Shopify, và Shopify gửi email cho khách nếu mục "Gửi email mã vận
+          Khi mã vận đơn của một đơn AliExpress được ghi lại, trong tiện ích hoặc trên đơn trong ứng dụng, ứng dụng thêm mã đó vào fulfillment trên Shopify, và Shopify gửi email cho khách nếu mục "Gửi email mã vận
           đơn cho khách" đang bật trong Cài đặt → Chung. Đơn nhà cung cấp gửi thành nhiều kiện sẽ có đủ mã trên cùng một fulfillment.
         </p>
       </Section>

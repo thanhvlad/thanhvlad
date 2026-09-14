@@ -6,7 +6,7 @@ import prisma from "~/db.server";
 import { env } from "~/lib/env.server";
 import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
-import { connectSupplierAccount, parseOAuthState } from "~/services/supplier-accounts.server";
+import { connectSupplierAccount, verifyOAuthState } from "~/services/supplier-accounts.server";
 
 /**
  * OAuth return URL for supplier platforms (AliExpress): /suppliers/callback/:platform.
@@ -23,9 +23,11 @@ import { connectSupplierAccount, parseOAuthState } from "~/services/supplier-acc
  *
  * Here the signed `state` alone identifies the shop, and every exit is either an
  * absolute URL into that shop's admin or a static page with no input on it. A
- * state whose signature does not verify (or that has expired) cannot be trusted
- * to name a shop, so it never picks one: the merchant is sent to their Shopify
- * admin to start again rather than into somebody else's store.
+ * state whose signature does not verify cannot be trusted to name a shop, so it
+ * never picks one: the merchant is sent to their Shopify admin to start again
+ * rather than into somebody else's store. A state the app did sign but that has
+ * expired does name its shop reliably, so that merchant goes back to Suppliers in
+ * their own admin with an explanation; nothing is exchanged or stored for it.
  */
 
 export const meta: MetaFunction = () => [{ title: "Supplier connection · DropshipHub" }];
@@ -43,15 +45,23 @@ function failurePage(reason: Failure) {
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const url = new URL(request.url);
   const code = url.searchParams.get("code");
-  const parsed = parseOAuthState(url.searchParams.get("state") ?? "");
+  const check = verifyOAuthState(url.searchParams.get("state") ?? "");
 
-  if (!parsed) {
-    logger.warn("Supplier OAuth callback with an invalid or expired state", { platform: params.platform });
+  if (check.status === "invalid") {
+    logger.warn("Supplier OAuth callback with a state that does not verify", { platform: params.platform });
     return failurePage("invalid-state");
   }
 
+  const parsed = check.payload;
   const shop = await prisma.shop.findUnique({ where: { id: parsed.shopId } });
   if (!shop) return failurePage("shop-not-found");
+
+  if (check.status === "expired") {
+    logger.info("Supplier OAuth callback with an expired state", { platform: parsed.platform, shop: shop.domain });
+    return redirect(
+      adminSuppliersUrl(shop.domain, { error: "The supplier connection took too long and expired, so nothing was saved. Start it again from Suppliers." }),
+    );
+  }
 
   // The platform comes from the signed state. The path segment is only checked
   // against it: taken on its own, a crafted return URL could file the code under
@@ -73,10 +83,11 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   }
 
   try {
-    await connectSupplierAccount({ shopId: shop.id, platform: parsed.platform, code, shareAcrossStores: true });
+    await connectSupplierAccount({ shopId: shop.id, platform: parsed.platform, code, shareAcrossStores: true, oauthNonce: parsed.nonce || undefined });
   } catch (error) {
     logger.error("Supplier OAuth callback failed", { platform: parsed.platform, error });
-    return redirect(adminSuppliersUrl(shop.domain, { error: errorMessage(error) }));
+    // The message travels in the admin URL; keep it to a sentence, not a dump of the supplier's response.
+    return redirect(adminSuppliersUrl(shop.domain, { error: errorMessage(error).slice(0, 300) }));
   }
   return redirect(adminSuppliersUrl(shop.domain, { connected: "1" }));
 };
@@ -84,13 +95,13 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 /** Shown only when the return cannot be tied to a store. It has no input on it. */
 export default function SupplierCallbackFailed() {
   const { reason } = useLoaderData<typeof loader>();
-  const expired = reason === "invalid-state";
+  const unverified = reason === "invalid-state";
   return (
     <PublicPage title="The supplier connection did not complete" subtitle="Tiếng Việt ở phía dưới.">
       <Section heading="What happened">
         <p>
-          {expired
-            ? "This connection link has expired or could not be verified, so nothing was saved."
+          {unverified
+            ? "This connection link could not be verified, so nothing was saved."
             : "The store this connection was started from is no longer installed, so nothing was saved."}{" "}
           Open DropshipHub from your Shopify admin and start the connection again from Suppliers.
         </p>
@@ -103,8 +114,8 @@ export default function SupplierCallbackFailed() {
 
       <Section heading="Chuyện gì đã xảy ra">
         <p>
-          {expired
-            ? "Liên kết kết nối này đã hết hạn hoặc không xác minh được, nên chưa có gì được lưu."
+          {unverified
+            ? "Liên kết kết nối này không xác minh được, nên chưa có gì được lưu."
             : "Cửa hàng bắt đầu kết nối này không còn cài ứng dụng, nên chưa có gì được lưu."}{" "}
           Hãy mở DropshipHub từ trang quản trị Shopify và bắt đầu kết nối lại trong mục Nhà cung cấp.
         </p>
