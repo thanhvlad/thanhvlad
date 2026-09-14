@@ -8,6 +8,7 @@ import { logActivity } from "./activity.server";
 import { resolveForVariant } from "./mapping.server";
 import type { ShopWithSettings } from "./shop.server";
 import type { GraphqlClient } from "./shopify/graphql.server";
+import { orderNeedsCustomerData } from "./compliance.server";
 import { fetchOrder, fetchOrdersPage, updateOrderShippingAddress, type ShopifyOrderSnapshot } from "./shopify/orders.server";
 
 export type OrderWithItems = Order & { lineItems: OrderLineItem[]; purchaseOrders: PurchaseOrder[] };
@@ -16,7 +17,17 @@ export type OrderWithItems = Order & { lineItems: OrderLineItem[]; purchaseOrder
 // Ingest from Shopify
 // ---------------------------------------------------------------------------
 
-/** Mirror a Shopify order locally (idempotent) and re-evaluate its pipeline state. */
+/**
+ * Mirror a Shopify order locally (idempotent) and re-evaluate its pipeline state.
+ *
+ * The customer's name, email, phone, street address and order note are only
+ * stored when the app can act on the order (see orderNeedsCustomerData). The
+ * install sync pulls every order from the last 30 days and every order webhook
+ * lands here, so without the check a store selling mostly its own stock kept a
+ * full address book of customers this app would never ship to. An order that
+ * later gains a managed line gets its details on the next webhook or refresh,
+ * because Shopify still has them.
+ */
 export async function upsertOrderFromSnapshot(shop: ShopWithSettings, snapshot: ShopifyOrderSnapshot): Promise<Order> {
   const address = snapshot.shippingAddress;
   const managedVariants = await prisma.productVariant.findMany({
@@ -24,6 +35,9 @@ export async function upsertOrderFromSnapshot(shop: ShopWithSettings, snapshot: 
     select: { id: true, shopifyVariantId: true },
   });
   const variantByShopifyId = new Map(managedVariants.map((v) => [v.shopifyVariantId, v.id]));
+
+  const keepCustomerData = await needsCustomerData(shop.id, snapshot.id, managedVariants.length);
+  const customer = keepCustomerData ? customerFields(snapshot) : { customerName: null, customerEmail: null, phone: null, note: null, shippingAddress: minimalAddressJson(address) };
 
   const order = await prisma.order.upsert({
     where: { shopId_shopifyOrderId: { shopId: shop.id, shopifyOrderId: snapshot.id } },
@@ -34,10 +48,7 @@ export async function upsertOrderFromSnapshot(shop: ShopWithSettings, snapshot: 
       orderNumber: snapshot.orderNumber,
       financialStatus: snapshot.displayFinancialStatus?.toLowerCase() ?? null,
       fulfillmentStatus: snapshot.displayFulfillmentStatus?.toLowerCase() ?? null,
-      customerName: address?.name ?? [snapshot.customer?.firstName, snapshot.customer?.lastName].filter(Boolean).join(" ") ?? null,
-      customerEmail: snapshot.email ?? snapshot.customer?.email ?? null,
-      phone: address?.phone ?? snapshot.phone ?? snapshot.customer?.phone ?? null,
-      shippingAddress: toAddressJson(address, snapshot),
+      ...customer,
       countryCode: address?.countryCodeV2 ?? null,
       currency: snapshot.currencyCode,
       totalPrice: snapshot.totalPrice,
@@ -45,7 +56,6 @@ export async function upsertOrderFromSnapshot(shop: ShopWithSettings, snapshot: 
       totalTax: snapshot.totalTax,
       totalDiscount: snapshot.totalDiscounts,
       tags: snapshot.tags,
-      note: snapshot.note,
       riskLevel: snapshot.riskLevel,
       isTest: snapshot.test,
       canceledAt: snapshot.cancelledAt ? new Date(snapshot.cancelledAt) : null,
@@ -55,17 +65,23 @@ export async function upsertOrderFromSnapshot(shop: ShopWithSettings, snapshot: 
       name: snapshot.name,
       financialStatus: snapshot.displayFinancialStatus?.toLowerCase() ?? null,
       fulfillmentStatus: snapshot.displayFulfillmentStatus?.toLowerCase() ?? null,
-      customerName: address?.name ?? undefined,
-      customerEmail: snapshot.email ?? undefined,
-      phone: address?.phone ?? snapshot.phone ?? undefined,
-      shippingAddress: toAddressJson(address, snapshot),
+      // An order that stopped needing the details (its product was unlinked
+      // before anything was ordered) has them cleared rather than kept.
+      ...(keepCustomerData
+        ? {
+            customerName: customer.customerName ?? undefined,
+            customerEmail: customer.customerEmail ?? undefined,
+            phone: customer.phone ?? undefined,
+            note: customer.note,
+            shippingAddress: customer.shippingAddress,
+          }
+        : customer),
       countryCode: address?.countryCodeV2 ?? undefined,
       totalPrice: snapshot.totalPrice,
       totalShipping: snapshot.totalShipping,
       totalTax: snapshot.totalTax,
       totalDiscount: snapshot.totalDiscounts,
       tags: snapshot.tags,
-      note: snapshot.note,
       riskLevel: snapshot.riskLevel,
       canceledAt: snapshot.cancelledAt ? new Date(snapshot.cancelledAt) : null,
     },
@@ -106,6 +122,41 @@ export async function upsertOrderFromSnapshot(shop: ShopWithSettings, snapshot: 
   }
 
   return evaluateAndStoreOrder(shop, order.id);
+}
+
+/**
+ * Whether this order may hold the customer's details: it has a managed line, or
+ * the stored copy already has a supplier order or fulfilment request behind it.
+ */
+async function needsCustomerData(shopId: string, shopifyOrderId: string, managedLines: number): Promise<boolean> {
+  if (managedLines > 0) return true;
+  const existing = await prisma.order.findUnique({ where: { shopId_shopifyOrderId: { shopId, shopifyOrderId } }, select: { id: true } });
+  if (!existing) return false;
+  const [purchaseOrders, fulfillmentRequests] = await Promise.all([
+    prisma.purchaseOrder.count({ where: { orderId: existing.id } }),
+    prisma.fulfillmentRequest.count({ where: { orderId: existing.id } }),
+  ]);
+  return orderNeedsCustomerData({ managedLines, purchaseOrders, fulfillmentRequests });
+}
+
+function customerFields(snapshot: ShopifyOrderSnapshot) {
+  const address = snapshot.shippingAddress;
+  const fallbackName = [snapshot.customer?.firstName, snapshot.customer?.lastName].filter(Boolean).join(" ");
+  return {
+    customerName: address?.name || fallbackName || null,
+    customerEmail: snapshot.email ?? snapshot.customer?.email ?? null,
+    phone: address?.phone ?? snapshot.phone ?? snapshot.customer?.phone ?? null,
+    note: snapshot.note ?? null,
+    shippingAddress: toAddressJson(address, snapshot),
+  };
+}
+
+/**
+ * What an order the app will not ship keeps of the address: the destination
+ * country, which the reports group by. The same shape a redacted order keeps.
+ */
+function minimalAddressJson(address: ShopifyOrderSnapshot["shippingAddress"]): Prisma.InputJsonValue {
+  return address?.countryCodeV2 ? { countryCode: address.countryCodeV2 } : {};
 }
 
 function toAddressJson(address: ShopifyOrderSnapshot["shippingAddress"], snapshot: ShopifyOrderSnapshot): Prisma.InputJsonValue {

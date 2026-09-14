@@ -66,10 +66,27 @@ describe.skipIf(!TEST_DB)("privacy compliance (postgres)", () => {
     prisma = (await import("~/db.server")).default;
     const { getOrCreateShop } = await import("~/services/shop.server");
     shop = await getOrCreateShop(`gdpr-${stamp}.myshopify.com`);
-    const { upsertOrderFromSnapshot } = await import("~/services/orders.server");
-    await upsertOrderFromSnapshot(shop, snapshot(`gid://shopify/Order/${stamp}1`, "#7001", email));
-    await upsertOrderFromSnapshot(shop, snapshot(`gid://shopify/Order/${stamp}2`, "#7002", email));
-    await upsertOrderFromSnapshot(shop, snapshot(`gid://shopify/Order/${stamp}3`, "#7003", `someone-else-${stamp}@example.com`));
+    // Seeded directly rather than through upsertOrderFromSnapshot: the tea line
+    // is not managed by the app, and such orders no longer keep customer data
+    // at all (asserted separately below).
+    for (const [suffix, name, mail] of [["1", "#7001", email], ["2", "#7002", email], ["3", "#7003", `someone-else-${stamp}@example.com`]] as const) {
+      const s = snapshot(`gid://shopify/Order/${stamp}${suffix}`, name, mail);
+      await prisma.order.create({
+        data: {
+          shopId: shop.id,
+          shopifyOrderId: s.id,
+          name,
+          customerName: "Ada Lovelace",
+          customerEmail: mail,
+          phone: s.shippingAddress.phone,
+          note: s.note,
+          countryCode: "GB",
+          shippingAddress: { name: "Ada Lovelace", address1: s.shippingAddress.address1, zip: s.shippingAddress.zip, countryCode: "GB", phone: s.shippingAddress.phone },
+          issues: [{ code: "INVALID_PHONE", field: "phone", severity: "warning", message: `"${s.shippingAddress.phone}" has 12 digits.` }],
+          shopifyCreatedAt: new Date(),
+        },
+      });
+    }
   });
 
   afterAll(async () => {
@@ -95,7 +112,24 @@ describe.skipIf(!TEST_DB)("privacy compliance (postgres)", () => {
     expect(exported.orders[0].shippingAddress.address1).toBe("12 Analytical Engine Rd");
   });
 
-  it("erases personal data on the named orders and nothing else", async () => {
+  it("erases personal data on the named orders, in every table that holds a copy, and nothing else", async () => {
+    const o1 = await prisma.order.findFirstOrThrow({ where: { shopId: shop.id, name: "#7001" } });
+    const po = await prisma.purchaseOrder.create({
+      data: {
+        orderId: o1.id,
+        platform: "CJ_DROPSHIPPING",
+        status: "FAILED",
+        raw: { externalOrderIds: ["CJ-1"], response: { consignee: "Ada Lovelace", phone: "442071234567" } },
+        errorMessage: "Consignee Ada Lovelace rejected",
+        items: { create: [{ title: "Unmanaged tea", quantity: 1 }] },
+        trackings: { create: [{ number: `LP${stamp}`, syncError: "Refused for Ada Lovelace" }] },
+      },
+    });
+    await prisma.fulfillmentRequest.create({ data: { orderId: o1.id, shopifyFulfillmentOrderId: `gid://shopify/FulfillmentOrder/${stamp}`, requestMessage: "Gift for Ada", responseMessage: "Not fulfillable yet: \"+442071234567\" has 12 digits" } });
+    await prisma.activityLog.create({ data: { shopId: shop.id, action: "order.place_failed", entity: "Order", entityId: o1.id, message: "#7001: receiver Ada Lovelace, 12 Analytical Engine Rd" } });
+    await prisma.notification.create({ data: { shopId: shop.id, type: "order.failed", title: "#7001 failed", body: "Phone +442071234567 rejected", link: `/app/orders/${o1.id}` } });
+    await prisma.webhookEvent.create({ data: { shopId: shop.id, topic: "ORDERS_CREATE", webhookId: `gdpr-${stamp}-1`, processedAt: new Date(), payload: { id: Number(`${stamp}1`), email, shipping_address: { name: "Ada Lovelace", address1: "12 Analytical Engine Rd" } } } });
+
     const { redactCustomer } = await import("~/services/compliance.server");
     const result = await redactCustomer(shop, { customer: { id: 42, email }, orders_to_redact: [`${stamp}1`, `${stamp}2`] });
     expect(result.orders).toBe(2);
@@ -107,9 +141,27 @@ describe.skipIf(!TEST_DB)("privacy compliance (postgres)", () => {
       expect(order.phone).toBeNull();
       expect(order.note).toBeNull();
       expect(order.shippingAddress).toEqual({ countryCode: "GB" });
+      expect(JSON.stringify(order.issues)).not.toContain("2071234567");
     }
+    const copies = JSON.stringify([
+      await prisma.purchaseOrder.findUnique({ where: { id: po.id }, include: { items: true, trackings: true } }),
+      await prisma.fulfillmentRequest.findMany({ where: { orderId: o1.id } }),
+      await prisma.activityLog.findMany({ where: { shopId: shop.id } }),
+      await prisma.notification.findMany({ where: { shopId: shop.id } }),
+      await prisma.webhookEvent.findMany({ where: { shopId: shop.id } }),
+    ]);
+    for (const trace of ["Ada", "Lovelace", "Analytical", "2071234567", email]) expect(copies).not.toContain(trace);
     const untouched = await prisma.order.findFirstOrThrow({ where: { shopId: shop.id, name: "#7003" } });
     expect(untouched.customerName).toBe("Ada Lovelace");
+  });
+
+  it("stores no customer data for an order with nothing the app manages", async () => {
+    const { upsertOrderFromSnapshot } = await import("~/services/orders.server");
+    const order = await upsertOrderFromSnapshot(shop, snapshot(`gid://shopify/Order/${stamp}4`, "#7004", email));
+    expect(order.stage).toBe("IGNORED");
+    expect(order.customerName).toBeNull();
+    expect(order.customerEmail).toBeNull();
+    expect(JSON.stringify(order.shippingAddress)).not.toContain("Analytical");
   });
 
   it("purges stores uninstalled longer than the retention window, sessions included", async () => {
