@@ -1,4 +1,5 @@
-import { assertNoUserErrors, gql, type GraphqlClient, type UserError } from "./graphql.server";
+import { AppError } from "~/lib/errors";
+import { assertNoUserErrors, gql, gqlResult, type GraphqlClient, type UserError } from "./graphql.server";
 
 export interface ShopifyOrderSnapshot {
   id: string;
@@ -50,6 +51,16 @@ export interface ShopifyOrderSnapshot {
     requiresShipping: boolean;
   }>;
   customAttributes: Array<{ key: string; value: string | null }>;
+  /**
+   * Fields Shopify withheld because the app is not approved for that protected
+   * customer data, as dotted paths relative to the order ("shippingAddress",
+   * "customer.defaultPhoneNumber"). Those fields read as null above; this is
+   * how the order screen can tell "Shopify would not share the address" apart
+   * from "the customer gave no address". Always set by the fetchers here;
+   * optional only so a snapshot built by hand (fixtures, the demo script) need
+   * not claim anything about it.
+   */
+  redactedFields?: string[];
 }
 
 const ORDER_FIELDS = `#graphql
@@ -113,7 +124,7 @@ const ORDERS_QUERY = `#graphql
 `;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function normalizeOrder(raw: any): ShopifyOrderSnapshot {
+function normalizeOrder(raw: any): Omit<ShopifyOrderSnapshot, "redactedFields"> {
   const risks: Array<{ riskLevel: string }> = raw.risk?.assessments ?? [];
   const highest = risks.map((r) => r.riskLevel).sort((a, b) => rank(b) - rank(a))[0] ?? null;
   const numberMatch = /(\d+)/.exec(raw.name ?? "");
@@ -171,22 +182,96 @@ function rank(level: string): number {
 }
 
 export async function fetchOrder(client: GraphqlClient, id: string) {
-  const data = await gql<{ order: unknown }>(client, ORDER_QUERY, { id });
-  return data.order ? normalizeOrder(data.order) : null;
+  const { data, deniedPaths } = await gqlResult<{ order: unknown }>(client, ORDER_QUERY, { id });
+  const redacted = redactedFieldsByNode(deniedPaths, ["order"]);
+  if (!data.order) {
+    // The order itself was withheld, not just some of its fields. Returning
+    // null here would read as "the order was deleted" to every caller.
+    if (redacted.whole) throw accessDenied();
+    return null;
+  }
+  return { ...normalizeOrder(data.order), redactedFields: redacted.forNode(0) };
 }
 
 export async function fetchOrdersPage(
   client: GraphqlClient,
   options: { first?: number; after?: string | null; query?: string },
 ) {
-  const data = await gql<{
-    orders: { nodes: unknown[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } };
+  const { data, deniedPaths } = await gqlResult<{
+    orders: { nodes: unknown[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } } | null;
   }>(client, ORDERS_QUERY, {
     first: options.first ?? 50,
     after: options.after ?? null,
     query: options.query ?? null,
   });
-  return { nodes: data.orders.nodes.map(normalizeOrder), pageInfo: data.orders.pageInfo };
+  const redacted = redactedFieldsByNode(deniedPaths, ["orders", "nodes"]);
+  if (!data.orders) {
+    if (redacted.whole) throw accessDenied();
+    return { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } };
+  }
+  return {
+    nodes: data.orders.nodes.map((node, index) => ({ ...normalizeOrder(node), redactedFields: redacted.forNode(index) })),
+    pageInfo: data.orders.pageInfo,
+  };
+}
+
+function accessDenied() {
+  return new AppError(
+    "SHOPIFY_ACCESS_DENIED",
+    "Shopify has not approved this app to read orders (protected customer data). Request access in the Partner Dashboard.",
+  );
+}
+
+/**
+ * Map GraphQL error paths onto the orders they belong to.
+ *
+ * A path under `prefix` followed by a list index belongs to that node (for the
+ * single-order query the prefix is just `order`, and every path belongs to node
+ * 0). A path that stops at or above the prefix withheld the whole result.
+ */
+export function redactedFieldsByNode(deniedPaths: Array<Array<string | number>>, prefix: string[]) {
+  const perNode = new Map<number, Set<string>>();
+  const everyNode = new Set<string>();
+  let whole = false;
+  const indexed = prefix.length > 1;
+
+  for (const path of deniedPaths) {
+    const matchesPrefix = prefix.every((segment, i) => path[i] === segment);
+    if (!matchesPrefix || path.length <= prefix.length) {
+      // Also covers an error with no path: something was withheld and Shopify
+      // did not say what, which is still worth showing rather than dropping.
+      whole = true;
+      everyNode.add("*");
+      continue;
+    }
+    let rest = path.slice(prefix.length);
+    let index: number | null = null;
+    if (indexed) {
+      if (typeof rest[0] !== "number") {
+        everyNode.add(fieldPath(rest));
+        continue;
+      }
+      index = rest[0];
+      rest = rest.slice(1);
+      if (rest.length === 0) continue;
+    }
+    const key = index ?? 0;
+    const set = perNode.get(key) ?? new Set<string>();
+    set.add(fieldPath(rest));
+    perNode.set(key, set);
+  }
+
+  return {
+    whole,
+    forNode(index: number): string[] {
+      return [...new Set([...everyNode, ...(perNode.get(index) ?? [])])].sort();
+    },
+  };
+}
+
+function fieldPath(path: Array<string | number>): string {
+  // "lineItems.nodes.3.image" and "lineItems.nodes.4.image" are one fact.
+  return path.filter((p): p is string => typeof p === "string" && p !== "nodes").join(".");
 }
 
 // ---------------------------------------------------------------------------

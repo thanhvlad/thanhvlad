@@ -1,5 +1,4 @@
-import { createHash } from "node:crypto";
-import { assertNoUserErrors, gql, type GraphqlClient, type UserError } from "./graphql.server";
+import { assertNoUserErrors, gql, operationIdempotencyKey, type GraphqlClient, type UserError } from "./graphql.server";
 
 // ---------------------------------------------------------------------------
 // Create
@@ -48,6 +47,14 @@ export interface PushedProduct {
   title: string;
   status: string;
   featuredImage: string | null;
+  /**
+   * Media Shopify could not ingest, as far as it knows by the time productSet
+   * returns. Supplier CDNs refuse hotlinking often enough that a push can
+   * "succeed" with no pictures at all; this is where that shows.
+   */
+  failedMedia: Array<{ id: string; alt: string | null; message: string }>;
+  /** Media still being fetched when the push returned; its outcome is not known yet. */
+  processingMediaCount: number;
   variants: Array<{
     id: string;
     title: string;
@@ -69,6 +76,9 @@ const PRODUCT_SET_MUTATION = `#graphql
         title
         status
         featuredMedia { preview { image { url } } }
+        media(first: 50) {
+          nodes { id alt status mediaErrors { code details message } }
+        }
         variants(first: 250) {
           nodes {
             id
@@ -80,6 +90,7 @@ const PRODUCT_SET_MUTATION = `#graphql
             inventoryItem { id }
             selectedOptions { name value }
           }
+          pageInfo { hasNextPage endCursor }
         }
       }
       userErrors { field message code }
@@ -94,6 +105,12 @@ const DEFAULT_VALUE = "Default Title";
  * Create a product with all variants, images and inventory in one call using
  * `productSet`. Variants are matched to images by URL so each colour swatch
  * gets its own picture, the way suppliers present them.
+ *
+ * Synchronous mode is kept for every size: Shopify documents both modes as a
+ * choice rather than a threshold, and the push already runs in a job. What a
+ * large product did break was the read-back: the payload lists 250 variants,
+ * so the rest are paged in afterwards (see readRemainingVariants). Before that,
+ * variant 251 onwards never got a supplier mapping and could not be ordered.
  */
 export async function createProduct(
   client: GraphqlClient,
@@ -142,9 +159,7 @@ export async function createProduct(
     ...(variant.imageUrl ? { file: { originalSource: variant.imageUrl, contentType: "IMAGE" } } : {}),
   }));
 
-  const data = await gql<{
-    productSet: { product: RawProduct | null; userErrors: UserError[] };
-  }>(client, PRODUCT_SET_MUTATION, {
+  const variables = {
     synchronous: true,
     input: {
       ...(input.id ? { id: input.id } : {}),
@@ -160,11 +175,81 @@ export async function createProduct(
       variants,
       ...(input.collectionIds?.length ? { collections: input.collectionIds } : {}),
     },
+  };
+  const data = await gql<{
+    productSet: { product: RawProduct | null; userErrors: UserError[] };
+  }>(client, PRODUCT_SET_MUTATION, variables, {
+    // With an id productSet is an upsert, so a replay after a lost response
+    // writes the same state again. Without one it creates, and a replay would
+    // put a second copy of the listing in the merchant's store.
+    replaySafe: Boolean(input.id),
   });
 
   assertNoUserErrors(data.productSet.userErrors, "productSet");
-  if (!data.productSet.product) throw new Error("productSet returned no product");
-  return normalizeProduct(data.productSet.product);
+  const product = data.productSet.product;
+  if (!product) throw new Error("productSet returned no product");
+  if (product.variants.pageInfo?.hasNextPage) {
+    product.variants.nodes.push(...(await readRemainingVariants(client, product.id, product.variants.pageInfo.endCursor)));
+  }
+  return normalizeProduct(product);
+}
+
+const PRODUCT_VARIANTS_PAGE_QUERY = `#graphql
+  query DropshipProductVariantsPage($id: ID!, $after: String) {
+    product(id: $id) {
+      variants(first: 250, after: $after) {
+        nodes {
+          id
+          title
+          sku
+          price
+          compareAtPrice
+          position
+          inventoryQuantity
+          inventoryItem { id unitCost { amount } }
+          selectedOptions { name value }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+`;
+
+/** Every variant after `after`, for products larger than one 250-variant page. */
+async function readRemainingVariants(client: GraphqlClient, productId: string, after: string | null) {
+  const nodes: RawProduct["variants"]["nodes"] = [];
+  let cursor = after;
+  while (cursor) {
+    const data = await gql<{ product: { variants: RawProduct["variants"] } | null }>(client, PRODUCT_VARIANTS_PAGE_QUERY, {
+      id: productId,
+      after: cursor,
+    });
+    if (!data.product) break;
+    nodes.push(...data.product.variants.nodes);
+    cursor = data.product.variants.pageInfo?.hasNextPage ? data.product.variants.pageInfo.endCursor : null;
+  }
+  return nodes;
+}
+
+const PRODUCT_MEDIA_QUERY = `#graphql
+  query DropshipProductMedia($id: ID!) {
+    product(id: $id) {
+      media(first: 100) {
+        nodes { id alt status mediaErrors { code details message } }
+      }
+    }
+  }
+`;
+
+/**
+ * The product's media processing state, for checking a push some time after it
+ * returned: Shopify fetches `originalSource` URLs in the background, so most
+ * failures only appear here seconds to minutes later.
+ */
+export async function fetchProductMediaStatus(client: GraphqlClient, productId: string) {
+  const data = await gql<{ product: { media: { nodes: RawMedia[] } } | null }>(client, PRODUCT_MEDIA_QUERY, { id: productId });
+  if (!data.product) return null;
+  return summariseMedia(data.product.media.nodes);
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +277,7 @@ const PRODUCT_QUERY = `#graphql
           inventoryItem { id unitCost { amount } }
           selectedOptions { name value }
         }
+        pageInfo { hasNextPage endCursor }
       }
     }
   }
@@ -200,6 +286,11 @@ const PRODUCT_QUERY = `#graphql
 export async function fetchProduct(client: GraphqlClient, id: string) {
   const data = await gql<{ product: (RawProduct & { vendor: string | null }) | null }>(client, PRODUCT_QUERY, { id });
   if (!data.product) return null;
+  if (data.product.variants.pageInfo?.hasNextPage) {
+    data.product.variants.nodes.push(
+      ...(await readRemainingVariants(client, data.product.id, data.product.variants.pageInfo.endCursor)),
+    );
+  }
   return {
     ...normalizeProduct(data.product),
     vendor: data.product.vendor,
@@ -314,22 +405,14 @@ export async function updateVariantPrices(
 
 // The @idempotent key is REQUIRED on this mutation from Admin API 2026-04
 // onwards, and this app pins 2026-07. Without it every call is rejected, which
-// silently broke the whole hourly inventory sync.
-/**
- * A stable idempotency key. Shopify requires one on the inventory mutations from
- * API 2026-04; deriving it from the payload means a genuine retry of the same
- * write reuses it, which is the entire point. A fresh uuid per attempt would
- * satisfy the API and protect nothing.
- */
-function idempotencyKey(...parts: unknown[]): string {
-  return createHash("sha256").update(JSON.stringify(parts)).digest("hex").slice(0, 36);
-}
+// silently broke the whole hourly inventory sync. How the key is chosen is
+// explained on operationIdempotencyKey.
 
 const INVENTORY_SET_QUANTITIES = `#graphql
   mutation DropshipInventorySet($input: InventorySetQuantitiesInput!, $key: String!) {
     inventorySetQuantities(input: $input) @idempotent(key: $key) {
       inventoryAdjustmentGroup { reason }
-      userErrors { field message }
+      userErrors { field message code }
     }
   }
 `;
@@ -338,6 +421,7 @@ export async function setInventoryQuantities(
   client: GraphqlClient,
   locationId: string,
   quantities: Array<{ inventoryItemId: string; quantity: number }>,
+  options: { operationId?: string | null } = {},
 ) {
   if (quantities.length === 0) return;
   const data = await gql<{
@@ -346,9 +430,7 @@ export async function setInventoryQuantities(
     // No `ignoreCompareQuantity`: it is not a field on InventorySetQuantitiesInput
     // (verified against the 2026-07 Admin schema), and an unknown key in the
     // variables is rejected by the server as a top-level error — every inventory
-    // sync failed on it. The optimistic-concurrency check is opt-in through each
-    // quantity's `changeFromQuantity`; leaving it out means "set it regardless",
-    // which is what a supplier-driven sync wants.
+    // sync failed on it.
     input: {
       name: "available",
       reason: "correction",
@@ -356,9 +438,18 @@ export async function setInventoryQuantities(
         inventoryItemId: q.inventoryItemId,
         locationId,
         quantity: Math.max(0, q.quantity),
+        // Mandatory on 2026-07: changeFromQuantity must be sent explicitly, even
+        // as null, "or the mutation returns an error". The schema types it as a
+        // nullable Int, so a schema validator accepts an input without it and
+        // only the server refuses. Null opts out of compare-and-swap, which
+        // Shopify reserves for a caller that is the source of truth. This sync
+        // is: it mirrors the supplier's stock. The only "expected" quantity it
+        // could send is the local mirror, which never sees storefront sales and
+        // would fail every write as CHANGE_FROM_QUANTITY_STALE.
+        changeFromQuantity: null,
       })),
     },
-    key: idempotencyKey("inventorySetQuantities", locationId, quantities),
+    key: operationIdempotencyKey("inventorySetQuantities", options.operationId, locationId, quantities),
   });
   assertNoUserErrors(data.inventorySetQuantities.userErrors, "inventorySetQuantities");
 }
@@ -458,7 +549,9 @@ interface RawProduct {
   title: string;
   status: string;
   featuredMedia: { preview: { image: { url: string } | null } | null } | null;
+  media?: { nodes: RawMedia[] } | null;
   variants: {
+    pageInfo?: { hasNextPage: boolean; endCursor: string | null } | null;
     nodes: Array<{
       id: string;
       title: string;
@@ -473,6 +566,29 @@ interface RawProduct {
   };
 }
 
+interface RawMedia {
+  id: string;
+  alt: string | null;
+  status: string;
+  mediaErrors?: Array<{ code: string; details: string | null; message: string }> | null;
+}
+
+export function summariseMedia(nodes: RawMedia[]) {
+  const failedMedia = nodes
+    .filter((m) => m.status === "FAILED")
+    .map((m) => ({
+      id: m.id,
+      alt: m.alt,
+      message:
+        (m.mediaErrors ?? [])
+          .map((e) => e.details || e.message)
+          .filter(Boolean)
+          .join("; ") || "Shopify could not process this image.",
+    }));
+  const processingMediaCount = nodes.filter((m) => m.status === "PROCESSING" || m.status === "UPLOADED").length;
+  return { failedMedia, processingMediaCount };
+}
+
 function normalizeProduct(raw: RawProduct): PushedProduct {
   return {
     id: raw.id,
@@ -480,6 +596,7 @@ function normalizeProduct(raw: RawProduct): PushedProduct {
     title: raw.title,
     status: raw.status,
     featuredImage: raw.featuredMedia?.preview?.image?.url ?? null,
+    ...summariseMedia(raw.media?.nodes ?? []),
     variants: raw.variants.nodes.map((v) => ({
       id: v.id,
       title: v.title,

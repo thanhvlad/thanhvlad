@@ -1,5 +1,6 @@
-import prisma from "~/db.server";
-import { d, money, sum } from "~/lib/money";
+import prisma, { chunkedTransaction } from "~/db.server";
+import { d, money, sum, type MoneyInput } from "~/lib/money";
+import { logger } from "~/lib/logger.server";
 import { countOrdersByStage } from "./orders.server";
 import { countProducts } from "./products.server";
 import { countUnread } from "./notifications.server";
@@ -10,6 +11,57 @@ function startOfDay(date: Date): Date {
   return day;
 }
 
+type RollupOrder = {
+  shopifyCreatedAt: Date | null;
+  stage: string;
+  totalPrice: MoneyInput;
+  supplierCost: MoneyInput;
+  supplierShipping: MoneyInput;
+  lineItems: Array<{ quantity: number; productVariantId: string | null }>;
+  purchaseOrders: Array<{ status: string }>;
+};
+
+const ROLLUP_SELECT = {
+  shopifyCreatedAt: true,
+  stage: true,
+  totalPrice: true,
+  supplierCost: true,
+  supplierShipping: true,
+  lineItems: { select: { quantity: true, productVariantId: true } },
+  purchaseOrders: { select: { status: true } },
+} as const;
+
+/** The DailyMetric figures for one day's orders. Pure, so it can be tested without a database. */
+export function aggregateOrders(orders: RollupOrder[]) {
+  const revenue = sum(orders.filter((o) => o.stage !== "CANCELED").map((o) => o.totalPrice));
+  const productCost = sum(orders.map((o) => o.supplierCost));
+  const shippingCost = sum(orders.map((o) => o.supplierShipping));
+  return {
+    orders: orders.length,
+    itemsSold: orders.reduce((n, o) => n + o.lineItems.filter((li) => li.productVariantId).reduce((m, li) => m + li.quantity, 0), 0),
+    revenue: money(revenue),
+    productCost: money(productCost),
+    shippingCost: money(shippingCost),
+    profit: money(revenue.minus(productCost).minus(shippingCost)),
+    ordersPlaced: orders.filter((o) => o.purchaseOrders.some((po) => !["FAILED", "CANCELED", "DRAFT"].includes(po.status))).length,
+    ordersFulfilled: orders.filter((o) => o.stage === "FULFILLED" || o.stage === "AWAITING_DELIVERY").length,
+    ordersFailed: orders.filter((o) => o.stage === "FAILED").length,
+  };
+}
+
+/** Group orders by the UTC day they were created, for every day in [from, to]. */
+export function groupOrdersByDay<T extends { shopifyCreatedAt: Date | null }>(orders: T[], from: Date, to: Date) {
+  const days = new Map<number, T[]>();
+  for (let cursor = startOfDay(from).getTime(); cursor <= startOfDay(to).getTime(); cursor += 86_400_000) {
+    days.set(cursor, []);
+  }
+  for (const order of orders) {
+    if (!order.shopifyCreatedAt) continue;
+    days.get(startOfDay(order.shopifyCreatedAt).getTime())?.push(order);
+  }
+  return days;
+}
+
 /** Aggregate one UTC day into DailyMetric. Idempotent. */
 export async function rollupDailyMetrics(shopId: string, day: Date) {
   const from = startOfDay(day);
@@ -17,56 +69,44 @@ export async function rollupDailyMetrics(shopId: string, day: Date) {
 
   const orders = await prisma.order.findMany({
     where: { shopId, shopifyCreatedAt: { gte: from, lt: to }, isTest: false },
-    include: { lineItems: { select: { quantity: true, productVariantId: true } }, purchaseOrders: { select: { status: true, placedAt: true } } },
+    select: ROLLUP_SELECT,
   });
-
-  const revenue = sum(orders.filter((o) => o.stage !== "CANCELED").map((o) => o.totalPrice));
-  const productCost = sum(orders.map((o) => o.supplierCost));
-  const shippingCost = sum(orders.map((o) => o.supplierShipping));
-  const itemsSold = orders.reduce((n, o) => n + o.lineItems.filter((li) => li.productVariantId).reduce((m, li) => m + li.quantity, 0), 0);
-  const ordersPlaced = orders.filter((o) => o.purchaseOrders.some((po) => !["FAILED", "CANCELED", "DRAFT"].includes(po.status))).length;
-  const ordersFulfilled = orders.filter((o) => o.stage === "FULFILLED" || o.stage === "AWAITING_DELIVERY").length;
-  const ordersFailed = orders.filter((o) => o.stage === "FAILED").length;
+  const figures = aggregateOrders(orders);
 
   return prisma.dailyMetric.upsert({
     where: { shopId_day: { shopId, day: from } },
-    create: {
-      shopId,
-      day: from,
-      orders: orders.length,
-      itemsSold,
-      revenue: money(revenue),
-      productCost: money(productCost),
-      shippingCost: money(shippingCost),
-      profit: money(revenue.minus(productCost).minus(shippingCost)),
-      ordersPlaced,
-      ordersFulfilled,
-      ordersFailed,
-    },
-    update: {
-      orders: orders.length,
-      itemsSold,
-      revenue: money(revenue),
-      productCost: money(productCost),
-      shippingCost: money(shippingCost),
-      profit: money(revenue.minus(productCost).minus(shippingCost)),
-      ordersPlaced,
-      ordersFulfilled,
-      ordersFailed,
-    },
+    create: { shopId, day: from, ...figures },
+    update: figures,
   });
 }
 
+/**
+ * Re-aggregate every day in a range.
+ *
+ * One read for the whole range and bounded write transactions, rather than a
+ * read and an upsert per day: "Recalculate" on a year of reports ran about 730
+ * sequential queries inside the request that asked for it.
+ */
 export async function rollupRange(shopId: string, from: Date, to: Date) {
-  let cursor = startOfDay(from);
+  const start = startOfDay(from);
   const end = startOfDay(to);
-  let days = 0;
-  while (cursor <= end) {
-    await rollupDailyMetrics(shopId, cursor);
-    cursor = new Date(cursor.getTime() + 86_400_000);
-    days += 1;
-  }
-  return days;
+  const orders = await prisma.order.findMany({
+    where: { shopId, shopifyCreatedAt: { gte: start, lt: new Date(end.getTime() + 86_400_000) }, isTest: false },
+    select: ROLLUP_SELECT,
+  });
+  const byDay = groupOrdersByDay(orders, start, end);
+  await chunkedTransaction(
+    [...byDay.entries()].map(([time, dayOrders]) => {
+      const day = new Date(time);
+      const figures = aggregateOrders(dayOrders);
+      return prisma.dailyMetric.upsert({
+        where: { shopId_day: { shopId, day } },
+        create: { shopId, day, ...figures },
+        update: figures,
+      });
+    }),
+  );
+  return byDay.size;
 }
 
 export interface ReportRange {
@@ -133,10 +173,37 @@ export async function getReport(shopId: string, range: ReportRange) {
   };
 }
 
+/** How old today's figures may be before a dashboard view refreshes them. */
+export const DASHBOARD_METRIC_MAX_AGE_MS = 10 * 60_000;
+const refreshing = new Map<string, Promise<unknown>>();
+
+/**
+ * Keep today's DailyMetric roughly current without making the dashboard wait.
+ *
+ * Every dashboard GET used to load all of today's orders with their lines and
+ * purchase orders and upsert a row before any of its own queries started, so
+ * the home screen got slower with every order a shop took. The scheduler rolls
+ * metrics up anyway; the dashboard only fills a gap. With no row yet for today
+ * it waits once, so a first visit is not empty; a row that is merely old is
+ * refreshed in the background and the view shows it as it stands.
+ */
+async function refreshTodayIfStale(shopId: string, today: Date) {
+  const existing = await prisma.dailyMetric.findUnique({ where: { shopId_day: { shopId, day: today } }, select: { updatedAt: true } });
+  if (existing && Date.now() - existing.updatedAt.getTime() < DASHBOARD_METRIC_MAX_AGE_MS) return;
+  let run = refreshing.get(shopId);
+  if (!run) {
+    run = rollupDailyMetrics(shopId, today)
+      .catch((error) => logger.warn("Dashboard metric refresh failed", { shopId, error }))
+      .finally(() => refreshing.delete(shopId));
+    refreshing.set(shopId, run);
+  }
+  if (!existing) await run;
+}
+
 export async function getDashboardStats(shopId: string) {
   const today = startOfDay(new Date());
   const weekAgo = new Date(today.getTime() - 6 * 86_400_000);
-  await rollupDailyMetrics(shopId, today).catch(() => undefined);
+  await refreshTodayIfStale(shopId, today);
 
   const [stages, products, unread, importCount, supplierAccounts, week, recentFailures, activeJobs] = await Promise.all([
     countOrdersByStage(shopId),

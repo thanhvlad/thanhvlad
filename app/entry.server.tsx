@@ -30,6 +30,39 @@ export function handleError(error: unknown, { request }: LoaderFunctionArgs | Ac
   logger.error("Unhandled route error", { method: request.method, path: url.pathname, error });
 }
 
+/**
+ * Security headers the Shopify helper leaves to us.
+ *
+ * `addDocumentResponseHeaders` only sets `frame-ancestors` when the request
+ * carries a valid `?shop=`, so the landing page, the legal pages and the login
+ * form could be framed by any site (clickjacking the login form in particular).
+ * Those pages are never meant to render inside the admin, so without a shop they
+ * refuse framing outright.
+ *
+ * Paths under /app and /auth (other than the login form) are left alone even
+ * without a shop: they are the embedded app and its OAuth bounce pages, which
+ * Shopify loads inside the admin iframe, and a `frame-ancestors 'none'` that
+ * slipped onto one of them would blank the app for the merchant.
+ *
+ * HSTS goes out only in production and only over HTTPS (directly or as reported
+ * by the proxy in front), so local http development is never pinned to TLS.
+ */
+export function addPublicDocumentHeaders(request: Request, headers: Headers) {
+  const url = new URL(request.url);
+  headers.set("X-Content-Type-Options", "nosniff");
+
+  const embeddedPath = /^\/(app|auth)(\/|$)/.test(url.pathname) && !/^\/auth\/login\/?$/.test(url.pathname);
+  if (!headers.has("Content-Security-Policy") && !embeddedPath) {
+    headers.set("Content-Security-Policy", "frame-ancestors 'none';");
+  }
+
+  const forwardedProto = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
+  const https = url.protocol === "https:" || forwardedProto === "https";
+  if (process.env.NODE_ENV === "production" && https) {
+    headers.set("Strict-Transport-Security", "max-age=31536000");
+  }
+}
+
 export default async function handleRequest(
   request: Request,
   responseStatusCode: number,
@@ -37,6 +70,7 @@ export default async function handleRequest(
   remixContext: EntryContext,
 ) {
   addDocumentResponseHeaders(request, responseHeaders);
+  addPublicDocumentHeaders(request, responseHeaders);
   const userAgent = request.headers.get("user-agent");
   const callbackName = isbot(userAgent ?? "") ? "onAllReady" : "onShellReady";
 
