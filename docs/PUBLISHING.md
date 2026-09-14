@@ -8,6 +8,53 @@ for the setup and one to two weeks for Shopify's review.
 
 ---
 
+## 0. Launch gate (audited 2026-09-14)
+
+An App Store readiness audit on 2026-09-14 checked this app against Shopify's
+requirements, quoted from shopify.dev, and against production as it actually
+ran. Several boxes further down had been ticked on the strength of the code
+existing rather than of it being live. Until each item here is done, do not
+submit:
+
+**The Chrome extension cannot be the only way the app works.** App Store
+requirement 1.1.11: *"Browser extensions are only permitted as an optional
+feature."* The extension-first ordering and import flow is the right way to run
+the owner's own stores now, but a publicly listed app must import products and
+place supplier orders from inside the Shopify admin with no extension installed.
+For AliExpress that means the official Dropshipping API
+(`app/services/suppliers/aliexpress.server.ts`, kept intact for exactly this):
+apply for AliExpress Open Platform Dropshipping access early, because approval
+takes days to weeks, then set `ALIEXPRESS_APP_KEY`, `ALIEXPRESS_APP_SECRET`,
+`ALIEXPRESS_REDIRECT_URI` and `SUPPLIER_DRIVER=live`. Requirement 1.1.13 also
+rules out listing copy like "import from any store", with or without an
+extension.
+
+Owner actions, none of which code can do:
+
+1. `shopify app config link` against the production app, keeping this repo's
+   `[access_scopes]`, `[webhooks]` (including `compliance_topics`), `[auth]` and
+   `application_url`; then `shopify app deploy`. Until then `client_id` is empty
+   here and the scopes, webhook subscriptions and compliance topics Shopify uses
+   are whatever the Partner Dashboard last had.
+2. Set distribution to Public, then request **Protected customer data** with
+   Name, Email, Phone and Address, justified by fulfilling orders through the
+   supplier. Without approval, a merchant's orders come back with no address.
+3. AliExpress Dropshipping API approval (above), and a dedicated AliExpress
+   buyer account for reviewers with no SMS or 2FA step.
+4. A monitored support mailbox on the owner's domain, set as `SUPPORT_EMAIL` in
+   production and in the listing; an emergency developer contact in the Partner
+   Dashboard.
+5. One brand-led app name. `shopify.app.toml` says "WS Fullfill App" (and
+   misspells fulfil) while every page says DropshipHub.
+6. In the submission form choose **Manual pricing with the Billing API**: the
+   code implements the Billing API, and Shopify App Pricing is the default for
+   new public apps. Do not list paid plans for features production cannot yet
+   deliver.
+7. If the extension stays in the listing as the optional shortcut, publish it on
+   the Chrome Web Store first; reviewers cannot load an unpacked extension.
+8. Review the legal wording of `/privacy` once the code-side corrections land.
+9. Record the demo screencast only after live ordering works end to end.
+
 ## 1. Host it
 
 Deploy once, before touching the Partner Dashboard, because every other step
@@ -165,19 +212,20 @@ try the full flow without an AliExpress account.
 Everything on Shopify's requirements list, and where this app meets it:
 
 - [x] Embedded, App Bridge, session-token auth (`@shopify/shopify-app-remix`), latest stable API version.
-- [x] OAuth via managed installation; scopes declared in `shopify.app.toml`.
-- [x] Mandatory compliance webhooks implemented and answering `200` with HMAC verification.
+- [ ] OAuth via managed installation; scopes declared in `shopify.app.toml` **and deployed** (`shopify app config link` + `shopify app deploy` - not done as of 2026-09-14).
+- [ ] Mandatory compliance webhooks implemented and answering `200` with HMAC verification (the handler exists; the subscriptions only exist once the config is deployed).
 - [x] `app/uninstalled` handled; store data erased on `shop/redact` and after 30 days.
 - [x] Billing through the Billing API only; no external payment collection.
 - [x] Free plan available; trial on paid plans; plan changes and cancellation from inside the app.
 - [x] Privacy policy, terms and support pages reachable without login.
-- [x] Protected customer data requested with the reasons above.
+- [ ] Protected customer data requested with the reasons above (Partner Dashboard; not confirmed as of 2026-09-14).
 - [x] Polaris UI, works at 1280 px and on mobile admin; no page depends on third-party cookies.
-- [x] Health endpoint for the host; structured logs; worker and web separated.
+- [ ] Health endpoint for the host; structured logs; worker and web separated (production runs the inline queue inside the web process with no Redis).
 - [x] Reinstall works (the install hook reactivates the store and skips the order backfill when history exists).
 - [ ] Listing copy, screenshots and icon uploaded.
 - [ ] Protected customer data approved (submit the app for review only after this, or the reviewer's test orders will have no addresses).
-- [ ] A test store with the Demo supplier connected and one placed order, so the reviewer sees the pipeline populated.
+- [ ] A test store with **AliExpress connected through the API** and one placed order, so the reviewer sees the real pipeline. The Demo supplier is not acceptable here: the listing describes AliExpress, and reviewers test what the listing claims.
+- [ ] The app imports and orders with no browser extension installed (requirement 1.1.11).
 
 ## 7. After approval
 
