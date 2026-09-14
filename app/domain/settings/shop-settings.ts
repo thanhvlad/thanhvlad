@@ -99,6 +99,15 @@ export const shopSettingsSchema = z.object({
        * to every weight-based shipping rate in the store.
        */
       defaultWeightGrams: z.number().min(0).max(100_000).default(0),
+      /**
+       * The customer support address printed on pages written by Rewrite with
+       * AI, as the only link those pages may carry. Empty means use the contact
+       * email from the store's Shopify details. Kept a plain string here, with
+       * the format checked on save by `supportEmailProblem`: a stricter schema
+       * would make one bad stored value fail the whole parse, and
+       * parseShopSettings then resets every setting to its default.
+       */
+      storefrontSupportEmail: z.string().default(""),
     })
     .default({}),
 
@@ -163,6 +172,22 @@ export function resolveVariantWeightGrams(supplierGrams: number | null | undefin
   if (typeof supplierGrams === "number" && Number.isFinite(supplierGrams) && supplierGrams > 0) return Math.round(supplierGrams);
   if (Number.isFinite(defaultGrams) && defaultGrams > 0) return Math.round(defaultGrams);
   return null;
+}
+
+const SUPPORT_EMAIL = /^[^\s@<>"'()]+@[^\s@<>"'()]+\.[^\s@<>"'()]+$/;
+
+/**
+ * Why a storefront support address cannot be saved, or null when it can.
+ *
+ * An empty value is fine, it means "use Shopify's". Anything else ends up as a
+ * mailto link on a live product page, so it has to be a single plain address:
+ * no display name, no second address, nothing that would break out of the
+ * href, and short enough to be a real mailbox.
+ */
+export function supportEmailProblem(value: string | null | undefined): "invalid" | null {
+  const trimmed = (value ?? "").trim();
+  if (!trimmed) return null;
+  return trimmed.length <= 254 && SUPPORT_EMAIL.test(trimmed) ? null : "invalid";
 }
 
 /** Deep-merge a partial update into an existing settings object. */

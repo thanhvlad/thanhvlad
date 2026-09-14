@@ -203,19 +203,54 @@ export function aiUsageResetsAt(at: Date = new Date()): Date {
 
 export interface AiRewriteAllowance {
   plan: PlanId;
-  limit: number;
+  /** `null` when the store's rewrites are not metered at all. */
+  limit: number | null;
   used: number;
-  remaining: number;
+  /** `null` when the store's rewrites are not metered at all. */
+  remaining: number | null;
   /** The cheapest plan with a larger allowance, for the upgrade hint. */
   upgradeTo: PlanId | null;
 }
 
-/** What is left of a plan's monthly rewrite allowance after `used` of it. */
-export function aiRewriteAllowance(plan: PlanId, used: number): AiRewriteAllowance {
-  const limit = PLANS[plan].limits.aiRewritesPerMonth;
+/**
+ * What is left of a plan's monthly rewrite allowance after `used` of it.
+ *
+ * `unmetered` is the operator's exemption (AI_UNMETERED_SHOP_DOMAINS), not a
+ * plan: it exists because the owner's own store runs on the free tier and its
+ * real rewrite volume would otherwise stop at three a month on deploy. It uses
+ * the same `null` means unlimited convention as the other plan limits, and
+ * usage is still reported so the operator can see what the exemption costs.
+ */
+export function aiRewriteAllowance(plan: PlanId, used: number, options: { unmetered?: boolean } = {}): AiRewriteAllowance {
   const spent = Math.max(0, Math.floor(used));
+  if (options.unmetered) return { plan, limit: null, used: spent, remaining: null, upgradeTo: null };
+  const limit = PLANS[plan].limits.aiRewritesPerMonth;
   const upgradeTo = PLAN_ORDER.find((id) => planRank(id) > planRank(plan) && PLANS[id].limits.aiRewritesPerMonth > limit) ?? null;
   return { plan, limit, used: spent, remaining: Math.max(0, limit - spent), upgradeTo };
+}
+
+/**
+ * Parse the operator's list of shops whose rewrites are not metered.
+ *
+ * Forgiving on purpose, because a typo in an environment variable must never
+ * stop the boot: entries are trimmed, lowercased and stripped of a scheme or a
+ * trailing slash someone pasted from the browser, and empty entries are dropped.
+ */
+export function parseShopDomainList(raw: string | null | undefined): string[] {
+  return (raw ?? "")
+    .split(",")
+    .map((entry) => normalizeShopDomain(entry))
+    .filter(Boolean);
+}
+
+function normalizeShopDomain(value: string): string {
+  return value.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/+$/, "");
+}
+
+/** Whether a shop's myshopify domain is on the unmetered list. */
+export function isUnmeteredShop(domain: string | null | undefined, unmetered: readonly string[]): boolean {
+  if (!domain) return false;
+  return unmetered.includes(normalizeShopDomain(domain));
 }
 
 export type AiRewriteRefusal = "none-selected" | "batch-too-large" | "quota-exhausted" | "quota-short";
@@ -230,6 +265,9 @@ export type AiRewriteRefusal = "none-selected" | "batch-too-large" | "quota-exha
 export function checkAiRewriteRequest(allowance: AiRewriteAllowance, requested: number): AiRewriteRefusal | null {
   if (requested <= 0) return "none-selected";
   if (requested > MAX_AI_REWRITE_BATCH) return "batch-too-large";
+  // The batch cap still applies to an unmetered store: it exists to keep one
+  // click from holding the inline queue for an hour, not to save money.
+  if (allowance.remaining === null) return null;
   if (allowance.remaining === 0) return "quota-exhausted";
   if (requested > allowance.remaining) return "quota-short";
   return null;

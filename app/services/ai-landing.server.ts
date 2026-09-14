@@ -23,7 +23,8 @@ import { logger } from "~/lib/logger.server";
  * ai-mapping.server.ts already behaves.
  *
  * What leaves the app on each call - the supplier title, description, variant
- * options and prices, the supplier store name and up to eight image urls - goes
+ * options, prices and stock, the supplier store name, the store's name and
+ * support address, up to two of its finished pages and up to eight image urls - goes
  * to whatever ANTHROPIC_BASE_URL names. The merchant is told so before a
  * rewrite is queued (the import list's confirmation), and an endpoint that is
  * not Anthropic's own is logged at warn level and reported by `aiEndpointStatus`
@@ -161,17 +162,59 @@ function warnAboutGatewayOnce() {
 if (process.env.ANTHROPIC_API_KEY) warnAboutGatewayOnce();
 
 /**
- * True when a failed rewrite never produced a billable answer.
- *
- * An error status from the endpoint - a refusal of the request's shape, an
- * auth or rate-limit answer, a server fault - means no completion was produced,
- * so it should not use up the merchant's monthly allowance. A dropped
- * connection or a timeout carries no status and is counted: the model may well
- * have run to the end on the other side. So is anything else, such as an answer
- * that would not parse, which came back after the model ran and was paid for.
+ * Statuses that are answered before any model runs, from Anthropic or from a
+ * gateway in front of it: a request refused as shaped (400, 413, 422), refused
+ * for its credentials or its content (401, 403), sent to a model or route that
+ * does not exist (404), or turned away by a rate limit (429). No completion can
+ * exist behind any of them, so nobody was billed for one.
  */
-export function rewriteWasNotBilled(error: unknown): boolean {
-  return error instanceof Anthropic.APIError && typeof error.status === "number";
+const REFUSED_BEFORE_THE_MODEL = new Set([400, 401, 403, 404, 413, 422, 429]);
+
+/**
+ * Server faults that Anthropic's own API returns only when it did not produce
+ * the answer: 500 is an internal error and 529 is "overloaded", both raised
+ * instead of running the request.
+ */
+const ANTHROPIC_FAULTS_BEFORE_THE_MODEL = new Set([500, 529]);
+
+/**
+ * True when a failed rewrite cannot have produced a billable answer, so the
+ * merchant's allowance unit may be given back.
+ *
+ * The line is drawn at what can be known, not at what probably happened. Round
+ * one gave the unit back for every status, and production sends every call
+ * through a third-party gateway: a gateway that gives up on a long Opus
+ * generation answers 502, 504 or 524 after the model upstream has already run
+ * to the end and been paid for. Refunding those let a merchant retry the same
+ * long page indefinitely while the counter stayed at zero. So a 5xx counts
+ * unless it came from Anthropic directly and is one of the two it raises
+ * instead of running the request; through a gateway even a 500 or 529 may be
+ * the gateway's own wrapper around a finished, billed call.
+ *
+ * A dropped connection or a timeout carries no status and is counted for the
+ * same reason, and so is anything that came back after the model ran, such as
+ * an answer that would not parse.
+ */
+export function rewriteWasNotBilled(error: unknown, endpoint: Pick<AiEndpointStatus, "direct"> = aiEndpointStatus()): boolean {
+  if (!(error instanceof Anthropic.APIError) || typeof error.status !== "number") return false;
+  if (REFUSED_BEFORE_THE_MODEL.has(error.status)) return true;
+  return endpoint.direct && ANTHROPIC_FAULTS_BEFORE_THE_MODEL.has(error.status);
+}
+
+/**
+ * The client a rewrite is sent with.
+ *
+ * The SDK retries 408, 409, 429 and every 5xx twice by default. One allowance
+ * unit is reserved per product, and a retried 5xx through a gateway can be a
+ * second and third billed generation of the same page, so one unit could pay
+ * for three. With no automatic retries one unit is one request; a merchant
+ * whose rewrite hit a transient fault presses the button again, and a refused
+ * request has already been given back by `rewriteWasNotBilled`. The deliberate
+ * no-image retry in `rewriteLandingPage` follows only a 4xx refusal, which
+ * produced nothing to pay for.
+ */
+export function createRewriteClient(): Anthropic {
+  return new Anthropic({ maxRetries: 0 });
 }
 
 /** Vision needs a reachable http(s) url, and a long tail of images costs tokens
@@ -321,7 +364,7 @@ function requireShape(parsed: Record<string, unknown>): void {
 
 export async function rewriteLandingPage(input: RewriteInput): Promise<RewriteResult> {
   if (!aiLandingAvailable()) throw new Error("ANTHROPIC_API_KEY is not configured.");
-  const client = new Anthropic();
+  const client = createRewriteClient();
 
   const visionImages = input.images.filter((u) => /^https?:\/\//i.test(u)).slice(0, MAX_VISION_IMAGES);
 

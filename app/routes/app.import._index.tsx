@@ -140,7 +140,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             ok: false,
             error: `AI rewrite refused: ${refusal}.`,
             errorKey: REWRITE_REFUSAL_KEYS[refusal],
-            errorVars: { n: ids.length, max: MAX_AI_REWRITE_BATCH, remaining: allowance.remaining, limit: allowance.limit, plan: PLANS[allowance.plan].displayName },
+            errorVars: { n: ids.length, max: MAX_AI_REWRITE_BATCH, remaining: allowance.remaining ?? "", limit: allowance.limit ?? "", plan: PLANS[allowance.plan].displayName },
           };
         }
         const job = await createJobRun({ shopId: shop.id, type: "rewrite-landing", total: ids.length, payload: { ids } });
@@ -281,9 +281,16 @@ export default function ImportListPage() {
         // what the finished form looks like, so a review step in between
         // would only be a step. It spends money and sends product data to an
         // AI provider, though, so it goes through a confirmation that says so
-        // and shows what is left of the month's allowance.
+        // and shows what is left of the month's allowance. A store exempt from
+        // the allowance has no count worth showing on the button.
         ...(ai
-          ? [{ content: t("import.list.bulk.rewriteLeft", { n: ai.remaining }), onAction: () => setModal("rewrite"), disabled: busy }]
+          ? [
+              {
+                content: ai.remaining === null ? t("import.list.bulk.rewrite") : t("import.list.bulk.rewriteLeft", { n: ai.remaining }),
+                onAction: () => setModal("rewrite"),
+                disabled: busy,
+              },
+            ]
           : []),
         { content: t("action.remove"), onAction: () => setModal("remove"), disabled: busy },
       ]}
@@ -551,7 +558,7 @@ export default function ImportListPage() {
             <Modal.Section>
               <Banner tone="warning">
                 <p>
-                  {t(REWRITE_REFUSAL_KEYS[rewriteRefusal], { n: selectedCount, max: MAX_AI_REWRITE_BATCH, remaining: ai.remaining, limit: ai.limit, plan: ai.planName })}
+                  {t(REWRITE_REFUSAL_KEYS[rewriteRefusal], { n: selectedCount, max: MAX_AI_REWRITE_BATCH, remaining: ai.remaining ?? "", limit: ai.limit ?? "", plan: ai.planName })}
                   {ai.upgradeName && (rewriteRefusal === "quota-exhausted" || rewriteRefusal === "quota-short") ? ` ${t("import.list.rewrite.upgradeHint", { upgrade: ai.upgradeName })}` : ""}
                 </p>
               </Banner>
@@ -568,12 +575,23 @@ export default function ImportListPage() {
           <Modal.Section>
             <BlockStack gap="200">
               <SectionHeader title={t("import.list.rewriteModal.allowanceTitle")} />
-              <Text as="p" numeric>
-                {t("import.list.rewriteModal.allowance", { remaining: ai.remaining, limit: ai.limit, plan: ai.planName })}
-              </Text>
-              <Text as="p" tone="subdued">
-                {t("import.list.rewriteModal.allowanceHelp", { date: resetsOn })}
-              </Text>
+              {ai.remaining === null || ai.limit === null ? (
+                <>
+                  <Text as="p">{t("import.list.rewriteModal.allowanceUnlimited")}</Text>
+                  <Text as="p" tone="subdued">
+                    {t("import.list.rewriteModal.allowanceUnlimitedHelp", { max: MAX_AI_REWRITE_BATCH })}
+                  </Text>
+                </>
+              ) : (
+                <>
+                  <Text as="p" numeric>
+                    {t("import.list.rewriteModal.allowance", { remaining: ai.remaining, limit: ai.limit, plan: ai.planName })}
+                  </Text>
+                  <Text as="p" tone="subdued">
+                    {t("import.list.rewriteModal.allowanceHelp", { date: resetsOn })}
+                  </Text>
+                </>
+              )}
             </BlockStack>
           </Modal.Section>
         </Modal>

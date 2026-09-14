@@ -74,6 +74,14 @@ const schema = z.object({
    * use this key. */
   ANTHROPIC_API_KEY: z.string().optional(),
   AI_MAPPING_MODEL: z.string().default("claude-opus-5"),
+  /**
+   * Comma-separated myshopify domains whose AI landing rewrites are not
+   * metered against the plan's monthly allowance. Meant for the operator's own
+   * store, which pays the model bill directly and may sit on the free tier.
+   * Parsed forgivingly by parseShopDomainList, so a malformed entry matches no
+   * shop instead of stopping the boot.
+   */
+  AI_UNMETERED_SHOP_DOMAINS: z.string().default(""),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
   EXCHANGE_RATE_API_URL: z.string().default("https://open.er-api.com/v6/latest"),
 }).superRefine((values, ctx) => {
