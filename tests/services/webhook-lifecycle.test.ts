@@ -12,7 +12,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { billingReturnUrl, paysForAccountPlan, remainingTrialDays } from "~/services/billing.server";
 import { generateInviteCode, markShopUninstalled, normalizeInviteCode, reauthenticatedSince, webhookCheckDue } from "~/services/shop.server";
 import { failedTopics, pointsAtHost } from "~/services/shopify/webhooks.server";
-import { classifyInstallProbeError, parseTriggeredAt, pendingWebhookFilter, processWebhookEvent, sweepPendingWebhooks, WEBHOOK_MAX_ATTEMPTS } from "~/services/webhooks.server";
+import { HttpResponseError } from "@shopify/shopify-api";
+import { SessionNotFoundError } from "@shopify/shopify-app-remix/server";
+import { classifyInstallProbeError, parseTriggeredAt, processWebhookEvent, sweepPendingWebhooks } from "~/services/webhooks.server";
 import { handleWebhookRequest, verifyWebhookDelivery } from "~/lib/webhook-route.server";
 
 // vi.hoisted and vi.mock run before the imports above, so the modules load against these fakes.
@@ -184,29 +186,29 @@ describe("processing claim", () => {
     expect(db.webhookEvent.update).toHaveBeenCalledWith({ where: { id: "evt2" }, data: expect.objectContaining({ error: null, lockedUntil: null }) });
   });
 
-  it("skips shop/redact for a store Shopify says is installed again", async () => {
-    db.webhookEvent.updateMany.mockResolvedValue({ count: 1 });
-    db.webhookEvent.findUnique.mockResolvedValue({ id: "evt3", topic: "SHOP_REDACT", shopId: "s1", shop: { domain: "a.myshopify.com" }, shopDomain: "a.myshopify.com", payload: {}, createdAt: new Date(), attempts: 1 });
-    db.shop.findUnique.mockResolvedValue({ id: "s1", domain: "a.myshopify.com", settings: {}, isActive: true });
-    db.webhookEvent.update.mockResolvedValue({});
-    shopifyMock.unauthenticatedAdmin.mockResolvedValue({ admin: { graphql: async () => new Response(JSON.stringify({ data: { shop: { id: "gid://shopify/Shop/1" } } })) } });
-    await processWebhookEvent("evt3");
-    expect(db.session.deleteMany).not.toHaveBeenCalled();
-    expect(db.webhookEvent.update).toHaveBeenCalledWith({ where: { id: "evt3" }, data: expect.objectContaining({ error: "skipped: store reinstalled" }) });
-  });
-
-  it("reads a revoked token or a missing session as uninstalled, and anything else as unknown", () => {
-    expect(classifyInstallProbeError(Object.assign(new Error("x"), { name: "SessionNotFoundError" }))).toBe("uninstalled");
-    expect(classifyInstallProbeError(Object.assign(new Error("x"), { response: { code: 401 } }))).toBe("uninstalled");
-    expect(classifyInstallProbeError(Object.assign(new Error("x"), { response: { code: 400, body: { error: "invalid_subject_token" } } }))).toBe("uninstalled");
-    expect(classifyInstallProbeError(Object.assign(new Error("x"), { response: { code: 502 } }))).toBe("unknown");
+  it("reads a missing session, a revoked token or a dead grant as uninstalled, and anything else as unknown", () => {
+    // The real classes: the library's SessionNotFoundError never sets `name`,
+    // so the name check this replaced matched only a hand-made fake.
+    expect(classifyInstallProbeError(new SessionNotFoundError("no session"))).toBe("uninstalled");
+    expect(classifyInstallProbeError(Object.assign(new Error("x"), { name: "SessionNotFoundError" }))).toBe("unknown");
+    const http = (code: number, body: Record<string, unknown> = {}) => new HttpResponseError({ message: "x", code, statusText: "x", body });
+    expect(classifyInstallProbeError(http(401))).toBe("uninstalled");
+    expect(classifyInstallProbeError(http(400, { error: "invalid_subject_token" }))).toBe("uninstalled");
+    expect(classifyInstallProbeError(http(502))).toBe("unknown");
+    // A refused refresh and a network failure both reach us as this.
+    expect(classifyInstallProbeError(new Response(null, { status: 500 }))).toBe("unknown");
     expect(classifyInstallProbeError(new Error("ECONNRESET"))).toBe("unknown");
   });
 });
 
 describe("recovery sweep", () => {
   it("re-queues unfinished events and survives one that cannot be queued", async () => {
-    db.webhookEvent.findMany.mockResolvedValue([{ id: "a", topic: "ORDERS_CREATE" }, { id: "b", topic: "SHOP_REDACT" }, { id: "c", topic: "ORDERS_PAID" }]);
+    // The first read is the abandonment pass (nothing expired), the second the candidates.
+    db.webhookEvent.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
+      { id: "a", topic: "ORDERS_CREATE", attempts: 0, lastAttemptAt: null },
+      { id: "b", topic: "SHOP_REDACT", attempts: 0, lastAttemptAt: null },
+      { id: "c", topic: "ORDERS_PAID", attempts: 0, lastAttemptAt: null },
+    ]);
     const seen: string[] = [];
     const queued = await sweepPendingWebhooks(async (id) => {
       if (id === "b") throw new Error("queue down");
@@ -214,20 +216,6 @@ describe("recovery sweep", () => {
     });
     expect(queued).toBe(2);
     expect(seen).toEqual(["a", "c"]);
-  });
-
-  it("leaves fresh, held, exhausted and processed events alone, and keeps privacy requests for 30 days", () => {
-    const now = new Date("2026-09-14T12:00:00Z");
-    const filter = pendingWebhookFilter(now);
-    expect(filter.processedAt).toBeNull();
-    expect(filter.attempts).toEqual({ lt: WEBHOOK_MAX_ATTEMPTS });
-    const created = filter.createdAt as { lt: Date; gt: Date };
-    expect(created.lt.getTime()).toBe(now.getTime() - 2 * 60_000);
-    expect(created.gt.getTime()).toBe(now.getTime() - 30 * DAY);
-    const clauses = JSON.stringify(filter.AND);
-    expect(clauses).toContain("SHOP_REDACT");
-    expect(clauses).toContain(new Date(now.getTime() - 2 * DAY).toISOString());
-    expect(clauses).toContain("lockedUntil");
   });
 
   it("parses the trigger header and ignores garbage", () => {

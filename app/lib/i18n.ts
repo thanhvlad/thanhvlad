@@ -692,7 +692,7 @@ const coreEn = {
   "suppliers.labelPlaceholder": "Main CJ account",
   "suppliers.lastUsed": "last used",
   "suppliers.makeDefault": "Make default",
-  "suppliers.mockMode.body": "SUPPLIER_DRIVER=mock: every platform is served by the built-in sample catalog, orders complete automatically and tracking is generated. Set SUPPLIER_DRIVER=live plus the platform API keys to go live.",
+  "suppliers.mockMode.body": "Supplier accounts are not connected on this app yet, so supplier searches show sample products and nothing is ordered from a supplier automatically. To order from AliExpress, use the Chrome extension. The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.",
   "suppliers.mockMode.title": "Demo supplier mode",
   "suppliers.needsApiKeys": "Needs API keys",
   "suppliers.neverUsed": "never used",
@@ -858,7 +858,6 @@ const coreEn = {
   "settings.fulfillmentService.how.step2After": "the request with the reason, so the merchant sees it in Shopify instead of silence.",
   "settings.fulfillmentService.how.step2Before": "The app re-checks the order: address validity, mapping, stock and payment. If a variant is not mapped it",
   "settings.fulfillmentService.how.step2Rejects": "rejects",
-  "settings.fulfillmentService.how.step3": "Otherwise it accepts, places the supplier order, and the order moves to Awaiting payment.",
   "settings.fulfillmentService.how.step4After": "; tracking is pushed back to Shopify automatically once the supplier ships.",
   "settings.fulfillmentService.how.step4Before": "You pay on the supplier site from",
   "settings.fulfillmentService.how.step5": "A cancellation request is accepted automatically while nothing has shipped yet.",
@@ -1714,7 +1713,7 @@ const coreVi: Partial<Record<keyof typeof coreEn, string>> = {
   "suppliers.labelPlaceholder": "Tài khoản CJ chính",
   "suppliers.lastUsed": "dùng lần cuối",
   "suppliers.makeDefault": "Đặt mặc định",
-  "suppliers.mockMode.body": "SUPPLIER_DRIVER=mock: mọi nền tảng đều dùng catalog mẫu có sẵn, đơn hàng tự hoàn tất và mã vận đơn được tạo tự động. Đặt SUPPLIER_DRIVER=live kèm API key của nền tảng để chạy thật.",
+  "suppliers.mockMode.body": "Ứng dụng chưa kết nối tài khoản nhà cung cấp, nên tìm hàng chỉ hiện sản phẩm mẫu và không có đơn nào được tự động đặt với nhà cung cấp. Để đặt hàng trên AliExpress, hãy dùng tiện ích Chrome. Tiện ích liệt kê các đơn đang chờ đặt và mở từng sản phẩm trên AliExpress. Bạn tự đặt và thanh toán đơn ở đó, rồi ghi mã đơn AliExpress vào tiện ích; mã vận đơn bạn thêm trong tiện ích sẽ được gửi sang Shopify.",
   "suppliers.mockMode.title": "Chế độ nhà cung cấp giả lập",
   "suppliers.needsApiKeys": "Cần API key",
   "suppliers.neverUsed": "chưa dùng lần nào",
@@ -1880,7 +1879,6 @@ const coreVi: Partial<Record<keyof typeof coreEn, string>> = {
   "settings.fulfillmentService.how.step2After": "yêu cầu kèm lý do, để bạn thấy ngay trong Shopify thay vì im lặng.",
   "settings.fulfillmentService.how.step2Before": "Ứng dụng kiểm tra lại đơn hàng: địa chỉ, mapping, tồn kho và thanh toán. Nếu một biến thể chưa được map, ứng dụng sẽ",
   "settings.fulfillmentService.how.step2Rejects": "từ chối",
-  "settings.fulfillmentService.how.step3": "Nếu ổn, ứng dụng chấp nhận, đặt đơn với nhà cung cấp và đơn chuyển sang Chờ thanh toán.",
   "settings.fulfillmentService.how.step4After": "; mã vận đơn sẽ tự động đẩy về Shopify khi nhà cung cấp giao hàng.",
   "settings.fulfillmentService.how.step4Before": "Bạn thanh toán trên trang nhà cung cấp từ mục",
   "settings.fulfillmentService.how.step5": "Yêu cầu huỷ được chấp nhận tự động khi hàng chưa được gửi đi.",
@@ -2066,11 +2064,11 @@ const coreVi: Partial<Record<keyof typeof coreEn, string>> = {
 // The core dictionaries above plus one module per screen group. Spreading
 // `as const` objects keeps every key literal, so I18nKey still covers all of
 // them and a typo in a call site is still a compile error.
-const en = { ...coreEn, ...M.dashboard.en, ...M.search.en, ...M.import.en, ...M.products.en, ...M.orders.en, ...M.payments.en, ...M.tracking.en, ...M.suppliers.en, ...M.pricing.en, ...M.shipping.en, ...M.inventory.en, ...M.reports.en, ...M.notifications.en, ...M.logs.en, ...M.settings.en, ...M.shared.en } as const;
+const en = { ...coreEn, ...M.dashboard.en, ...M.search.en, ...M.import.en, ...M.products.en, ...M.orders.en, ...M.payments.en, ...M.tracking.en, ...M.suppliers.en, ...M.pricing.en, ...M.shipping.en, ...M.inventory.en, ...M.reports.en, ...M.notifications.en, ...M.logs.en, ...M.settings.en, ...M.shared.en, ...M.billing.en } as const;
 
 export type I18nKey = keyof typeof en;
 
-const vi: Partial<Record<I18nKey, string>> = { ...coreVi, ...M.dashboard.vi, ...M.search.vi, ...M.import.vi, ...M.products.vi, ...M.orders.vi, ...M.payments.vi, ...M.tracking.vi, ...M.suppliers.vi, ...M.pricing.vi, ...M.shipping.vi, ...M.inventory.vi, ...M.reports.vi, ...M.notifications.vi, ...M.logs.vi, ...M.settings.vi, ...M.shared.vi };
+const vi: Partial<Record<I18nKey, string>> = { ...coreVi, ...M.dashboard.vi, ...M.search.vi, ...M.import.vi, ...M.products.vi, ...M.orders.vi, ...M.payments.vi, ...M.tracking.vi, ...M.suppliers.vi, ...M.pricing.vi, ...M.shipping.vi, ...M.inventory.vi, ...M.reports.vi, ...M.notifications.vi, ...M.logs.vi, ...M.settings.vi, ...M.shared.vi, ...M.billing.vi };
 
 const dictionaries: Record<Locale, Partial<Record<I18nKey, string>>> = { en, vi };
 
