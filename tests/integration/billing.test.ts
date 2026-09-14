@@ -153,4 +153,35 @@ describe.skipIf(!TEST_DB)("billing and plan limits (postgres)", () => {
     const actions = (await listActivity(shop.id, { limit: 50 })).map((a) => a.action);
     expect(actions.filter((a) => a === "billing.plan_changed").length).toBeGreaterThanOrEqual(3);
   });
+  it("drops the plan when the paying store uninstalls, and a reinstall does not bring it back", async () => {
+    const { syncSubscription, getAccountBilling } = await import("~/services/billing.server");
+    const { markShopUninstalled } = await import("~/services/shop.server");
+    const live = fakeBilling([
+      { id: "gid://shopify/AppSubscription/3", name: "Pro", status: "ACTIVE", test: true, trialDays: 14, currentPeriodEnd: "2026-10-08T00:00:00Z", createdAt: "2026-09-08T00:00:00Z" },
+    ]);
+    expect(await syncSubscription(shop, live.api)).toBe("PRO");
+    expect((await prisma.shop.findUniqueOrThrow({ where: { id: shop.id } })).trialStartedAt?.toISOString()).toBe("2026-09-08T00:00:00.000Z");
+
+    // Shopify cancels the subscription on uninstall; the sister store must not keep it.
+    expect(await markShopUninstalled(shop.domain)).toBe(true);
+    expect((await getAccountBilling(sister)).plan).toBe("FREE");
+
+    // Reinstalled: Shopify reports nothing until a new charge is approved.
+    await prisma.shop.update({ where: { id: shop.id }, data: { isActive: true, uninstalledAt: null } });
+    expect(await syncSubscription(shop, fakeBilling([]).api)).toBe("FREE");
+    // The trial start survives, so the next subscription gets no fresh trial.
+    expect((await prisma.shop.findUniqueOrThrow({ where: { id: shop.id } })).trialStartedAt).not.toBeNull();
+  });
+
+  it("stops a sister store deferring to a paying store that is gone", async () => {
+    const { syncSubscription } = await import("~/services/billing.server");
+    const live = fakeBilling([
+      { id: "gid://shopify/AppSubscription/4", name: "Advanced", status: "ACTIVE", test: true, trialDays: 0, currentPeriodEnd: "2026-10-08T00:00:00Z", createdAt: "2026-09-10T00:00:00Z" },
+    ]);
+    expect(await syncSubscription(shop, live.api)).toBe("ADVANCED");
+    // The payer's uninstall was never processed, but the row says it is gone.
+    await prisma.shop.update({ where: { id: shop.id }, data: { isActive: false } });
+    expect(await syncSubscription(sister, fakeBilling([]).api)).toBe("FREE");
+    await prisma.shop.update({ where: { id: shop.id }, data: { isActive: true } });
+  });
 });

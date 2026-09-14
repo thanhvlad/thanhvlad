@@ -1,7 +1,7 @@
 import { env } from "~/lib/env.server";
 import { logger } from "~/lib/logger.server";
 import { registerAllHandlers } from "./handlers.server";
-import { ensureSchedules, shutdownQueue, startInlineSchedules, startWorker } from "./queue.server";
+import { ensureSchedules, shutdownQueue, startInlineSchedules, startWebhookRecovery, startWorker } from "./queue.server";
 
 declare global {
   // eslint-disable-next-line no-var
@@ -25,6 +25,9 @@ export function bootJobs(options: { worker?: boolean } = {}) {
     // thing a merchant notices is tracking numbers that never reach Shopify.
     if (startWorker()) void ensureSchedules();
     else startInlineSchedules();
+    // Whichever process does the work also recovers the webhooks a restart or
+    // a failed job left unfinished; see startWebhookRecovery.
+    startWebhookRecovery();
     // The standalone worker installs its own handlers; the web process needs
     // them too when it consumes the queue, or a deploy kills jobs mid-flight
     // and BullMQ has to wait for the stall timeout before retrying them.

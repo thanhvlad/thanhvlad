@@ -72,6 +72,11 @@ model Account {
   billingShopId      String?
   trialEndsAt        DateTime?
   planChangedAt      DateTime?
+  /// Single-use invite an owner creates to bring another store into this
+  /// account. It replaced sharing the raw account id, which let any store that
+  /// learned the id join and inherit a plan it never paid for.
+  joinCode           String?   @unique
+  joinCodeExpiresAt  DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -104,6 +109,17 @@ model Shop {
   installedAt   DateTime  @default(now())
   uninstalledAt DateTime?
   isActive      Boolean   @default(true)
+  /// Last successful token exchange (afterAuth). Shopify refuses a token
+  /// exchange for an app that is not installed, so an auth later than an
+  /// app/uninstalled event's trigger time proves the store reinstalled since.
+  lastAuthAt    DateTime?
+  /// When this store's webhook subscriptions were last verified, so afterAuth
+  /// does not re-register fifteen topics every time a staff token expires.
+  webhooksCheckedAt DateTime?
+  /// When this store first began a free trial. Never cleared, not even by an
+  /// uninstall: the Billing API grants a fresh trial to every new subscription,
+  /// so without it each plan switch or reinstall restarted the trial.
+  trialStartedAt DateTime?
   /// Partner development stores cannot be charged; billing runs in test mode there.
   isDevelopmentStore Boolean @default(false)
   onboardingStep String   @default("connect_supplier")
@@ -1036,16 +1052,32 @@ model Notification {
 model WebhookEvent {
   id        String   @id @default(cuid())
   shopId    String?
+  /// The delivering store, kept even when no Shop row existed yet, so a retry
+  /// can still find the store once the install has created it.
+  shopDomain String?
   topic     String
   webhookId String   @unique
+  /// X-Shopify-Event-Id: shared by every delivery of one event, including the
+  /// copies a second subscription to the same topic produces.
+  eventId   String?
+  /// X-Shopify-Triggered-At, used to tell a late app/uninstalled from a reinstall.
+  triggeredAt DateTime?
   payload   Json     @default("{}")
   processedAt DateTime?
   error     String?
+  /// Processing attempts so far; the recovery sweep stops retrying at a cap.
+  attempts  Int      @default(0)
+  lastAttemptAt DateTime?
+  /// Lease held while one process works on the event, so the sweep and an
+  /// inline retry never run it twice at once.
+  lockedUntil DateTime?
   createdAt DateTime @default(now())
 
   shop Shop? @relation(fields: [shopId], references: [id], onDelete: Cascade)
 
+  @@unique([shopDomain, topic, eventId])
   @@index([topic, createdAt])
+  @@index([processedAt, createdAt])
 }
 
 model CurrencyRate {

@@ -18,6 +18,7 @@ import { env } from "~/lib/env.server";
 import type { I18nVars } from "~/lib/i18n";
 import { logger } from "~/lib/logger.server";
 import { logActivity } from "./activity.server";
+import { gql, type GraphqlClient } from "./shopify/graphql.server";
 
 /**
  * Plans, subscriptions and limits.
@@ -29,20 +30,98 @@ import { logActivity } from "./activity.server";
  * so a sister store never downgrades the account because Shopify, quite
  * correctly, reports no subscription for it.
  *
- * Three things keep the stored plan honest: the plan page reconciles against
- * `billing.check()` whenever it is opened, the `app_subscriptions/update`
- * webhook applies status changes as they happen, and the free tier is the
- * answer whenever neither has anything better to say.
+ * Several things keep the stored plan honest: the plan page reconciles against
+ * `billing.check()` whenever it is opened, every token exchange reconciles it
+ * again in the background (so at least daily per active staff member), the
+ * `app_subscriptions/update` webhook applies status changes as they happen, an
+ * uninstall drops the plan because Shopify cancels the subscription, and the
+ * free tier is the answer whenever none of them has anything better to say.
  */
+
+type AppSubscriptionSummary = { id: string; name: string; status: string; test: boolean; trialDays: number; currentPeriodEnd: string; createdAt: string };
 
 /** The subset of `authenticate.admin()`'s billing context this module needs. */
 export interface BillingApi {
   check: (options: { isTest?: boolean }) => Promise<{
     hasActivePayment: boolean;
-    appSubscriptions: Array<{ id: string; name: string; status: string; test: boolean; trialDays: number; currentPeriodEnd: string; createdAt: string }>;
+    appSubscriptions: AppSubscriptionSummary[];
   }>;
-  request: (options: { plan: string; isTest?: boolean; returnUrl?: string }) => Promise<never>;
+  request: (options: { plan: string; isTest?: boolean; returnUrl?: string; trialDays?: number }) => Promise<never>;
   cancel: (options: { subscriptionId: string; isTest?: boolean; prorate?: boolean }) => Promise<unknown>;
+}
+
+const ACTIVE_SUBSCRIPTIONS = `#graphql
+  query DropshipActiveSubscriptions {
+    currentAppInstallation {
+      activeSubscriptions { id name status test trialDays currentPeriodEnd createdAt }
+    }
+  }
+`;
+
+/**
+ * `billing.check()` for code that has no request: afterAuth receives no billing
+ * context, and it must reconcile with the offline token rather than a staff
+ * member's. Mirrors the library's filter, where test charges only count when
+ * test mode is on.
+ */
+export function offlineBillingCheck(client: GraphqlClient): Pick<BillingApi, "check"> {
+  return {
+    check: async ({ isTest = true }) => {
+      const data = await gql<{ currentAppInstallation: { activeSubscriptions: AppSubscriptionSummary[] } }>(client, ACTIVE_SUBSCRIPTIONS);
+      const appSubscriptions = data.currentAppInstallation.activeSubscriptions.filter((s) => isTest || !s.test);
+      return { hasActivePayment: appSubscriptions.length > 0, appSubscriptions };
+    },
+  };
+}
+
+/**
+ * Where Shopify sends the merchant after approving a charge.
+ *
+ * Built from the API key, the same way the library builds its own default.
+ * The app handle was hardcoded here, and the handle of the app actually
+ * deployed was never confirmed: a mismatch lands a merchant who has just paid
+ * on Shopify's "app not found" page.
+ */
+export function billingReturnUrl(shopDomain: string, apiKey: string): string {
+  const store = shopDomain.replace(/\.myshopify\.com$/, "");
+  return `https://admin.shopify.com/store/${store}/apps/${apiKey}/app/settings/plan?billing=return`;
+}
+
+const DAY_MS = 86_400_000;
+
+/**
+ * Trial days a store still has for a new subscription.
+ *
+ * The Billing API grants the configured trial to every new subscription, so a
+ * plan switch or an uninstall and reinstall used to restart a full 14 days. The
+ * trial is instead counted from the first one the store ever began.
+ */
+export function remainingTrialDays(planTrialDays: number, trialStartedAt: Date | string | null | undefined, now: Date = new Date()): number {
+  if (planTrialDays <= 0) return 0;
+  if (!trialStartedAt) return planTrialDays;
+  const started = new Date(trialStartedAt).getTime();
+  if (Number.isNaN(started)) return planTrialDays;
+  const used = Math.max(0, Math.floor((now.getTime() - started) / DAY_MS));
+  return Math.max(0, planTrialDays - used);
+}
+
+/** Remember the earliest trial start for a store. Never moves later, never clears. */
+async function recordTrialStart(shopId: string, startedAt: Date) {
+  if (Number.isNaN(startedAt.getTime())) return;
+  await prisma.shop.updateMany({
+    where: { id: shopId, OR: [{ trialStartedAt: null }, { trialStartedAt: { gt: startedAt } }] },
+    data: { trialStartedAt: startedAt },
+  });
+}
+
+/**
+ * Whether this store is the one paying for the account's plan. Such a store
+ * cannot leave or join another account without stranding the subscription:
+ * its sister stores would keep a plan nobody pays for.
+ */
+export function paysForAccountPlan(account: Pick<Account, "plan" | "subscriptionId" | "billingShopId">, shopId: string): boolean {
+  if (account.plan === "FREE" && !account.subscriptionId) return false;
+  return account.billingShopId === shopId;
 }
 
 interface ShopRef {
@@ -157,12 +236,17 @@ export async function getAccountBilling(shop: ShopRef): Promise<AccountBilling> 
  * and reading that as "cancelled" would strip the whole account every time a
  * sister store opened the page.
  */
-export async function syncSubscription(shop: ShopRef, billing: BillingApi): Promise<PlanId> {
+export async function syncSubscription(shop: ShopRef, billing: Pick<BillingApi, "check">): Promise<PlanId> {
   if (!shop.accountId) return "FREE";
   const account = await prisma.account.findUnique({ where: { id: shop.accountId } });
   if (!account) return "FREE";
   if (account.billingShopId && account.billingShopId !== shop.id && account.subscriptionId) {
-    return isPlanId(account.plan) ? account.plan : "FREE";
+    // Only while the paying store is still installed. Shopify cancels its
+    // subscription on uninstall, and a sister store deferring to a store that
+    // is gone kept a paid plan forever. Otherwise this store's own answer
+    // decides, like any store with no billing store to defer to.
+    const payer = await prisma.shop.findUnique({ where: { id: account.billingShopId }, select: { isActive: true } });
+    if (payer?.isActive) return isPlanId(account.plan) ? account.plan : "FREE";
   }
 
   const result = await billing.check({ isTest: billingIsTest(shop) });
@@ -178,7 +262,8 @@ export async function syncSubscription(shop: ShopRef, billing: BillingApi): Prom
   }
 
   const plan = entitledPlan(live);
-  const trialEndsAt = live.trialDays > 0 ? new Date(new Date(live.createdAt).getTime() + live.trialDays * 86_400_000) : null;
+  if (live.trialDays > 0) await recordTrialStart(shop.id, new Date(live.createdAt));
+  const trialEndsAt = live.trialDays > 0 ? new Date(new Date(live.createdAt).getTime() + live.trialDays * DAY_MS) : null;
   await setAccountPlan(account, plan, {
     subscription: { id: live.id, name: live.name, status: live.status, renewsAt: live.currentPeriodEnd ? new Date(live.currentPeriodEnd) : null, trialEndsAt },
     billingShopId: shop.id,
@@ -212,12 +297,44 @@ export async function applySubscriptionWebhook(shop: ShopRef, payload: Record<st
     return;
   }
 
+  if (plan !== "FREE") {
+    // Every paid plan offers a trial, so an approved subscription is the moment
+    // this store's trial began, if it had not already.
+    const created = typeof sub.created_at === "string" ? new Date(sub.created_at) : new Date();
+    await recordTrialStart(shop.id, Number.isNaN(created.getTime()) ? new Date() : created);
+  }
+
   await setAccountPlan(account, plan, {
     subscription: plan === "FREE" ? null : { id, name, status, renewsAt: account.planRenewsAt, trialEndsAt: account.trialEndsAt },
     billingShopId: plan === "FREE" ? null : shop.id,
     shopId: shop.id,
     reason: `webhook ${status ?? "?"} for ${name ?? id}`,
   });
+}
+
+/**
+ * The store is gone: drop the plan it was paying for.
+ *
+ * Shopify cancels an app's subscriptions on uninstall, and whether an
+ * app_subscriptions/update is still delivered afterwards cannot be relied on.
+ * The account used to keep its paid plan through the uninstall, so a reinstall
+ * within the retention window came back to paid limits with no charge, and its
+ * sister stores kept them indefinitely. A store that was not paying changes
+ * nothing, except when the account holds a plan with no recorded payer and no
+ * other installed store — an older row from before the payer was tracked.
+ */
+export async function releasePlanOnUninstall(shop: ShopRef): Promise<boolean> {
+  if (!shop.accountId) return false;
+  const account = await prisma.account.findUnique({ where: { id: shop.accountId } });
+  if (!account || (account.plan === "FREE" && !account.subscriptionId)) return false;
+  let release = account.billingShopId === shop.id;
+  if (!account.billingShopId) {
+    const others = await prisma.shop.count({ where: { accountId: account.id, isActive: true, id: { not: shop.id } } });
+    release = others === 0;
+  }
+  if (!release) return false;
+  await setAccountPlan(account, "FREE", { subscription: null, billingShopId: null, shopId: shop.id, reason: "store uninstalled; Shopify cancelled the subscription" });
+  return true;
 }
 
 /** Cancel the account's subscription with Shopify and drop to the free tier. */

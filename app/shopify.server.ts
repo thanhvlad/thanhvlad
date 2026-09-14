@@ -7,7 +7,7 @@ import {
   DeliveryMethod,
   shopifyApp,
 } from "@shopify/shopify-app-remix/server";
-import type { BillingConfig } from "@shopify/shopify-api";
+import type { BillingConfig, Session } from "@shopify/shopify-api";
 import { PrismaSessionStorage } from "@shopify/shopify-app-session-storage-prisma";
 import prisma from "./db.server";
 import { PAID_PLANS, PLANS } from "./domain/billing/plans";
@@ -15,7 +15,8 @@ import { env } from "./lib/env.server";
 import { logger } from "./lib/logger.server";
 import { ensureWebhooks } from "./services/shopify/webhooks.server";
 import type { GraphqlClient } from "./services/shopify/graphql.server";
-import { onShopInstalled } from "./services/shop.server";
+import { offlineBillingCheck, syncSubscription } from "./services/billing.server";
+import { markWebhooksChecked, onShopInstalled } from "./services/shop.server";
 
 const config = env();
 
@@ -78,31 +79,68 @@ const shopify = shopifyApp({
     FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE: { deliveryMethod: DeliveryMethod.Http, callbackUrl: "/webhooks/fulfillment-orders" },
   },
   hooks: {
-    afterAuth: async ({ session, admin }) => {
-      // Subscriptions are declared in shopify.app.toml and created by the CLI on
-      // deploy. registerWebhooks() discovers existing subscriptions with the
-      // `webhookSubscriptions` query, which returns only shop-scoped ones, so
-      // calling it here cannot see the app-scoped subscriptions and creates a
-      // second subscription per topic - every event then arrives twice.
+    afterAuth: async ({ session }) => {
+      const authenticatedAt = new Date();
+      // afterAuth is handed the online session of whichever staff member
+      // opened the app (useOnlineTokens), and that token carries only their
+      // permissions: webhook registration and the store profile ran with it,
+      // and a staff member without Orders access left the store with no order
+      // webhooks. Everything here uses the store's offline token instead,
+      // which token exchange stored just before this hook runs.
       //
       // Install work is best-effort: an uncaught throw here becomes a bodyless
       // 500 inside the merchant's iframe on their very first open.
+      let offline: Awaited<ReturnType<typeof shopify.unauthenticated.admin>>;
       try {
-        await onShopInstalled({ session, admin });
+        offline = await shopify.unauthenticated.admin(session.shop);
+      } catch (error) {
+        logger.error("afterAuth could not load the offline session", { shop: session.shop, error });
+        return;
+      }
+      const graphql = offline.admin.graphql as unknown as GraphqlClient;
+
+      let installed: Awaited<ReturnType<typeof onShopInstalled>> | null = null;
+      try {
+        installed = await onShopInstalled({ session: offline.session, graphql, authenticatedAt });
       } catch (error) {
         logger.error("onShopInstalled failed", { shop: session.shop, error });
       }
-      // See ensureWebhooks for why this exists despite the comment above: the
-      // toml was never deployed, so a new store has no subscriptions at all.
-      try {
-        await ensureWebhooks(session, admin.graphql as unknown as GraphqlClient, (options) => shopify.registerWebhooks(options));
-      } catch (error) {
-        logger.error("ensureWebhooks failed", { shop: session.shop, error });
-      }
+
+      // Not awaited. Neither is needed to draw the first screen, and together
+      // they are up to sixteen Admin API calls the merchant used to wait for on
+      // every token exchange. Both are idempotent and re-run on the next one.
+      void afterAuthBackground(offline.session, graphql, installed);
     },
   },
   ...(config.SHOP_CUSTOM_DOMAIN ? { customShopDomains: [config.SHOP_CUSTOM_DOMAIN] } : {}),
 });
+
+/**
+ * The slow half of afterAuth.
+ *
+ * Billing: reconciling here, not only on the Plan page, is what stops a paid
+ * plan surviving an uninstall whose webhook was lost, or a reinstall.
+ *
+ * Webhooks: subscriptions are declared in shopify.app.toml, but that config was
+ * never deployed, so each store registers its own (see ensureWebhooks). The
+ * check is skipped while a recent one succeeded, and forced after a reinstall.
+ */
+async function afterAuthBackground(session: Session, graphql: GraphqlClient, installed: Awaited<ReturnType<typeof onShopInstalled>> | null) {
+  if (installed) {
+    try {
+      await syncSubscription(installed.shop, offlineBillingCheck(graphql));
+    } catch (error) {
+      logger.warn("Billing reconcile after auth failed", { shop: session.shop, error });
+    }
+  }
+  if (installed && !installed.webhooksDue) return;
+  try {
+    const { failed } = await ensureWebhooks(session, graphql, (options) => shopify.registerWebhooks(options));
+    if (failed.length === 0) await markWebhooksChecked(session.shop);
+  } catch (error) {
+    logger.error("ensureWebhooks failed", { shop: session.shop, error });
+  }
+}
 
 export default shopify;
 export const apiVersion = ApiVersion.July26;

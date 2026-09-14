@@ -39,9 +39,9 @@ describe.skipIf(!TEST_DB)("install (postgres + fake Shopify)", () => {
 
   it("records the store profile, flags a development store and queues a 30-day order backfill", async () => {
     const { onShopInstalled } = await import("~/services/shop.server");
-    const session = { shop: domain } as unknown as Parameters<typeof onShopInstalled>[0]["session"];
-    const admin = { graphql: fake.client } as unknown as Parameters<typeof onShopInstalled>[0]["admin"];
-    await onShopInstalled({ session, admin });
+    const session = { shop: domain };
+    const graphql = fake.client as unknown as Parameters<typeof onShopInstalled>[0]["graphql"];
+    await onShopInstalled({ session, graphql });
 
     const shop = await prisma.shop.findUniqueOrThrow({ where: { domain } });
     shopId = shop.id;
@@ -56,7 +56,7 @@ describe.skipIf(!TEST_DB)("install (postgres + fake Shopify)", () => {
     expect(runs[0].payload).toMatchObject({ days: 30, reason: "install" });
 
     // A second auth (token refresh, reinstall) must not queue a second sync.
-    await onShopInstalled({ session, admin });
+    await onShopInstalled({ session, graphql });
     expect(await prisma.jobRun.count({ where: { shopId: shop.id, type: "sync-orders" } })).toBe(1);
   });
 
@@ -89,9 +89,27 @@ describe.skipIf(!TEST_DB)("install (postgres + fake Shopify)", () => {
       shippingAddress: null,
       lineItems: [],
     });
-    const session = { shop: domain } as unknown as Parameters<typeof onShopInstalled>[0]["session"];
-    const admin = { graphql: fake.client } as unknown as Parameters<typeof onShopInstalled>[0]["admin"];
-    await onShopInstalled({ session, admin });
+    const session = { shop: domain };
+    const graphql = fake.client as unknown as Parameters<typeof onShopInstalled>[0]["graphql"];
+    await onShopInstalled({ session, graphql });
     expect(await prisma.jobRun.count({ where: { shopId, type: "sync-orders" } })).toBe(0);
+  });
+  it("treats an auth after a recorded uninstall as a reinstall and forces a webhook check", async () => {
+    const { onShopInstalled, markShopUninstalled, markWebhooksChecked } = await import("~/services/shop.server");
+    const session = { shop: domain };
+    const graphql = fake.client as unknown as Parameters<typeof onShopInstalled>[0]["graphql"];
+    await markWebhooksChecked(domain);
+    expect((await onShopInstalled({ session, graphql })).webhooksDue).toBe(false);
+
+    // The auth above happened well before this uninstall was triggered.
+    expect(await markShopUninstalled(domain, { triggeredAt: new Date(Date.now() + 60_000) })).toBe(true);
+    const back = await onShopInstalled({ session, graphql });
+    expect(back.reinstalled).toBe(true);
+    expect(back.webhooksDue).toBe(true);
+    expect(back.shop.isActive).toBe(true);
+
+    // A copy of that uninstall arriving late must not switch the store off again.
+    expect(await markShopUninstalled(domain, { triggeredAt: new Date(Date.now() - 10 * 60_000) })).toBe(false);
+    expect((await prisma.shop.findUniqueOrThrow({ where: { domain } })).isActive).toBe(true);
   });
 });

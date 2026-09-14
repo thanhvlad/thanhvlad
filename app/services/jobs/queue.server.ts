@@ -23,6 +23,8 @@ declare global {
   var __dropshipJobHandlers: Map<JobName, JobHandler<JobName>> | undefined;
   // eslint-disable-next-line no-var
   var __dropshipInlineTimers: NodeJS.Timeout[] | undefined;
+  // eslint-disable-next-line no-var
+  var __dropshipWebhookSweep: NodeJS.Timeout[] | undefined;
 }
 
 // On globalThis, like the Prisma client: Vite re-evaluates server modules on
@@ -243,6 +245,51 @@ export function startInlineSchedules(): boolean {
   return true;
 }
 
+/** How often stored-but-unfinished webhooks are handed back to the queue. */
+const WEBHOOK_SWEEP_EVERY_MS = 5 * 60_000;
+/** The first sweep waits for the process to finish booting and take traffic. */
+const WEBHOOK_SWEEP_BOOT_DELAY_MS = 30_000;
+
+/**
+ * Start the webhook recovery sweep in this process: once shortly after boot,
+ * then on a timer.
+ *
+ * It runs in both queue modes. Without Redis it is the only thing that
+ * recovers a webhook whose in-memory job died with the process; with Redis it
+ * recovers events whose job exhausted its attempts, or that were stored while
+ * Redis was unreachable. Plain timers rather than a BullMQ scheduler, so it
+ * needs no job type of its own; a second process sweeping at the same time is
+ * harmless, because each event is claimed before it is processed.
+ */
+export function startWebhookRecovery(): boolean {
+  if (globalThis.__dropshipWebhookSweep) return false;
+  const run = () => {
+    void runWebhookSweep().catch((error) => logger.error("Webhook recovery sweep failed", { error }));
+  };
+  const boot = setTimeout(run, WEBHOOK_SWEEP_BOOT_DELAY_MS);
+  const timer = setInterval(run, WEBHOOK_SWEEP_EVERY_MS);
+  boot.unref?.();
+  timer.unref?.();
+  globalThis.__dropshipWebhookSweep = [boot, timer];
+  return true;
+}
+
+/** One sweep. The service is loaded lazily: it imports every handler, which import the queue. */
+export async function runWebhookSweep(): Promise<number> {
+  const { sweepPendingWebhooks } = await import("../webhooks.server");
+  return sweepPendingWebhooks((webhookEventId) =>
+    // Its own key and a window just under the sweep interval: the original
+    // enqueue's day-long key must not swallow the retry, and two sweeps in a row
+    // must not queue the same event twice.
+    enqueue("process-webhook", { webhookEventId }, { dedupeKey: `webhook-sweep-${webhookEventId}`, dedupeWindowMs: Math.floor(WEBHOOK_SWEEP_EVERY_MS * 0.9) }),
+  );
+}
+
+export function stopWebhookRecovery() {
+  for (const timer of globalThis.__dropshipWebhookSweep ?? []) clearTimeout(timer);
+  globalThis.__dropshipWebhookSweep = undefined;
+}
+
 export function stopInlineSchedules() {
   for (const timer of globalThis.__dropshipInlineTimers ?? []) clearInterval(timer);
   globalThis.__dropshipInlineTimers = undefined;
@@ -250,6 +297,7 @@ export function stopInlineSchedules() {
 
 export async function shutdownQueue() {
   stopInlineSchedules();
+  stopWebhookRecovery();
   await worker?.close();
   await queue?.close();
   connection?.disconnect();

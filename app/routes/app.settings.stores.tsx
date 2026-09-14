@@ -9,26 +9,38 @@ import { useSettingsPageAction } from "~/components/settings-page-action";
 import prisma from "~/db.server";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { actionFailure } from "~/lib/errors";
-import { useErrorMessage, useMessage, useT } from "~/lib/use-t";
-import { logActivity } from "~/services/activity.server";
-import { assertWithinPlan } from "~/services/billing.server";
-import { listAccountShops } from "~/services/shop.server";
+import { formatDate } from "~/lib/format";
+import type { I18nVars } from "~/lib/i18n";
+import * as billingStrings from "~/lib/i18n-modules/billing";
+import { useErrorMessage, useLocale, useMessage, useT } from "~/lib/use-t";
+import { createAccountInvite, joinAccountWithInvite, leaveAccount, listAccountShops } from "~/services/shop.server";
+
+type BillingKey = keyof typeof billingStrings.en;
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { shop } = await requireShop(request);
+  const { shop, role } = await requireShop(request);
   const account = shop.accountId ? await prisma.account.findUnique({ where: { id: shop.accountId } }) : null;
   const shops = await listAccountShops(shop.accountId);
+  const isOwner = role === "OWNER";
+  // The invite is shown to the owner only, and only while it still works. The
+  // raw account id used to be shown to everyone as a permanent join code.
+  const inviteLive = Boolean(account?.joinCode && account.joinCodeExpiresAt && account.joinCodeExpiresAt > new Date());
   return {
     current: shop.domain,
     account: account ? { id: account.id, name: account.name, plan: account.plan } : null,
     shops: shops.map((s) => ({ ...s, isCurrent: s.domain === shop.domain })),
-    joinCode: account?.id ?? "",
+    isOwner,
+    invite: isOwner && inviteLive ? { code: account!.joinCode!, expiresAt: account!.joinCodeExpiresAt!.toISOString() } : null,
   };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { shop } = await requireShop(request, { minRole: "ADMIN" });
+  const { shop, role } = await requireShop(request, { minRole: "ADMIN" });
   const { intent, get } = await readForm(request);
+  // Linking decides which plan a store runs on and who pays for it, so it is
+  // the owner's call on both sides: the owner of the account creates the code,
+  // and the owner of the joining store redeems it.
+  const ownerOnly = { ok: false as const, error: billingStrings.en["billing.stores.ownerOnly"], errorKey: "billing.stores.ownerOnly" };
   try {
     switch (intent) {
       case "rename": {
@@ -36,24 +48,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         await prisma.account.update({ where: { id: shop.accountId }, data: { name: get("name").trim() || shop.domain } });
         return { ok: true, messageKey: "msg.accountRenamed" };
       }
+      case "createInvite": {
+        if (role !== "OWNER") return ownerOnly;
+        if (!shop.accountId) return { ok: false, error: "No account" };
+        await createAccountInvite(shop.accountId);
+        return { ok: true, messageKey: "billing.stores.inviteCreated", message: billingStrings.en["billing.stores.inviteCreated"] };
+      }
       case "join": {
         // Move this store under another store's account (share suppliers, pricing rules are per-store).
-        const target = await prisma.account.findUnique({ where: { id: get("code").trim() } });
-        if (!target) return { ok: false, error: "No account found for that code." };
-        if (target.id !== shop.accountId) await assertWithinPlan({ accountId: target.id }, "stores", 1);
-        const previous = shop.accountId;
-        await prisma.shop.update({ where: { id: shop.id }, data: { accountId: target.id } });
-        if (previous && previous !== target.id) {
-          const remaining = await prisma.shop.count({ where: { accountId: previous } });
-          if (remaining === 0) await prisma.account.delete({ where: { id: previous } }).catch(() => undefined);
-        }
-        await logActivity(shop.id, { action: "shop.joined_account", message: `Store joined account "${target.name}".` });
+        if (role !== "OWNER") return ownerOnly;
+        const target = await joinAccountWithInvite(shop, get("code"));
         return { ok: true, messageKey: "msg.storeJoinedAccount", messageVars: { name: target.name } };
       }
       case "leave": {
-        const account = await prisma.account.create({ data: { name: shop.domain.replace(".myshopify.com", "") } });
-        await prisma.shop.update({ where: { id: shop.id }, data: { accountId: account.id } });
-        await logActivity(shop.id, { action: "shop.left_account", message: "Store moved to its own account." });
+        if (role !== "OWNER") return ownerOnly;
+        await leaveAccount(shop);
         return { ok: true, messageKey: "msg.storeNowOwnAccount" };
       }
       default:
@@ -64,13 +73,34 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 };
 
+/**
+ * Strings from the billing module. app/lib/i18n.ts spreads each module into the
+ * typed dictionary by hand and does not include this one yet, so until it does
+ * these are looked up here, with the same English fallback and placeholders.
+ */
+function useBillingT() {
+  const locale = useLocale();
+  const bt = (key: BillingKey, vars?: I18nVars) => {
+    const raw = (locale === "vi" ? billingStrings.vi[key] : undefined) ?? billingStrings.en[key];
+    return vars ? raw.replace(/\{(\w+)\}/g, (match, name: string) => (name in vars ? String(vars[name]) : match)) : raw;
+  };
+  const has = (key: string | null | undefined): key is BillingKey => Boolean(key && key in billingStrings.en);
+  return { bt, has };
+}
+
+type ActionResult = { ok?: boolean; message?: string; messageKey?: string; messageVars?: I18nVars; error?: string; errorKey?: string; errorVars?: I18nVars } | undefined;
+
 export default function StoresSettings() {
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
-  const result = fetcher.data as { ok?: boolean; message?: string; error?: string } | undefined;
-  const actionMessage = useMessage(result as Parameters<typeof useMessage>[0]);
-  const failureMessage = useErrorMessage(result as Parameters<typeof useErrorMessage>[0]);
+  const result = fetcher.data as ActionResult;
+  const { bt, has } = useBillingT();
+  const locale = useLocale();
+  const genericMessage = useMessage(result as Parameters<typeof useMessage>[0]);
+  const genericFailure = useErrorMessage(result as Parameters<typeof useErrorMessage>[0]);
+  const actionMessage = has(result?.messageKey) ? bt(result.messageKey, result.messageVars) : genericMessage;
+  const failureMessage = !result?.ok && has(result?.errorKey) ? bt(result.errorKey, result.errorVars) : genericFailure;
   const [name, setName] = useState(data.account?.name ?? "");
   const [code, setCode] = useState("");
   const [confirm, setConfirm] = useState<"join" | "leave" | null>(null);
@@ -79,11 +109,13 @@ export default function StoresSettings() {
   const busyIntent = busy ? String(fetcher.formData?.get("intent") ?? "") : "";
   const nameDirty = name.trim() !== (data.account?.name ?? "").trim();
   const planName = data.account?.plan ?? "FREE";
+  const dateLocale = locale === "vi" ? "vi-VN" : "en-US";
 
   const copyCode = async () => {
+    if (!data.invite) return;
     try {
-      await navigator.clipboard.writeText(data.joinCode);
-      shopify.toast.show(t("settings.stores.codeCopied"));
+      await navigator.clipboard.writeText(data.invite.code);
+      shopify.toast.show(bt("billing.stores.inviteCopied"));
     } catch {
       shopify.toast.show(t("settings.stores.copyFailed"), { isError: true });
     }
@@ -95,6 +127,8 @@ export default function StoresSettings() {
     loading: busyIntent === "rename",
     disabled: !data.account || !nameDirty || (busy && busyIntent !== "rename"),
   });
+
+  const createInvite = () => fetcher.submit({ intent: "createInvite" }, { method: "post" });
 
   return (
     <Layout>
@@ -117,15 +151,39 @@ export default function StoresSettings() {
         <Card>
           <FormLayout>
             <TextField label={t("settings.stores.accountName")} value={name} onChange={setName} autoComplete="off" disabled={!data.account} helpText={t("settings.stores.accountName.help")} />
-            <TextField
-              label={t("settings.stores.accountCodeShare")}
-              value={data.joinCode}
-              readOnly
-              autoComplete="off"
-              monospaced
-              connectedRight={<Button icon={ClipboardIcon} onClick={copyCode} accessibilityLabel={t("settings.stores.copyCode")} disabled={!data.joinCode} />}
-              helpText={t("settings.stores.accountCode.help")}
-            />
+            {!data.isOwner ? (
+              <Text as="p" tone="subdued">
+                {bt("billing.stores.ownerOnly")}
+              </Text>
+            ) : data.invite ? (
+              <BlockStack gap="200">
+                <TextField
+                  label={bt("billing.stores.inviteLabel")}
+                  value={data.invite.code}
+                  readOnly
+                  autoComplete="off"
+                  monospaced
+                  connectedRight={<Button icon={ClipboardIcon} onClick={copyCode} accessibilityLabel={bt("billing.stores.inviteCopy")} />}
+                  helpText={bt("billing.stores.inviteHelp", { date: formatDate(data.invite.expiresAt, dateLocale) })}
+                />
+                <InlineStack>
+                  <Button onClick={createInvite} loading={busyIntent === "createInvite"} disabled={!data.account || (busy && busyIntent !== "createInvite")}>
+                    {bt("billing.stores.inviteReplace")}
+                  </Button>
+                </InlineStack>
+              </BlockStack>
+            ) : (
+              <BlockStack gap="200">
+                <Text as="p" tone="subdued">
+                  {bt("billing.stores.inviteNone")}
+                </Text>
+                <InlineStack>
+                  <Button onClick={createInvite} loading={busyIntent === "createInvite"} disabled={!data.account || (busy && busyIntent !== "createInvite")}>
+                    {bt("billing.stores.inviteCreate")}
+                  </Button>
+                </InlineStack>
+              </BlockStack>
+            )}
             <InlineStack gap="200" blockAlign="center">
               <Text as="span" tone="subdued" variant="bodySm">
                 {t("settings.stores.plan")}
@@ -139,13 +197,22 @@ export default function StoresSettings() {
       <Layout.AnnotatedSection title={t("settings.stores.linkTitle")} description={t("settings.stores.linkDescription")}>
         <Card>
           <FormLayout>
-            <TextField label={t("settings.stores.accountCode")} value={code} onChange={setCode} autoComplete="off" monospaced placeholder={t("settings.stores.accountCode.placeholder")} />
+            <TextField
+              label={bt("billing.stores.inviteLabel")}
+              value={code}
+              onChange={setCode}
+              autoComplete="off"
+              monospaced
+              disabled={!data.isOwner}
+              placeholder={t("settings.stores.accountCode.placeholder")}
+              helpText={data.isOwner ? undefined : bt("billing.stores.ownerOnly")}
+            />
             <InlineStack gap="200">
-              <Button variant="primary" disabled={!code.trim() || (busy && busyIntent !== "join")} loading={busyIntent === "join"} onClick={() => setConfirm("join")}>
+              <Button variant="primary" disabled={!data.isOwner || !code.trim() || (busy && busyIntent !== "join")} loading={busyIntent === "join"} onClick={() => setConfirm("join")}>
                 {t("settings.stores.joinAccount")}
               </Button>
               {data.shops.length > 1 && (
-                <Button tone="critical" disabled={busy && busyIntent !== "leave"} loading={busyIntent === "leave"} onClick={() => setConfirm("leave")}>
+                <Button tone="critical" disabled={!data.isOwner || (busy && busyIntent !== "leave")} loading={busyIntent === "leave"} onClick={() => setConfirm("leave")}>
                   {t("settings.stores.leaveAccount")}
                 </Button>
               )}

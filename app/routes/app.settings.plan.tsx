@@ -7,11 +7,13 @@ import { useSettingsPageAction } from "~/components/settings-page-action";
 import { Stat } from "~/components/Stat";
 import { PLANS, PLAN_ORDER, planRank, usageFraction, type LimitedResource, type PlanId } from "~/domain/billing/plans";
 import { readForm, requireShop } from "~/lib/auth.server";
+import { env } from "~/lib/env.server";
 import { errorMessage } from "~/lib/errors";
 import { formatDate, formatMoney, formatNumber } from "~/lib/format";
-import type { I18nKey } from "~/lib/i18n";
+import type { I18nKey, I18nVars } from "~/lib/i18n";
+import * as billingStrings from "~/lib/i18n-modules/billing";
 import { useErrorMessage, useLocale, useMessage, useT } from "~/lib/use-t";
-import { cancelSubscription, getAccountBilling, syncSubscription } from "~/services/billing.server";
+import { billingReturnUrl, cancelSubscription, getAccountBilling, remainingTrialDays, syncSubscription } from "~/services/billing.server";
 
 /**
  * Plans and usage.
@@ -31,7 +33,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }
   }
   const account = await getAccountBilling(shop);
+  // What a new subscription would actually get: the trial runs from the first
+  // one this store ever started, so the plan cards must not promise a full one.
+  const trialDaysLeft = Object.fromEntries(PLAN_ORDER.map((id) => [id, remainingTrialDays(PLANS[id].trialDays, shop.trialStartedAt)])) as Record<PlanId, number>;
   return {
+    trialDaysLeft,
     account: {
       ...account,
       subscription: account.subscription
@@ -57,7 +63,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         await billing.request({
           plan: PLANS[plan].displayName,
           isTest: account.isTest,
-          returnUrl: `https://admin.shopify.com/store/${shop.domain.replace(/\.myshopify\.com$/, "")}/apps/ws-fullfill-app/app/settings/plan?billing=return`,
+          // Overrides the configured 14 days: a plan switch or a reinstall must
+          // not hand out a second trial.
+          trialDays: remainingTrialDays(PLANS[plan].trialDays, shop.trialStartedAt),
+          returnUrl: billingReturnUrl(shop.domain, env().SHOPIFY_API_KEY),
         });
         return { ok: true };
       }
@@ -76,11 +85,25 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
 const RESOURCES: LimitedResource[] = ["products", "stores", "staff"];
 
+/**
+ * Strings from the billing module. app/lib/i18n.ts spreads each module into the
+ * typed dictionary by hand and does not include this one yet, so until it does
+ * these are looked up here, with the same English fallback and placeholders.
+ */
+function useBillingT() {
+  const locale = useLocale();
+  return (key: keyof typeof billingStrings.en, vars?: I18nVars) => {
+    const raw = (locale === "vi" ? billingStrings.vi[key] : undefined) ?? billingStrings.en[key];
+    return vars ? raw.replace(/\{(\w+)\}/g, (match, name: string) => (name in vars ? String(vars[name]) : match)) : raw;
+  };
+}
+
 export default function PlanSettings() {
-  const { account, syncError } = useLoaderData<typeof loader>();
+  const { account, syncError, trialDaysLeft } = useLoaderData<typeof loader>();
   const [params] = useSearchParams();
   const fetcher = useFetcher<typeof action>();
   const t = useT();
+  const bt = useBillingT();
   const locale = useLocale();
   const result = fetcher.data as { ok?: boolean; error?: string; errorKey?: string; errorVars?: Record<string, string | number>; messageKey?: string } | undefined;
   const successMessage = useMessage(result as Parameters<typeof useMessage>[0]);
@@ -229,7 +252,7 @@ export default function PlanSettings() {
                         )}
                       </InlineStack>
                       <Text as="p" tone="subdued" variant="bodySm">
-                        {plan.trialDays > 0 ? t("plan.trialDays", { days: plan.trialDays }) : t("settings.plan.noTrial")}
+                        {trialDaysLeft[id] > 0 ? t("plan.trialDays", { days: trialDaysLeft[id] }) : plan.trialDays > 0 ? bt("billing.plan.trialUsed") : t("settings.plan.noTrial")}
                       </Text>
                     </BlockStack>
                     <List>
