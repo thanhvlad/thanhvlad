@@ -68,7 +68,7 @@ type TabId = (typeof TABS)[number];
 
 /** Supplier platform as the merchant names it; PlatformBadge keeps the same wording. */
 function platformName(platform: SupplierPlatform): string {
-  return platform === "ALIEXPRESS" ? "AliExpress" : platform === "CJ_DROPSHIPPING" ? "CJ" : platform === "MOCK" ? "Mock" : platform;
+  return platform === "ALIEXPRESS" ? "AliExpress" : platform === "CJ_DROPSHIPPING" ? "CJ" : platform === "MOCK" ? "Demo" : platform;
 }
 
 export default function PaymentsPage() {
@@ -158,7 +158,7 @@ export default function PaymentsPage() {
       ]}
     >
       <Layout>
-        {(actionMessage || actionError || queue.overdue > 0 || queue.expiringSoon > 0) && (
+        {(actionMessage || actionError || queue.overdue > 0 || queue.expiringSoon > 0 || queue.awaitingPlacement > 0) && (
           <Layout.Section>
             <BlockStack gap="300">
               {actionMessage && (
@@ -181,6 +181,17 @@ export default function PaymentsPage() {
               {queue.expiringSoon > 0 && queue.overdue === 0 && (
                 <Banner tone="warning" title={t("payments.banner.dueSoon", { n: queue.expiringSoon })}>
                   <p>{t("payments.autoCancelWarning")}</p>
+                </Banner>
+              )}
+              {/* Counted apart from the unpaid orders: they do not exist at the
+                  supplier yet, so there is nothing to pay and no link to pay it with. */}
+              {queue.awaitingPlacement > 0 && (
+                <Banner
+                  tone="info"
+                  title={t("orders.placement.paymentsBannerTitle", { n: queue.awaitingPlacement })}
+                  action={{ content: t("orders.placement.setUpExtension"), url: "/app/settings/advanced" }}
+                >
+                  <p>{t("orders.placement.paymentsBannerBody")}</p>
                 </Banner>
               )}
             </BlockStack>

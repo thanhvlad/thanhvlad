@@ -17,7 +17,13 @@ import { ALIEXPRESS_UNPAID_ORDERS_URL, orderPaymentUrl } from "./suppliers/aliex
  * the supplier reports the payment so the pipeline moves on.
  */
 
-/** Statuses that mean "placed upstream but not paid for yet". */
+/**
+ * Statuses that mean "placed upstream but not paid for yet".
+ *
+ * AWAITING_PLACEMENT is deliberately not one of them: that order does not
+ * exist at the supplier yet, so there is nothing to pay and no payment link
+ * that could work. The queue counts it separately.
+ */
 export const UNPAID_STATUSES: PurchaseOrderStatus[] = ["PLACED", "AWAITING_PAYMENT"];
 
 /** Where to send the merchant to pay several orders at once, per platform. */
@@ -70,6 +76,8 @@ export interface PaymentQueue {
   byPlatform: Array<{ platform: SupplierPlatform; count: number; bulkUrl: string | null }>;
   expiringSoon: number;
   overdue: number;
+  /** Priced orders still to be placed with the Chrome extension, before they can be paid. */
+  awaitingPlacement: number;
 }
 
 /**
@@ -86,6 +94,7 @@ export async function getPaymentQueue(shopId: string, now: Date = new Date()): P
     },
     orderBy: [{ paymentDueAt: "asc" }, { placedAt: "asc" }],
   });
+  const awaitingPlacement = await prisma.purchaseOrder.count({ where: { order: { shopId }, status: "AWAITING_PLACEMENT" } });
 
   const items: UnpaidPurchaseOrder[] = rows.map((po) => ({
     id: po.id,
@@ -126,6 +135,7 @@ export async function getPaymentQueue(shopId: string, now: Date = new Date()): P
     byPlatform: [...platforms.entries()].map(([platform, count]) => ({ platform, count, bulkUrl: bulkPaymentUrl(platform) })),
     expiringSoon: items.filter((i) => i.hoursLeft !== null && i.hoursLeft > 0 && i.hoursLeft <= 6).length,
     overdue: items.filter((i) => i.hoursLeft !== null && i.hoursLeft <= 0).length,
+    awaitingPlacement,
   };
 }
 

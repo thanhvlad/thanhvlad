@@ -3,8 +3,9 @@
  *
  * Every upstream marketplace (AliExpress, CJ, ...) is wrapped in an adapter
  * implementing this interface, so the import list, mapping, order placement
- * and tracking jobs are written once. A mock adapter with realistic fixtures
- * lets the whole flow run with no upstream credentials.
+ * and tracking jobs are written once. The Demo supplier (platform MOCK) lets
+ * the whole flow be tried with no upstream credentials; it only ever serves
+ * MOCK, never a real platform.
  */
 
 export type SupplierPlatform = "ALIEXPRESS" | "CJ_DROPSHIPPING" | "TEMU" | "MANUAL" | "MOCK";
@@ -242,6 +243,13 @@ export interface SupplierAdapter {
   readonly platform: SupplierPlatform;
   readonly displayName: string;
   readonly capabilities: SupplierCapabilities;
+  /**
+   * True when the adapter invents its answers (the Demo supplier). Stored on
+   * every purchase order it places, so nothing it made up - an order id, a
+   * payment link, a tracking number - is ever written to a real Shopify order
+   * or shown to a buyer as if a supplier had said it.
+   */
+  readonly simulated?: boolean;
 
   /** True when the adapter has what it needs (app keys, tokens) to make calls. */
   isConfigured(): boolean;

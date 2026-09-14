@@ -1,22 +1,26 @@
 import { createHash } from "node:crypto";
 import type { OrderLineItem, Prisma, PurchaseOrder, PurchaseOrderStatus, SupplierPlatform } from "@prisma/client";
+import { z } from "zod";
 import prisma from "~/db.server";
 import type { ResolveResult, ResolvedSupplierLine } from "~/domain/mapping/types";
+import type { ShippingAddress } from "~/domain/orders/address";
 import { evaluateOrder as evaluatePipeline } from "~/domain/orders/pipeline";
 import { AppError, errorMessage, isRetryable } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
 import { d, money, sum, type Decimal } from "~/lib/money";
+import { rateLimit } from "~/lib/rate-limit.server";
 import { logActivity } from "./activity.server";
 import { getKnownRate } from "./currency.server";
 import { notify } from "./notifications.server";
 import { evaluateAndStoreOrder, lineResolution, orderIssues, supplierAddressFor } from "./orders.server";
 import { chooseShippingForShop } from "./shipping.server";
-import type { ShopWithSettings } from "./shop.server";
+import { withSettings, type ShopWithSettings } from "./shop.server";
 import { offlineClient, type GraphqlClient } from "./shopify/graphql.server";
 import { addOrderTags, createFulfillmentWithTracking, updateFulfillmentTracking } from "./shopify/orders.server";
 import { touchSupplierAccount } from "./supplier-accounts.server";
+import { orderPaymentUrl } from "./suppliers/aliexpress.server";
 import { getShippingOptions } from "./suppliers/catalog.server";
-import { adapterForShop } from "./suppliers/index.server";
+import { adapterForShop, placementModeForShop, supplierProductUrl, unavailableReason, type PlacementMode } from "./suppliers/index.server";
 import type { PlaceOrderInput, SupplierOrderState } from "./suppliers/types";
 
 // ---------------------------------------------------------------------------
@@ -27,6 +31,12 @@ export interface PlaceOrderOutcome {
   orderId: string;
   ok: boolean;
   purchaseOrderIds: string[];
+  /**
+   * The subset of `purchaseOrderIds` that was priced and is now waiting for the
+   * merchant to place it with the Chrome extension. Nothing was sent upstream
+   * for these, so a caller must not report them as placed.
+   */
+  awaitingPlacementIds?: string[];
   error?: string;
   issues?: string[];
 }
@@ -275,9 +285,23 @@ export async function placeSupplierOrders(
   const address = supplierAddressFor(full, shop.parsedSettings.orders);
   const country = (address.countryCode ?? full.countryCode ?? "US").toUpperCase();
   const purchaseOrderIds: string[] = [];
+  const awaitingPlacementIds: string[] = [];
   const errors: string[] = [];
+  let placedUpstream = 0;
 
   for (const group of groups.values()) {
+    const mode = await placementModeForShop(shop.id, group.platform);
+
+    // Refused before anything is priced or written as live. Under the old
+    // registry these fell through to the mock, which "placed" them and later
+    // invented tracking for a real buyer.
+    const refusal = placementRefusal(mode, group.platform, { isTest: full.isTest, isDevelopmentStore: shop.isDevelopmentStore });
+    if (refusal) {
+      errors.push(`${group.platform}: ${refusal.message}`);
+      await recordFailedPurchaseOrder(shop, full.id, group, null, refusal.code, refusal.message, { onlyOnce: true });
+      continue;
+    }
+
     const { adapter, account } = await adapterForShop(shop.id, group.platform);
 
     // Shipping is quoted per supplier product, with that product's own
@@ -309,6 +333,8 @@ export async function placeSupplierOrders(
       choiceFor,
       supplierNote: options.supplierNote ?? shop.parsedSettings.orders.supplierNote,
       shippingReason: [...new Set([...shipping.values()].map((c) => c.reason).filter(Boolean))].join(" "),
+      mode,
+      simulated: Boolean(adapter.simulated),
     });
     if (!created.po) {
       // Another caller got there first between our coverage read and this
@@ -318,6 +344,26 @@ export async function placeSupplierOrders(
     }
     const po = created.po;
     purchaseOrderIds.push(po.id);
+
+    if (mode === "extension") {
+      // Nothing goes upstream: the merchant's browser places this order on the
+      // supplier's site. It is priced now, so the payment queue and the
+      // order's profit read correctly while it waits.
+      const converted = await toShopCurrency(shop.currency, po.currency, po.itemsCost, po.shippingCost);
+      if (Object.keys(converted).length > 0) {
+        await prisma.purchaseOrder.update({ where: { id: po.id }, data: converted });
+      }
+      awaitingPlacementIds.push(po.id);
+      await logActivity(shop.id, {
+        actor: options.actor,
+        action: "order.awaiting_placement",
+        entity: "Order",
+        entityId: full.id,
+        message: `${full.name}: ${group.platform} order priced at ${money(po.totalCost)} ${po.currency} and waiting to be placed with the Chrome extension.`,
+        meta: { purchaseOrderId: po.id },
+      });
+      continue;
+    }
 
     const payload: PlaceOrderInput = {
       reference: po.idempotencyKey ?? po.id,
@@ -375,6 +421,7 @@ export async function placeSupplierOrders(
         },
       });
       if (account) await touchSupplierAccount(account.id);
+      placedUpstream += 1;
       await logActivity(shop.id, {
         actor: options.actor,
         action: "order.placed",
@@ -426,17 +473,62 @@ export async function placeSupplierOrders(
   await rollupOrderCosts(full.id);
   await evaluateAndStoreOrder(shop, full.id);
 
-  const anyPlaced = purchaseOrderIds.length > 0 && errors.length < groups.size;
-  if (anyPlaced && shop.parsedSettings.orders.tagOnPlaced) {
-    try {
-      const client = await offlineClient(shop.domain);
-      await addOrderTags(client, full.shopifyOrderId, [shop.parsedSettings.orders.tagOnPlaced]);
-    } catch (error) {
-      logger.warn("Could not tag Shopify order", { orderId, error });
-    }
+  if (awaitingPlacementIds.length > 0) {
+    await notify(shop.id, {
+      type: "order.placed",
+      severity: "info",
+      title: `${full.name} is ready to place with the Chrome extension`,
+      body: "Open the DropshipHub extension in Chrome and choose Orders to place. The supplier order is not placed until you do.",
+      link: `/app/orders/${full.id}`,
+      dedupeKey: `awaiting-placement:${full.id}`,
+      dedupeMinutes: 60,
+    });
   }
 
-  return { orderId, ok: errors.length === 0, purchaseOrderIds, error: errors.length ? errors.join("; ") : undefined };
+  // Tagged only when something actually reached a supplier. An order waiting
+  // for the extension is tagged when the extension reports it placed.
+  if (placedUpstream > 0) await tagPlacedOrder(shop, full.id, full.shopifyOrderId);
+
+  return {
+    orderId,
+    ok: errors.length === 0,
+    purchaseOrderIds,
+    awaitingPlacementIds,
+    error: errors.length ? errors.join("; ") : undefined,
+  };
+}
+
+async function tagPlacedOrder(shop: ShopWithSettings, orderId: string, shopifyOrderId: string) {
+  if (!shop.parsedSettings.orders.tagOnPlaced) return;
+  try {
+    const client = await offlineClient(shop.domain);
+    await addOrderTags(client, shopifyOrderId, [shop.parsedSettings.orders.tagOnPlaced]);
+  } catch (error) {
+    logger.warn("Could not tag Shopify order", { orderId, error });
+  }
+}
+
+/**
+ * Why a group may not be placed at all in this mode, or null when it may.
+ *
+ * The Demo supplier only runs for test orders or on development stores. On a
+ * real order it would walk a purchase order through invented payment and
+ * shipping, and the order page would show a real buyer's parcel as on its way
+ * when nothing was bought.
+ */
+export function placementRefusal(
+  mode: PlacementMode,
+  platform: SupplierPlatform,
+  context: { isTest: boolean; isDevelopmentStore: boolean },
+): { code: string; message: string } | null {
+  if (mode === "unavailable") return { code: "SUPPLIER_UNAVAILABLE", message: unavailableReason(platform) };
+  if (mode === "demo" && !context.isTest && !context.isDevelopmentStore) {
+    return {
+      code: "DEMO_SUPPLIER_REAL_ORDER",
+      message: "The Demo supplier only simulates orders, so it cannot fulfil a real customer's order. Link this product to a real supplier, or use a test order.",
+    };
+  }
+  return null;
 }
 
 /**
@@ -538,8 +630,20 @@ async function createPurchaseOrderExclusively(input: {
   choiceFor: (line: GroupLine) => ShippingChoice;
   supplierNote: string | null;
   shippingReason: string;
+  mode: PlacementMode;
+  simulated: boolean;
 }): Promise<{ po: PurchaseOrder | null; reason?: string }> {
   const { group, choiceFor } = input;
+  const itemsCost = sum(group.lines.map((l) => d(l.resolved.unitCost).times(l.resolved.quantity)));
+  // Shipping is charged once per supplier product, exactly as the quote does,
+  // so a purchase order waiting for the extension carries the same total the
+  // merchant would have approved.
+  const shippingByProduct = new Map<string, string>();
+  for (const line of group.lines) {
+    const cost = choiceFor(line).cost;
+    if (cost !== null && !shippingByProduct.has(line.supplierProductId)) shippingByProduct.set(line.supplierProductId, cost);
+  }
+  const shippingCost = sum([...shippingByProduct.values()].map((c) => d(c)));
   try {
     return await prisma.$transaction(async (tx) => {
       // Transaction-scoped: released on commit or rollback, no cleanup needed.
@@ -564,9 +668,14 @@ async function createPurchaseOrderExclusively(input: {
           idempotencyKey: input.idempotencyKey,
           supplierAccountId: input.supplierAccountId,
           platform: group.platform,
-          status: "SUBMITTING",
+          // Created straight into its waiting state, inside the same lock and
+          // under the same idempotency key as an API placement, so a second
+          // caller sees it as covering these lines and does nothing.
+          status: input.mode === "extension" ? "AWAITING_PLACEMENT" : "SUBMITTING",
           currency: group.lines[0].resolved.currency,
-          itemsCost: money(sum(group.lines.map((l) => d(l.resolved.unitCost).times(l.resolved.quantity)))),
+          itemsCost: money(itemsCost),
+          shippingCost: money(shippingCost),
+          totalCost: money(itemsCost.plus(shippingCost)),
           carrierCode: input.headline.carrierCode,
           carrierName: input.headline.carrierName,
           shipFromCountry: input.headline.shipFromCountry,
@@ -574,7 +683,7 @@ async function createPurchaseOrderExclusively(input: {
           supplierNote: input.supplierNote,
           attempts: 1,
           lastAttemptAt: new Date(),
-          raw: { shippingReason: input.shippingReason } as Prisma.InputJsonValue,
+          raw: { shippingReason: input.shippingReason, placementMode: input.mode, simulated: input.simulated } as Prisma.InputJsonValue,
           items: {
             create: group.lines.map((l) => {
               const choice = choiceFor(l);
@@ -640,7 +749,24 @@ async function toShopCurrency(
   }
 }
 
-async function recordFailedPurchaseOrder(shop: ShopWithSettings, orderId: string, group: Group, supplierAccountId: string | null, code: string, message: string) {
+async function recordFailedPurchaseOrder(
+  shop: ShopWithSettings,
+  orderId: string,
+  group: Group,
+  supplierAccountId: string | null,
+  code: string,
+  message: string,
+  options: { onlyOnce?: boolean } = {},
+) {
+  if (options.onlyOnce) {
+    // A refusal that no retry can change (no way to reach the platform) would
+    // otherwise add a fresh FAILED row on every auto-place tick.
+    const existing = await prisma.purchaseOrder.findFirst({
+      where: { orderId, platform: group.platform, status: "FAILED", errorCode: code },
+      select: { id: true },
+    });
+    if (existing) return;
+  }
   await prisma.purchaseOrder.create({
     data: {
       orderId,
@@ -719,7 +845,10 @@ export async function retryPurchaseOrder(shop: ShopWithSettings, purchaseOrderId
   if (po.status !== "FAILED" && po.status !== "CANCELED" && !stale) {
     throw new Error("Only failed, canceled or abandoned purchase orders can be retried.");
   }
-  if (po.externalOrderId) {
+  // A simulated order id (the Demo supplier's, or one the mock invented for a
+  // real platform before it was taken off real platforms) names nothing at any
+  // supplier, so there is nothing that could be ordered twice.
+  if (po.externalOrderId && !isSimulatedPurchaseOrder(po)) {
     throw new Error(
       `This purchase order already has a supplier order (${po.externalOrderId}). Cancel it at the supplier before retrying, or the goods are ordered twice.`,
     );
@@ -797,8 +926,50 @@ function toPurchaseOrderStatus(state: SupplierOrderState): PurchaseOrderStatus {
  * let a purchase order oscillate between them on every poll.
  */
 const ORDER_RANK: Record<PurchaseOrderStatus, number> = {
-  DRAFT: 0, FAILED: 1, SUBMITTING: 2, PLACED: 3, AWAITING_PAYMENT: 4, PAID: 5, SHIPPED: 6, DELIVERED: 7, CANCELED: 8,
+  DRAFT: 0, FAILED: 1, SUBMITTING: 2, AWAITING_PLACEMENT: 3, PLACED: 4, AWAITING_PAYMENT: 5, PAID: 6, SHIPPED: 7, DELIVERED: 8, CANCELED: 9,
 };
+
+/**
+ * True when a purchase order's supplier side was invented: placed through the
+ * Demo supplier, or - before the mock was taken off real platforms - given a
+ * MOCK- order id under a real platform's name. Nothing it says about payment,
+ * shipping or tracking came from a supplier.
+ */
+export function isSimulatedPurchaseOrder(po: { platform: SupplierPlatform; externalOrderId: string | null; raw?: unknown }): boolean {
+  if (po.platform === "MOCK") return true;
+  if (po.externalOrderId?.startsWith("MOCK-")) return true;
+  return Boolean(po.raw && typeof po.raw === "object" && (po.raw as { simulated?: unknown }).simulated === true);
+}
+
+/**
+ * Whether a purchase order may write to the Shopify order: create a fulfilment,
+ * attach tracking, email the buyer.
+ *
+ * A simulated purchase order may do so only on a test order or a development
+ * store, where the reviewer's walkthrough needs to see the fulfilment appear,
+ * and even then silently and with no carrier link. On a real order it never
+ * may: an invented tracking number in a shipping email is a lie told to a
+ * buyer who is still waiting for goods nobody bought.
+ */
+export function shopifyWritePolicy(
+  po: { platform: SupplierPlatform; externalOrderId: string | null; raw?: unknown },
+  context: { orderIsTest: boolean; isDevelopmentStore: boolean },
+): { allowed: boolean; notifyCustomer: boolean; trackingUrls: boolean } {
+  if (!isSimulatedPurchaseOrder(po)) return { allowed: true, notifyCustomer: true, trackingUrls: true };
+  if (context.orderIsTest || context.isDevelopmentStore) return { allowed: true, notifyCustomer: false, trackingUrls: false };
+  return { allowed: false, notifyCustomer: false, trackingUrls: false };
+}
+
+/** Prisma filter for purchase orders `isSimulatedPurchaseOrder` would flag by platform or id. */
+const SIMULATED_PO_WHERE: Prisma.PurchaseOrderWhereInput = {
+  OR: [{ platform: "MOCK" }, { externalOrderId: { startsWith: "MOCK-" } }],
+};
+
+const SIMULATED_TRACKING_BLOCKED =
+  "Not sent to Shopify: this tracking number was made up by the Demo supplier, and this is a real customer order. Nothing was ordered from a supplier.";
+
+/** Modes in which the app itself can ask the supplier about an order. */
+const POLLABLE_MODES = new Set<PlacementMode>(["api", "demo"]);
 
 /** Past this, a cancellation is a return or a dispute, not the order falling through. */
 const CANCELABLE_UP_TO = ORDER_RANK.PAID;
@@ -820,9 +991,22 @@ function nextStatus(current: PurchaseOrderStatus, upstream: PurchaseOrderStatus)
 }
 
 /** Poll one purchase order upstream; pull tracking when shipped. */
-export async function syncPurchaseOrder(shop: ShopWithSettings, purchaseOrderId: string): Promise<{ changed: boolean; status: PurchaseOrderStatus; newTracking: number }> {
+export async function syncPurchaseOrder(
+  shop: ShopWithSettings,
+  purchaseOrderId: string,
+  options: { mode?: PlacementMode } = {},
+): Promise<{ changed: boolean; status: PurchaseOrderStatus; newTracking: number }> {
   const po = await prisma.purchaseOrder.findFirst({ where: { id: purchaseOrderId, order: { shopId: shop.id } }, include: { order: true, trackings: true } });
   if (!po || !po.externalOrderId) return { changed: false, status: po?.status ?? "DRAFT", newTracking: 0 };
+
+  // Only an order the app placed through an API (or the Demo supplier) can be
+  // asked about. One placed from the browser is followed by what the merchant
+  // and the extension report; one given a MOCK- id under a real platform's
+  // name has no supplier to ask, and polling it through the mock is exactly
+  // how invented tracking used to reach real buyers.
+  if (po.platform !== "MOCK" && isSimulatedPurchaseOrder(po)) return { changed: false, status: po.status, newTracking: 0 };
+  const mode = options.mode ?? (await placementModeForShop(shop.id, po.platform));
+  if (!POLLABLE_MODES.has(mode)) return { changed: false, status: po.status, newTracking: 0 };
 
   const { adapter } = await adapterForShop(shop.id, po.platform);
   const upstream = await adapter.getOrder(po.externalOrderId);
@@ -907,12 +1091,16 @@ export async function syncOpenPurchaseOrders(shop: ShopWithSettings, options: { 
     where: { order: { shopId: shop.id }, status: { in: ["PLACED", "AWAITING_PAYMENT", "PAID", "SHIPPED"] }, externalOrderId: { not: null } },
     orderBy: { updatedAt: "asc" },
     take: options.limit ?? 200,
-    select: { id: true },
+    select: { id: true, platform: true },
   });
+  // One mode lookup per platform rather than per purchase order: the answer
+  // cannot differ between two orders of the same shop and platform.
+  const modes = new Map<SupplierPlatform, PlacementMode>();
   let changed = 0;
   for (const po of open) {
     try {
-      const result = await syncPurchaseOrder(shop, po.id);
+      if (!modes.has(po.platform)) modes.set(po.platform, await placementModeForShop(shop.id, po.platform));
+      const result = await syncPurchaseOrder(shop, po.id, { mode: modes.get(po.platform) });
       if (result.changed || result.newTracking) changed += 1;
     } catch (error) {
       logger.warn("Purchase order sync failed", { purchaseOrderId: po.id, error, retryable: isRetryable(error) });
@@ -927,8 +1115,36 @@ export async function syncOpenPurchaseOrders(shop: ShopWithSettings, options: { 
  * number covering the line items of its purchase order.
  */
 export async function syncPendingTracking(shop: ShopWithSettings, purchaseOrderId?: string, client?: GraphqlClient) {
+  const base: Prisma.PurchaseOrderWhereInput = { order: { shopId: shop.id }, ...(purchaseOrderId ? { id: purchaseOrderId } : {}) };
+
+  // Simulated tracking on a real order is never sent. It is left out of the
+  // query itself, not skipped after it: the query takes the oldest 100, and
+  // rows that can never sync would otherwise crowd out real tracking forever.
+  // The reason is written on the row once so the order page can say why.
+  let scope = base;
+  if (!shop.isDevelopmentStore) {
+    await prisma.trackingNumber.updateMany({
+      where: { syncedToShopify: false, syncError: null, purchaseOrder: { AND: [base, SIMULATED_PO_WHERE, { order: { isTest: false } }] } },
+      data: { syncError: SIMULATED_TRACKING_BLOCKED },
+    });
+    // Written as what may sync rather than NOT(what may not): in SQL a NOT over
+    // `externalOrderId LIKE 'MOCK-%'` is NULL for a purchase order with no
+    // supplier id yet, which would silently drop real, hand-entered tracking.
+    scope = {
+      AND: [
+        base,
+        {
+          OR: [
+            { order: { isTest: true } },
+            { platform: { not: "MOCK" }, OR: [{ externalOrderId: null }, { NOT: { externalOrderId: { startsWith: "MOCK-" } } }] },
+          ],
+        },
+      ],
+    };
+  }
+
   const pending = await prisma.trackingNumber.findMany({
-    where: { syncedToShopify: false, purchaseOrder: { order: { shopId: shop.id }, ...(purchaseOrderId ? { id: purchaseOrderId } : {}) } },
+    where: { syncedToShopify: false, purchaseOrder: scope },
     include: { purchaseOrder: { include: { order: true, items: true, trackings: true } } },
     orderBy: { createdAt: "asc" },
     take: 100,
@@ -952,6 +1168,15 @@ export async function syncPendingTracking(shop: ShopWithSettings, purchaseOrderI
 
   for (const [poId, trackings] of byPurchaseOrder) {
     const po = trackings[0].purchaseOrder;
+    // Checked again per purchase order, whatever the query above excluded: it
+    // also catches a purchase order flagged simulated only in its raw data, and
+    // it keeps this rule true if the query is ever edited.
+    const policy = shopifyWritePolicy(po, { orderIsTest: po.order.isTest, isDevelopmentStore: shop.isDevelopmentStore });
+    if (!policy.allowed) {
+      await prisma.trackingNumber.updateMany({ where: { id: { in: trackings.map((t) => t.id) } }, data: { syncError: SIMULATED_TRACKING_BLOCKED } });
+      logger.warn("Refused to send simulated tracking to a real Shopify order", { purchaseOrderId: poId, orderId: po.orderId });
+      continue;
+    }
     const lineItemIds = po.items.map((i) => i.orderLineItemId).filter((id): id is string => Boolean(id));
     const lines = await prisma.orderLineItem.findMany({ where: { id: { in: lineItemIds } } });
     const outstanding = lines.filter((l) => l.fulfillableQuantity > 0);
@@ -972,15 +1197,15 @@ export async function syncPendingTracking(shop: ShopWithSettings, purchaseOrderI
           // Only what is genuinely still outstanding: falling back to the full
           // quantity re-fulfilled the whole order for the second parcel.
           items: outstanding.map((l) => ({ lineItemId: l.shopifyLineItemId, quantity: l.fulfillableQuantity })),
-          tracking: { numbers, company, urls: trackings.map(urlFor).filter((u): u is string => Boolean(u)) },
-          notifyCustomer: trackings.some((t) => t.notifyCustomer) && settings.notifyCustomer,
+          tracking: { numbers, company, urls: policy.trackingUrls ? trackings.map(urlFor).filter((u): u is string => Boolean(u)) : [] },
+          notifyCustomer: policy.notifyCustomer && trackings.some((t) => t.notifyCustomer) && settings.notifyCustomer,
         });
 
         if (result.skipped) {
           // Shopify has nothing left to fulfil even though we thought it did:
           // the merchant fulfilled outside the app. Attach to the existing
           // fulfilment if we know it, otherwise stop retrying and say why.
-          await attachOrRetire(graphql, shop, po, trackings, numbers, company, result.reason);
+          await attachOrRetire(graphql, shop, po, trackings, numbers, company, result.reason, policy.notifyCustomer);
         } else {
           await prisma.trackingNumber.updateMany({
             where: { id: { in: trackingIds } },
@@ -1003,7 +1228,7 @@ export async function syncPendingTracking(shop: ShopWithSettings, purchaseOrderI
           }
         }
       } else {
-        await attachOrRetire(graphql, shop, po, trackings, numbers, company, "No unfulfilled quantity left on the Shopify order.");
+        await attachOrRetire(graphql, shop, po, trackings, numbers, company, "No unfulfilled quantity left on the Shopify order.", policy.notifyCustomer);
       }
 
       synced += trackings.length;
@@ -1046,6 +1271,8 @@ async function attachOrRetire(
   numbers: string[],
   company: string | undefined,
   reason: string | null,
+  /** False for simulated tracking, whatever the shop's setting says. */
+  mayNotifyCustomer: boolean,
 ) {
   const fulfillmentId = po.trackings.find((t) => t.shopifyFulfillmentId)?.shopifyFulfillmentId ?? null;
   const trackingIds = trackings.map((t) => t.id);
@@ -1069,7 +1296,7 @@ async function attachOrRetire(
     graphql,
     fulfillmentId,
     { numbers: all, company },
-    shop.parsedSettings.fulfillment.notifyCustomer,
+    mayNotifyCustomer && shop.parsedSettings.fulfillment.notifyCustomer,
   );
   await prisma.trackingNumber.updateMany({
     where: { id: { in: trackingIds } },
@@ -1101,6 +1328,461 @@ export async function addManualTracking(
   if (shop.parsedSettings.fulfillment.autoFulfill) await syncPendingTracking(shop, purchaseOrderId, client);
   await evaluateAndStoreOrder(shop, po.orderId);
   return tracking;
+}
+
+// ---------------------------------------------------------------------------
+// Extension placement API
+//
+// Until the AliExpress API is connected, the merchant's own browser places
+// supplier orders: the extension lists purchase orders waiting for placement,
+// the merchant buys them on AliExpress, and the extension reports the order ids
+// and, later, the tracking back. The routes under /api/extension/orders are
+// thin; the rules live here so they are tested once.
+// ---------------------------------------------------------------------------
+
+/** Largest body each extension endpoint reads before refusing. */
+export const EXTENSION_BODY_LIMITS = {
+  /** A captured product with a few hundred variants is well under this. */
+  capture: 512 * 1024,
+  /** Order ids, a total and a tracking number. */
+  orders: 16 * 1024,
+} as const;
+
+/** A refusal with the HTTP status the extension should see. */
+export class ExtensionApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly headers: Record<string, string> = {},
+  ) {
+    super(message);
+    this.name = "ExtensionApiError";
+  }
+}
+
+/**
+ * The caller's address, for the pre-authentication limiter. Fly and most
+ * proxies put the client first in x-forwarded-for; the value only keys a
+ * rate-limit bucket, so a spoofed one costs the spoofer their own budget.
+ */
+function clientAddress(request: Request): string {
+  return (
+    request.headers.get("fly-client-ip") ??
+    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
+    request.headers.get("x-real-ip") ??
+    "unknown"
+  );
+}
+
+/** Tokens are `dsh_` plus base64url; anything else is refused without a lookup. */
+const TOKEN_SHAPE = /^[A-Za-z0-9_-]{16,200}$/;
+
+/**
+ * Authenticate an extension call by its bearer token (Settings → Advanced) and
+ * apply the limits.
+ *
+ * The per-address limit runs before the token lookup: an invalid-token flood
+ * used to cost one database query per request with no limit at all. The
+ * per-shop limit runs after; a request that fans out pays the rest of its cost
+ * through `spendExtensionBudget` once it knows how much work it carries.
+ */
+export async function authenticateExtensionRequest(
+  request: Request,
+  options: { scope: string; limit: number; windowMs?: number },
+): Promise<ShopWithSettings> {
+  const byAddress = rateLimit(`extension-ip:${clientAddress(request)}`, { limit: 120, windowMs: 60_000 });
+  if (!byAddress.allowed) {
+    throw new ExtensionApiError(429, `Too many requests. Try again in ${byAddress.retryAfter}s.`, { "Retry-After": String(byAddress.retryAfter) });
+  }
+
+  const token = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
+  if (!token) throw new ExtensionApiError(401, "Missing bearer token");
+  if (!TOKEN_SHAPE.test(token)) throw new ExtensionApiError(401, "Invalid token");
+  const row = await prisma.shop.findUnique({ where: { apiToken: token } });
+  if (!row || !row.isActive) throw new ExtensionApiError(401, "Invalid token");
+
+  spendExtensionBudget(row.id, { ...options, cost: 1 });
+  return withSettings(row);
+}
+
+/**
+ * Charge a shop's per-scope budget for `cost` units of work. Capture takes up
+ * to 25 links per request, and a limit counted per request let one caller make
+ * 750 supplier lookups a minute.
+ */
+export function spendExtensionBudget(shopId: string, options: { scope: string; limit: number; windowMs?: number; cost: number }) {
+  for (let i = 0; i < options.cost; i += 1) {
+    const limited = rateLimit(`extension-${options.scope}:${shopId}`, { limit: options.limit, windowMs: options.windowMs ?? 60_000 });
+    if (!limited.allowed) {
+      throw new ExtensionApiError(429, `Too many requests. Try again in ${limited.retryAfter}s.`, { "Retry-After": String(limited.retryAfter) });
+    }
+  }
+}
+
+/**
+ * Read a JSON body, refusing anything larger than `maxBytes`.
+ *
+ * `request.json()` buffers whatever arrives before any validation runs, so a
+ * caller holding a valid token could make the server hold an arbitrarily large
+ * body in memory. The declared length is checked first, and the stream is
+ * counted as it is read, because a chunked body declares no length at all.
+ */
+export async function readJsonBody(request: Request, maxBytes: number): Promise<unknown> {
+  const declared = Number(request.headers.get("content-length") ?? "");
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new ExtensionApiError(413, `Body too large (limit ${maxBytes} bytes)`);
+  }
+  if (!request.body) throw new ExtensionApiError(400, "Body must be JSON");
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw new ExtensionApiError(413, `Body too large (limit ${maxBytes} bytes)`);
+    }
+    chunks.push(value);
+  }
+  const text = Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8");
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new ExtensionApiError(400, "Body must be JSON");
+  }
+}
+
+/** Purchase order ids are cuids; the route refuses anything else before a query. */
+export const PURCHASE_ORDER_ID_SHAPE = /^[A-Za-z0-9_-]{8,64}$/;
+
+const SupplierOrderId = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .regex(/^[A-Za-z0-9_-]+$/, "must be the supplier's order number")
+  // A MOCK- id marks an order the Demo supplier invented; accepting one here
+  // would let a real purchase order pass for a simulated one, or the reverse.
+  .refine((v) => !/^mock-/i.test(v), "is not a real supplier order number");
+
+/** POST /api/extension/orders/:id/placed */
+export const ExtensionPlacedBody = z
+  .object({
+    externalOrderIds: z.array(SupplierOrderId).min(1).max(20),
+    totalCost: z
+      .string()
+      .trim()
+      .regex(/^\d{1,12}(\.\d{1,4})?$/, "must be a plain decimal amount")
+      .optional(),
+    currency: z
+      .string()
+      .trim()
+      .regex(/^[A-Z]{3}$/, "must be a three-letter currency code")
+      .optional(),
+  })
+  .strict();
+
+/** POST /api/extension/orders/:id/tracking */
+export const ExtensionTrackingBody = z
+  .object({
+    number: z
+      .string()
+      .trim()
+      .min(4)
+      .max(64)
+      .regex(/^[A-Za-z0-9-]+$/, "must be a tracking number"),
+    carrier: z.string().trim().min(1).max(80).optional(),
+  })
+  .strict();
+
+/** The first problem with a hostile body, phrased for the extension to show. */
+export function describeZodError(error: z.ZodError): string {
+  const first = error.issues[0];
+  return `${first.path.join(".") || "body"} ${first.message}`;
+}
+
+export interface ExtensionOrder {
+  id: string;
+  orderName: string;
+  createdAt: string;
+  note: string | null;
+  platform: SupplierPlatform;
+  currency: string;
+  totalCost: string;
+  shippingAddress: {
+    name: string;
+    company: string | null;
+    phone: string | null;
+    address1: string | null;
+    address2: string | null;
+    city: string | null;
+    province: string | null;
+    provinceCode: string | null;
+    zip: string | null;
+    country: string | null;
+    countryCode: string | null;
+    taxNumber: string | null;
+  };
+  items: Array<{
+    title: string;
+    variantLabel: string | null;
+    quantity: number;
+    externalProductId: string | null;
+    productUrl: string | null;
+    externalSkuId: string | null;
+    skuAttr: string | null;
+    unitCost: string;
+    currency: string;
+    carrierName: string | null;
+  }>;
+}
+
+function variantLabel(attributes: unknown, fallback: string | null): string | null {
+  if (Array.isArray(attributes)) {
+    const parts = attributes
+      .map((a) => (a && typeof a === "object" ? (a as { name?: unknown; value?: unknown }) : null))
+      .filter((a): a is { name?: unknown; value?: unknown } => Boolean(a && a.value))
+      .map((a) => (a.name ? `${String(a.name)}: ${String(a.value)}` : String(a.value)));
+    if (parts.length > 0) return parts.join(" / ");
+  }
+  return fallback;
+}
+
+/**
+ * GET /api/extension/orders: purchase orders waiting to be placed.
+ *
+ * Carries the customer's shipping address, because a supplier checkout needs
+ * it; that is why these routes send no CORS headers and are only called from
+ * the extension's own pages. The email address is left out: no supplier
+ * checkout asks for it.
+ */
+export async function listAwaitingPlacement(shop: ShopWithSettings): Promise<ExtensionOrder[]> {
+  const rows = await prisma.purchaseOrder.findMany({
+    // A cancelled Shopify order drops off the list at once: nothing clears its
+    // purchase order yet, and buying goods for it is money straight down the drain.
+    where: { order: { shopId: shop.id, canceledAt: null }, status: "AWAITING_PLACEMENT" },
+    include: {
+      order: { select: { name: true, shippingAddress: true } },
+      items: {
+        include: {
+          supplierVariant: { select: { attributes: true, supplierProduct: { select: { url: true } } } },
+          orderLineItem: { select: { variantTitle: true } },
+        },
+      },
+    },
+    orderBy: { createdAt: "asc" },
+    take: 50,
+  });
+
+  return rows.map((po) => {
+    // The same address placement would have sent upstream, phone fallback and all.
+    const address: ShippingAddress = supplierAddressFor(po.order, shop.parsedSettings.orders);
+    return {
+      id: po.id,
+      orderName: po.order.name,
+      createdAt: po.createdAt.toISOString(),
+      note: po.supplierNote,
+      platform: po.platform,
+      currency: po.currency,
+      totalCost: money(po.totalCost),
+      shippingAddress: {
+        name: address.name ?? [address.firstName, address.lastName].filter(Boolean).join(" "),
+        company: address.company ?? null,
+        phone: address.phone ?? null,
+        address1: address.address1 ?? null,
+        address2: address.address2 ?? null,
+        city: address.city ?? null,
+        province: address.province ?? null,
+        provinceCode: address.provinceCode ?? null,
+        zip: address.zip ?? null,
+        country: address.country ?? null,
+        countryCode: address.countryCode ?? null,
+        taxNumber: address.taxNumber ?? null,
+      },
+      items: po.items.map((item) => ({
+        title: item.title,
+        variantLabel: variantLabel(item.supplierVariant?.attributes, item.orderLineItem?.variantTitle ?? null),
+        quantity: item.quantity,
+        externalProductId: item.externalProductId,
+        productUrl: supplierProductUrl(po.platform, item.externalProductId, item.supplierVariant?.supplierProduct.url),
+        externalSkuId: item.externalSkuId,
+        skuAttr: item.externalSkuAttr,
+        unitCost: money(item.unitCost),
+        currency: item.currency,
+        carrierName: item.carrierName,
+      })),
+    };
+  });
+}
+
+export async function countAwaitingPlacement(shopId: string): Promise<number> {
+  return prisma.purchaseOrder.count({ where: { order: { shopId }, status: "AWAITING_PLACEMENT" } });
+}
+
+export interface ExtensionAnswer {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+function storedSupplierOrderIds(po: { externalOrderId: string | null; raw: unknown }): string[] {
+  const raw = po.raw && typeof po.raw === "object" ? (po.raw as { externalOrderIds?: unknown }).externalOrderIds : undefined;
+  if (Array.isArray(raw) && raw.every((v) => typeof v === "string")) return raw as string[];
+  return po.externalOrderId ? [po.externalOrderId] : [];
+}
+
+function sameIds(a: string[], b: string[]): boolean {
+  const left = new Set(a);
+  const right = new Set(b);
+  return left.size === right.size && [...left].every((v) => right.has(v));
+}
+
+/**
+ * The answer for a purchase order that is no longer waiting: the same report
+ * again is fine (the extension retries when a response is lost), anything else
+ * is a conflict. Silently overwriting would lose the id of an order the
+ * merchant has already paid for.
+ */
+function answerForSettled(
+  po: { id: string; status: PurchaseOrderStatus; externalOrderId: string | null; paymentUrl: string | null; raw: unknown },
+  ids: string[],
+): ExtensionAnswer {
+  if (po.externalOrderId && sameIds(storedSupplierOrderIds(po), ids)) {
+    return {
+      status: 200,
+      body: { ok: true, alreadyRecorded: true, purchaseOrderId: po.id, status: po.status, externalOrderId: po.externalOrderId, paymentUrl: po.paymentUrl },
+    };
+  }
+  return {
+    status: 409,
+    body: {
+      ok: false,
+      error: po.externalOrderId
+        ? `This purchase order is already recorded as supplier order ${storedSupplierOrderIds(po).join(", ")}.`
+        : `This purchase order is ${po.status.toLowerCase().replace(/_/g, " ")}, not waiting to be placed.`,
+      status: po.status,
+    },
+  };
+}
+
+/** POST /api/extension/orders/:id/placed */
+export async function markPlacedFromExtension(
+  shop: ShopWithSettings,
+  purchaseOrderId: string,
+  input: z.infer<typeof ExtensionPlacedBody>,
+): Promise<ExtensionAnswer> {
+  const po = await prisma.purchaseOrder.findFirst({
+    where: { id: purchaseOrderId, order: { shopId: shop.id } },
+    include: { order: { select: { id: true, name: true, shopifyOrderId: true, canceledAt: true } } },
+  });
+  if (!po) return { status: 404, body: { ok: false, error: "Purchase order not found" } };
+
+  const ids = [...new Set(input.externalOrderIds.map((v) => v.trim()))];
+  if (po.status !== "AWAITING_PLACEMENT") return answerForSettled(po, ids);
+  if (po.order.canceledAt) {
+    // Recorded as placed, it would sit in the payment queue for an order the
+    // customer no longer wants. The merchant cancels it on AliExpress instead.
+    return { status: 409, body: { ok: false, error: `${po.order.name} was cancelled in Shopify. Cancel the supplier order on AliExpress; it was not recorded.` } };
+  }
+
+  const primary = ids[0];
+  const reportedCurrency = input.currency ?? po.currency;
+  const sameCurrency = reportedCurrency === po.currency;
+  // A total in the purchase order's own currency replaces the estimate, with
+  // the difference taken as shipping. One in another currency cannot be split
+  // honestly, so it is kept for the record and the estimate stands.
+  const totalCost = input.totalCost && sameCurrency ? d(input.totalCost) : d(po.totalCost);
+  const remainder = totalCost.minus(d(po.itemsCost));
+  const shippingCost = input.totalCost && sameCurrency ? (remainder.isNegative() ? d(0) : remainder) : d(po.shippingCost);
+  const converted = await toShopCurrency(shop.currency, po.currency, po.itemsCost, shippingCost);
+  const aliexpress = po.platform === "ALIEXPRESS";
+  const now = new Date();
+
+  const updated = await prisma.purchaseOrder.updateMany({
+    // Conditional on the status, so two reports racing each other cannot both
+    // win: the loser re-reads and gets the idempotent answer or a conflict.
+    where: { id: po.id, status: "AWAITING_PLACEMENT" },
+    data: {
+      status: "AWAITING_PAYMENT",
+      externalOrderId: primary,
+      placedAt: now,
+      totalCost: money(totalCost),
+      shippingCost: money(shippingCost),
+      ...converted,
+      paymentUrl: aliexpress ? orderPaymentUrl(primary) : null,
+      // AliExpress cancels an unpaid order after 24 hours.
+      paymentDueAt: aliexpress ? new Date(now.getTime() + 24 * 3_600_000) : null,
+      errorCode: null,
+      errorMessage: null,
+      raw: {
+        ...(po.raw as object),
+        externalOrderIds: ids,
+        placedBy: "extension",
+        ...(input.totalCost ? { reportedTotal: { amount: input.totalCost, currency: reportedCurrency } } : {}),
+      } as Prisma.InputJsonValue,
+    },
+  });
+  if (updated.count === 0) {
+    const fresh = await prisma.purchaseOrder.findFirst({ where: { id: po.id } });
+    if (!fresh) return { status: 404, body: { ok: false, error: "Purchase order not found" } };
+    return answerForSettled(fresh, ids);
+  }
+
+  await logActivity(shop.id, {
+    actor: "extension",
+    action: "order.placed",
+    entity: "Order",
+    entityId: po.order.id,
+    message: `${po.order.name}: supplier order ${ids.join(", ")} placed on ${po.platform} from the Chrome extension.`,
+    meta: { purchaseOrderId: po.id },
+  });
+  await rollupOrderCosts(po.order.id);
+  await evaluateAndStoreOrder(shop, po.order.id);
+  await tagPlacedOrder(shop, po.order.id, po.order.shopifyOrderId);
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      purchaseOrderId: po.id,
+      status: "AWAITING_PAYMENT",
+      externalOrderId: primary,
+      paymentUrl: aliexpress ? orderPaymentUrl(primary) : null,
+    },
+  };
+}
+
+/** Statuses in which a purchase order has not reached a supplier, so tracking makes no sense. */
+const NOT_PLACED: PurchaseOrderStatus[] = ["DRAFT", "SUBMITTING", "AWAITING_PLACEMENT", "FAILED", "CANCELED"];
+
+/** POST /api/extension/orders/:id/tracking - the same path as tracking typed on the order page. */
+export async function addTrackingFromExtension(
+  shop: ShopWithSettings,
+  purchaseOrderId: string,
+  input: z.infer<typeof ExtensionTrackingBody>,
+): Promise<ExtensionAnswer> {
+  const po = await prisma.purchaseOrder.findFirst({ where: { id: purchaseOrderId, order: { shopId: shop.id } }, select: { id: true, status: true } });
+  if (!po) return { status: 404, body: { ok: false, error: "Purchase order not found" } };
+  if (NOT_PLACED.includes(po.status)) {
+    return {
+      status: 409,
+      body: { ok: false, error: "Record the supplier order as placed before adding its tracking number.", status: po.status },
+    };
+  }
+
+  try {
+    const tracking = await addManualTracking(shop, po.id, { number: input.number, carrierName: input.carrier ?? null }, "extension");
+    return { status: 200, body: { ok: true, purchaseOrderId: po.id, trackingId: tracking.id, number: tracking.number } };
+  } catch (error) {
+    // The number is stored before Shopify is written to. If only that second
+    // step failed (no offline session, say), the periodic sync picks it up, and
+    // telling the extension it failed would make the merchant enter it twice.
+    const stored = await prisma.trackingNumber.findFirst({ where: { purchaseOrderId: po.id, number: input.number } });
+    if (!stored) throw error;
+    logger.warn("Extension tracking stored; Shopify sync deferred", { purchaseOrderId: po.id, error });
+    return { status: 200, body: { ok: true, purchaseOrderId: po.id, trackingId: stored.id, number: stored.number, syncDeferred: true } };
+  }
 }
 
 // ---------------------------------------------------------------------------

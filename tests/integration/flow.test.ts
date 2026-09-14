@@ -1,5 +1,7 @@
 /**
- * End-to-end flow against a real PostgreSQL database and the mock supplier:
+ * End-to-end flow against a real PostgreSQL database and the Demo supplier
+ * (platform MOCK), on a development store - the only kind of store where the
+ * Demo supplier may place orders and write simulated tracking to Shopify:
  *
  *   import → push to Shopify (fake Admin API) → mapping → order ingest →
  *   evaluation → supplier order placement → status sync → tracking →
@@ -39,7 +41,7 @@ describe.skipIf(!TEST_DB)("full dropshipping flow (postgres + mock supplier)", (
     prisma = (await import("~/db.server")).default;
     const { getOrCreateShop } = await import("~/services/shop.server");
     shop = await getOrCreateShop(domain);
-    await prisma.shop.update({ where: { id: shop.id }, data: { currency: "USD", country: "US", primaryLocationId: "gid://shopify/Location/1" } });
+    await prisma.shop.update({ where: { id: shop.id }, data: { currency: "USD", country: "US", primaryLocationId: "gid://shopify/Location/1", isDevelopmentStore: true } });
     shop = (await (await import("~/services/shop.server")).getShopById(shop.id))!;
   });
 
@@ -55,17 +57,19 @@ describe.skipIf(!TEST_DB)("full dropshipping flow (postgres + mock supplier)", (
 
   it("adds a supplier product to the import list with prices from the default rule", async () => {
     const { addToImportList } = await import("~/services/import.server");
-    const imported = await addToImportList(shop, "https://www.aliexpress.com/item/1005006002.html");
+    // The Demo supplier is chosen explicitly. An AliExpress link no longer
+    // reaches the mock under any driver: it gets the real API or a refusal.
+    const imported = await addToImportList(shop, "1005006002", { platform: "MOCK" });
     importedId = imported.id;
     expect(imported.title).toContain("Watch");
     expect(imported.variants).toHaveLength(6);
-    expect(imported.supplierProduct?.platform).toBe("ALIEXPRESS");
+    expect(imported.supplierProduct?.platform).toBe("MOCK");
     // 2x markup + .99 ending
     expect(imported.variants[0].price.toString()).toMatch(/\.99/);
     expect(Number(imported.variants[0].price)).toBeGreaterThan(Number(imported.variants[0].cost));
 
     // Idempotent: adding again returns the same row.
-    const again = await addToImportList(shop, "1005006002");
+    const again = await addToImportList(shop, "1005006002", { platform: "MOCK" });
     expect(again.id).toBe(importedId);
   });
 

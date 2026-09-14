@@ -1,10 +1,11 @@
 {
   "manifest_version": 3,
   "name": "DropshipHub Product Capture",
-  "version": "1.2.0",
-  "description": "Add the AliExpress or CJ product you are viewing to your DropshipHub import list, straight from the product page.",
+  "version": "1.3.0",
+  "description": "Add the AliExpress or CJ product you are viewing to your DropshipHub import list, and see the supplier orders waiting for you to place.",
   "permissions": [
     "activeTab",
+    "scripting",
     "storage"
   ],
   "host_permissions": [
@@ -12,6 +13,11 @@
     "https://*.aliexpress.us/*",
     "https://cjdropshipping.com/*",
     "https://*.cjdropshipping.com/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
   ],
   "action": {
     "default_title": "Add to DropshipHub",

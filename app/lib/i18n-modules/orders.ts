@@ -63,6 +63,22 @@ export const en = {
   "orders.detail.placedAt": "Placed",
   "orders.detail.activityEmptyBody": "Everything that happens to this order is recorded here.",
   "orders.detail.approvalRequested": "Requested",
+
+  // ---- Placement with the Chrome extension ------------------------------------
+  "orders.placement.badge": "Waiting to be placed",
+  "orders.placement.title": "Waiting to be placed with the extension",
+  "orders.placement.body": "Nothing has been ordered from the supplier yet. Open the DropshipHub extension in Chrome, choose Orders to place, and buy each item on its product page. This order moves to Awaiting payment once the extension reports it placed.",
+  "orders.placement.openProduct": "Open on AliExpress",
+  "orders.placement.readyMessage": "{n} supplier order(s) priced and waiting to be placed with the Chrome extension. Nothing has been ordered yet.",
+  "orders.placement.listBannerTitle": "{n} supplier order(s) are waiting to be placed with the Chrome extension",
+  "orders.placement.listBannerBody": "They are priced but not ordered. Open the DropshipHub extension in Chrome and choose Orders to place.",
+  "orders.placement.setUpExtension": "Set up the extension",
+  "orders.placement.paymentsBannerTitle": "{n} more supplier order(s) must be placed with the Chrome extension before they can be paid",
+  "orders.placement.paymentsBannerBody": "They are not in this queue because they do not exist at the supplier yet.",
+
+  // ---- Simulated supplier orders -----------------------------------------------
+  "orders.simulated.title": "Simulated supplier order",
+  "orders.simulated.body": "This supplier order was made up by the Demo supplier. Nothing was ordered or paid for, and its tracking is never sent to a real customer. Cancel it, then send the order to a real supplier.",
 } as const;
 
 export const vi: Partial<Record<keyof typeof en, string>> = {
@@ -125,4 +141,20 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   "orders.detail.placedAt": "Đặt lúc",
   "orders.detail.activityEmptyBody": "Mọi việc xảy ra với đơn này đều được ghi lại ở đây.",
   "orders.detail.approvalRequested": "Yêu cầu lúc",
+
+  // ---- Placement with the Chrome extension ------------------------------------
+  "orders.placement.badge": "Chờ đặt đơn",
+  "orders.placement.title": "Đang chờ đặt đơn qua tiện ích Chrome",
+  "orders.placement.body": "Chưa có gì được đặt với nhà cung cấp. Mở tiện ích DropshipHub trên Chrome, chọn Đơn cần đặt, rồi mua từng món ngay trên trang sản phẩm. Đơn sẽ chuyển sang Chờ thanh toán khi tiện ích báo đã đặt xong.",
+  "orders.placement.openProduct": "Mở trên AliExpress",
+  "orders.placement.readyMessage": "Đã tính giá {n} đơn nhà cung cấp, đang chờ bạn đặt qua tiện ích Chrome. Chưa có đơn nào được đặt.",
+  "orders.placement.listBannerTitle": "{n} đơn nhà cung cấp đang chờ đặt qua tiện ích Chrome",
+  "orders.placement.listBannerBody": "Các đơn này đã có giá nhưng chưa được đặt. Mở tiện ích DropshipHub trên Chrome và chọn Đơn cần đặt.",
+  "orders.placement.setUpExtension": "Cài tiện ích",
+  "orders.placement.paymentsBannerTitle": "Còn {n} đơn nhà cung cấp phải đặt qua tiện ích Chrome trước khi thanh toán được",
+  "orders.placement.paymentsBannerBody": "Các đơn này không nằm trong danh sách vì chưa hề tồn tại bên nhà cung cấp.",
+
+  // ---- Simulated supplier orders -----------------------------------------------
+  "orders.simulated.title": "Đơn nhà cung cấp giả lập",
+  "orders.simulated.body": "Đơn này do Nhà cung cấp mẫu tự tạo ra. Không có gì được đặt hay thanh toán, và mã vận đơn của nó không bao giờ được gửi cho khách thật. Hãy huỷ đơn này rồi gửi đơn hàng cho một nhà cung cấp thật.",
 };

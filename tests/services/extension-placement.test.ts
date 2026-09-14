@@ -1,0 +1,554 @@
+/**
+ * Extension-mode placement, the extension order API, and the rule that
+ * simulated tracking never reaches a real Shopify order.
+ *
+ * Everything fulfillment.server.ts talks to is replaced with a stub, so these
+ * run without a database or Shopify and assert what would have been written.
+ */
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { parseShopSettings } from "~/domain/settings/shop-settings";
+import { resetRateLimits } from "~/lib/rate-limit.server";
+import type { ShopWithSettings } from "~/services/shop.server";
+
+const mocks = vi.hoisted(() => {
+  const fn = () => vi.fn();
+  return {
+    prisma: {
+      $transaction: fn(),
+      order: { findUnique: fn(), update: fn() },
+      purchaseOrder: { findFirst: fn(), findMany: fn(), create: fn(), update: fn(), updateMany: fn(), count: fn() },
+      purchaseOrderItem: { findMany: fn() },
+      supplierVariant: { findUnique: fn() },
+      trackingNumber: { findMany: fn(), findFirst: fn(), updateMany: fn(), update: fn(), upsert: fn() },
+      orderLineItem: { findMany: fn(), update: fn() },
+      shop: { findUnique: fn() },
+    },
+    tx: { $executeRaw: fn(), purchaseOrder: { findFirst: fn(), create: fn() } },
+    logActivity: fn(),
+    notify: fn(),
+    evaluateAndStoreOrder: fn(),
+    lineResolution: fn(),
+    orderIssues: fn(),
+    getShippingOptions: fn(),
+    chooseShippingForShop: fn(),
+    placementModeForShop: fn(),
+    adapterForShop: fn(),
+    placeOrder: fn(),
+    createFulfillmentWithTracking: fn(),
+    updateFulfillmentTracking: fn(),
+    addOrderTags: fn(),
+    offlineClient: fn(),
+  };
+});
+
+vi.mock("~/db.server", () => ({ default: mocks.prisma }));
+vi.mock("~/services/activity.server", () => ({ logActivity: mocks.logActivity }));
+vi.mock("~/services/notifications.server", () => ({ notify: mocks.notify }));
+vi.mock("~/services/currency.server", () => ({ getKnownRate: async () => 1 }));
+vi.mock("~/services/orders.server", () => ({
+  evaluateAndStoreOrder: mocks.evaluateAndStoreOrder,
+  lineResolution: mocks.lineResolution,
+  orderIssues: mocks.orderIssues,
+  supplierAddressFor: (order: { shippingAddress: unknown }) => order.shippingAddress,
+}));
+vi.mock("~/services/shipping.server", () => ({ chooseShippingForShop: mocks.chooseShippingForShop }));
+vi.mock("~/services/shop.server", () => ({ withSettings: (shop: object) => ({ ...shop, parsedSettings: parseShopSettings({}) }) }));
+vi.mock("~/services/shopify/graphql.server", () => ({ offlineClient: mocks.offlineClient }));
+vi.mock("~/services/shopify/orders.server", () => ({
+  addOrderTags: mocks.addOrderTags,
+  createFulfillmentWithTracking: mocks.createFulfillmentWithTracking,
+  updateFulfillmentTracking: mocks.updateFulfillmentTracking,
+}));
+vi.mock("~/services/supplier-accounts.server", () => ({ touchSupplierAccount: vi.fn() }));
+vi.mock("~/services/suppliers/catalog.server", () => ({ getShippingOptions: mocks.getShippingOptions }));
+vi.mock("~/services/suppliers/index.server", () => ({
+  adapterForShop: mocks.adapterForShop,
+  placementModeForShop: mocks.placementModeForShop,
+  supplierProductUrl: (platform: string, id: string | null) => (platform === "ALIEXPRESS" && id ? `https://www.aliexpress.com/item/${id}.html` : null),
+  unavailableReason: (platform: string) => `${platform} cannot be reached from DropshipHub yet.`,
+}));
+
+const fulfillment = await import("~/services/fulfillment.server");
+
+function makeShop(overrides: Partial<ShopWithSettings> = {}): ShopWithSettings {
+  return {
+    id: "shop1",
+    domain: "real-store.myshopify.com",
+    currency: "USD",
+    isDevelopmentStore: false,
+    isActive: true,
+    apiToken: "dsh_abcdefghijklmnopqrstuvwxyz012345",
+    parsedSettings: parseShopSettings({}),
+    ...overrides,
+  } as ShopWithSettings;
+}
+
+const address = { name: "Jane Doe", phone: "+15125550100", address1: "1 Main St", city: "Austin", province: "TX", zip: "78701", countryCode: "US", country: "United States" };
+
+const resolved = {
+  mappingRowId: "m1",
+  supplierVariantId: "sv1",
+  externalProductId: "1005006001",
+  externalSkuId: "12000031",
+  skuAttr: "14:193#Black",
+  platform: "ALIEXPRESS",
+  title: "Wireless earbuds, black",
+  quantity: 2,
+  unitCost: "3.50",
+  currency: "USD",
+};
+
+function orderRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "order1",
+    shopId: "shop1",
+    name: "#1001",
+    isTest: false,
+    currency: "USD",
+    shopifyOrderId: "gid://shopify/Order/1",
+    shippingAddress: address,
+    customerEmail: "jane@example.com",
+    countryCode: "US",
+    lineItems: [{ id: "li1", shopifyLineItemId: "gid://shopify/LineItem/1", productVariantId: "pv1", isCanceled: false, isFulfilled: false, title: "Earbuds" }],
+    purchaseOrders: [],
+    ...overrides,
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  resetRateLimits();
+  const { prisma, tx } = mocks;
+  prisma.$transaction.mockImplementation(async (work: (t: typeof tx) => unknown) => work(tx));
+  prisma.purchaseOrderItem.findMany.mockResolvedValue([]);
+  prisma.supplierVariant.findUnique.mockResolvedValue({ supplierProductId: "sp1" });
+  prisma.purchaseOrder.findMany.mockResolvedValue([]);
+  prisma.purchaseOrder.update.mockResolvedValue({});
+  prisma.purchaseOrder.create.mockResolvedValue({});
+  prisma.order.update.mockResolvedValue({});
+  prisma.trackingNumber.updateMany.mockResolvedValue({ count: 0 });
+  tx.purchaseOrder.findFirst.mockResolvedValue(null);
+  tx.purchaseOrder.create.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({ id: "po1", ...data }));
+  mocks.evaluateAndStoreOrder.mockResolvedValue({});
+  mocks.orderIssues.mockReturnValue([]);
+  mocks.lineResolution.mockReturnValue({ ok: true, lines: [resolved], totalCost: "7.00" });
+  mocks.getShippingOptions.mockResolvedValue([{ carrierCode: "CAINIAO_STANDARD" }]);
+  mocks.chooseShippingForShop.mockResolvedValue({
+    ok: true,
+    option: { carrierCode: "CAINIAO_STANDARD", carrierName: "AliExpress Standard Shipping", shipFromCountry: "CN", maxDeliveryDays: 20, cost: "1.99" },
+    reason: "Cheapest tracked option.",
+  });
+  mocks.adapterForShop.mockResolvedValue({ adapter: { platform: "ALIEXPRESS", simulated: false, placeOrder: mocks.placeOrder }, account: null });
+  mocks.offlineClient.mockResolvedValue({});
+});
+
+describe("placeSupplierOrders in extension mode", () => {
+  it("creates an AWAITING_PLACEMENT purchase order with full items, under the lock, and calls no supplier", async () => {
+    mocks.placementModeForShop.mockResolvedValue("extension");
+    mocks.prisma.order.findUnique.mockResolvedValue(orderRow());
+
+    const outcome = await fulfillment.placeSupplierOrders(makeShop(), "order1");
+
+    expect(outcome).toMatchObject({ ok: true, purchaseOrderIds: ["po1"], awaitingPlacementIds: ["po1"] });
+    expect(mocks.placeOrder).not.toHaveBeenCalled();
+    // The advisory lock and the idempotency key work exactly as for an API placement.
+    expect(mocks.tx.$executeRaw).toHaveBeenCalled();
+    const { data } = mocks.tx.purchaseOrder.create.mock.calls[0][0];
+    expect(data.status).toBe("AWAITING_PLACEMENT");
+    expect(data.idempotencyKey).toMatch(/^dh-[0-9a-f]{24}$/);
+    expect(data).toMatchObject({ platform: "ALIEXPRESS", itemsCost: "7.00", shippingCost: "1.99", totalCost: "8.99" });
+    expect(data.raw).toMatchObject({ placementMode: "extension", simulated: false });
+    expect(data.items.create).toEqual([
+      expect.objectContaining({
+        externalProductId: "1005006001",
+        externalSkuId: "12000031",
+        externalSkuAttr: "14:193#Black",
+        quantity: 2,
+        unitCost: "3.50",
+        carrierName: "AliExpress Standard Shipping",
+      }),
+    ]);
+    // Told what to do next, and not told it was placed.
+    expect(mocks.notify).toHaveBeenCalledWith("shop1", expect.objectContaining({ title: expect.stringMatching(/ready to place with the Chrome extension/) }));
+    expect(mocks.addOrderTags).not.toHaveBeenCalled();
+  });
+
+  it("is a no-op when the same purchase order already exists", async () => {
+    mocks.placementModeForShop.mockResolvedValue("extension");
+    mocks.prisma.order.findUnique.mockResolvedValue(orderRow());
+    mocks.tx.purchaseOrder.findFirst.mockResolvedValue({ id: "po1", status: "AWAITING_PLACEMENT" });
+
+    const outcome = await fulfillment.placeSupplierOrders(makeShop(), "order1");
+
+    expect(mocks.tx.purchaseOrder.create).not.toHaveBeenCalled();
+    expect(outcome.awaitingPlacementIds).toEqual([]);
+    expect(mocks.notify).not.toHaveBeenCalled();
+  });
+
+  it("fails a platform nothing can place with the reason, once, instead of simulating it", async () => {
+    mocks.placementModeForShop.mockResolvedValue("unavailable");
+    mocks.lineResolution.mockReturnValue({ ok: true, lines: [{ ...resolved, platform: "TEMU" }], totalCost: "7.00" });
+    mocks.prisma.order.findUnique.mockResolvedValue(orderRow());
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValueOnce(null).mockResolvedValueOnce({ id: "failed1" });
+
+    const first = await fulfillment.placeSupplierOrders(makeShop(), "order1");
+    expect(first.ok).toBe(false);
+    expect(first.error).toMatch(/TEMU cannot be reached/);
+    expect(mocks.prisma.purchaseOrder.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ status: "FAILED", errorCode: "SUPPLIER_UNAVAILABLE", platform: "TEMU" }),
+    });
+
+    // The auto-place tick comes back; it must not stack another FAILED row.
+    await fulfillment.placeSupplierOrders(makeShop(), "order1");
+    expect(mocks.prisma.purchaseOrder.create).toHaveBeenCalledTimes(1);
+    expect(mocks.placeOrder).not.toHaveBeenCalled();
+    expect(mocks.tx.purchaseOrder.create).not.toHaveBeenCalled();
+  });
+
+  it("will not run the Demo supplier for a real customer's order on a real store", async () => {
+    mocks.placementModeForShop.mockResolvedValue("demo");
+    mocks.lineResolution.mockReturnValue({ ok: true, lines: [{ ...resolved, platform: "MOCK" }], totalCost: "7.00" });
+    mocks.prisma.order.findUnique.mockResolvedValue(orderRow());
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(null);
+
+    const outcome = await fulfillment.placeSupplierOrders(makeShop(), "order1");
+    expect(outcome.ok).toBe(false);
+    expect(mocks.prisma.purchaseOrder.create).toHaveBeenCalledWith({ data: expect.objectContaining({ errorCode: "DEMO_SUPPLIER_REAL_ORDER" }) });
+    expect(mocks.placeOrder).not.toHaveBeenCalled();
+  });
+
+  it("still lets the Demo supplier run on a test order, for the reviewer walkthrough", () => {
+    expect(fulfillment.placementRefusal("demo", "MOCK", { isTest: true, isDevelopmentStore: false })).toBeNull();
+    expect(fulfillment.placementRefusal("demo", "MOCK", { isTest: false, isDevelopmentStore: true })).toBeNull();
+    expect(fulfillment.placementRefusal("extension", "ALIEXPRESS", { isTest: false, isDevelopmentStore: false })).toBeNull();
+  });
+});
+
+describe("simulated purchase orders and Shopify", () => {
+  it("recognises Demo supplier orders and MOCK- ids left on real platforms", () => {
+    expect(fulfillment.isSimulatedPurchaseOrder({ platform: "MOCK", externalOrderId: null })).toBe(true);
+    expect(fulfillment.isSimulatedPurchaseOrder({ platform: "ALIEXPRESS", externalOrderId: "MOCK-LX1-42" })).toBe(true);
+    expect(fulfillment.isSimulatedPurchaseOrder({ platform: "ALIEXPRESS", externalOrderId: "8190000000000000", raw: { simulated: true } })).toBe(true);
+    expect(fulfillment.isSimulatedPurchaseOrder({ platform: "ALIEXPRESS", externalOrderId: "8190000000000000", raw: {} })).toBe(false);
+  });
+
+  it("allows simulated writes only on test orders or development stores, and then silently", () => {
+    const simulated = { platform: "MOCK" as const, externalOrderId: "MOCK-1" };
+    expect(fulfillment.shopifyWritePolicy(simulated, { orderIsTest: false, isDevelopmentStore: false }).allowed).toBe(false);
+    expect(fulfillment.shopifyWritePolicy(simulated, { orderIsTest: true, isDevelopmentStore: false })).toEqual({ allowed: true, notifyCustomer: false, trackingUrls: false });
+    expect(fulfillment.shopifyWritePolicy({ platform: "ALIEXPRESS", externalOrderId: "8190" }, { orderIsTest: false, isDevelopmentStore: false })).toEqual({
+      allowed: true,
+      notifyCustomer: true,
+      trackingUrls: true,
+    });
+  });
+
+  function pendingTracking(purchaseOrder: Record<string, unknown>) {
+    return {
+      id: "t1",
+      purchaseOrderId: "po1",
+      number: "DEMO-0000000042",
+      carrierName: "Demo carrier",
+      carrierCode: "DEMO",
+      trackingUrl: "https://global.cainiao.com/detail.htm?mailNoList=LP1",
+      notifyCustomer: true,
+      purchaseOrder: { id: "po1", orderId: "order1", items: [{ orderLineItemId: "li1" }], trackings: [], ...purchaseOrder },
+    };
+  }
+
+  it("never creates a fulfilment from simulated tracking on a real order", async () => {
+    mocks.prisma.trackingNumber.findMany.mockResolvedValue([
+      pendingTracking({ platform: "ALIEXPRESS", externalOrderId: "MOCK-LX1-42", raw: {}, order: { name: "#1001", isTest: false, shopifyOrderId: "gid://shopify/Order/1" } }),
+    ]);
+
+    const result = await fulfillment.syncPendingTracking(makeShop(), undefined, {} as never);
+
+    expect(mocks.createFulfillmentWithTracking).not.toHaveBeenCalled();
+    expect(mocks.updateFulfillmentTracking).not.toHaveBeenCalled();
+    expect(result).toEqual({ synced: 0, failed: 0 });
+    // Excluded in the query too, so rows that can never sync do not crowd out real ones.
+    const where = mocks.prisma.trackingNumber.findMany.mock.calls[0][0].where;
+    expect(JSON.stringify(where)).toContain("MOCK-");
+    expect(JSON.stringify(where)).toContain("\"isTest\":true");
+    // And the merchant can see why.
+    expect(mocks.prisma.trackingNumber.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { syncError: expect.stringMatching(/Demo supplier/) } }),
+    );
+  });
+
+  it("fulfils a test order from the Demo supplier without emailing or linking a carrier", async () => {
+    mocks.prisma.trackingNumber.findMany.mockResolvedValue([
+      pendingTracking({ platform: "MOCK", externalOrderId: "MOCK-LX1-42", raw: {}, order: { name: "#1001", isTest: true, shopifyOrderId: "gid://shopify/Order/1" } }),
+    ]);
+    mocks.prisma.orderLineItem.findMany.mockResolvedValue([{ id: "li1", shopifyLineItemId: "gid://shopify/LineItem/1", fulfillableQuantity: 1 }]);
+    mocks.createFulfillmentWithTracking.mockResolvedValue({ skipped: false, id: "gid://shopify/Fulfillment/1", fulfilled: { "gid://shopify/LineItem/1": 1 } });
+
+    await fulfillment.syncPendingTracking(makeShop(), undefined, {} as never);
+
+    expect(mocks.createFulfillmentWithTracking).toHaveBeenCalledTimes(1);
+    const input = mocks.createFulfillmentWithTracking.mock.calls[0][1];
+    expect(input.notifyCustomer).toBe(false);
+    expect(input.tracking.urls).toEqual([]);
+  });
+
+  it("leaves real tracking exactly as it was", async () => {
+    mocks.prisma.trackingNumber.findMany.mockResolvedValue([
+      pendingTracking({ platform: "ALIEXPRESS", externalOrderId: "8190000000000000", raw: {}, order: { name: "#1001", isTest: false, shopifyOrderId: "gid://shopify/Order/1" } }),
+    ]);
+    mocks.prisma.orderLineItem.findMany.mockResolvedValue([{ id: "li1", shopifyLineItemId: "gid://shopify/LineItem/1", fulfillableQuantity: 1 }]);
+    mocks.createFulfillmentWithTracking.mockResolvedValue({ skipped: false, id: "gid://shopify/Fulfillment/1", fulfilled: { "gid://shopify/LineItem/1": 1 } });
+
+    await fulfillment.syncPendingTracking(makeShop(), undefined, {} as never);
+
+    const input = mocks.createFulfillmentWithTracking.mock.calls[0][1];
+    expect(input.notifyCustomer).toBe(true);
+    expect(input.tracking.urls).toHaveLength(1);
+  });
+});
+
+describe("syncPurchaseOrder", () => {
+  it("does not poll an order placed from the browser", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ id: "po1", platform: "ALIEXPRESS", externalOrderId: "8190000000000000", status: "AWAITING_PAYMENT", raw: {}, trackings: [], order: {} });
+    mocks.placementModeForShop.mockResolvedValue("extension");
+
+    const result = await fulfillment.syncPurchaseOrder(makeShop(), "po1");
+
+    expect(result).toEqual({ changed: false, status: "AWAITING_PAYMENT", newTracking: 0 });
+    expect(mocks.adapterForShop).not.toHaveBeenCalled();
+  });
+
+  it("does not poll a MOCK- id left on a real platform, even with the API connected", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ id: "po1", platform: "ALIEXPRESS", externalOrderId: "MOCK-LX1-42", status: "PAID", raw: {}, trackings: [], order: {} });
+    mocks.placementModeForShop.mockResolvedValue("api");
+
+    await fulfillment.syncPurchaseOrder(makeShop(), "po1");
+
+    expect(mocks.adapterForShop).not.toHaveBeenCalled();
+  });
+});
+
+describe("extension request guard", () => {
+  function request(headers: Record<string, string> = {}, body?: BodyInit) {
+    return new Request("https://app.example.com/api/extension/orders", { method: body === undefined ? "GET" : "POST", headers, body });
+  }
+
+  it("refuses a malformed token without touching the database", async () => {
+    await expect(fulfillment.authenticateExtensionRequest(request({ authorization: "Bearer x" }), { scope: "t", limit: 5 })).rejects.toMatchObject({ status: 401 });
+    await expect(fulfillment.authenticateExtensionRequest(request(), { scope: "t", limit: 5 })).rejects.toMatchObject({ status: 401 });
+    expect(mocks.prisma.shop.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("limits by address before looking a token up, so a flood of bad tokens costs no queries", async () => {
+    mocks.prisma.shop.findUnique.mockResolvedValue(null);
+    const bad = () => request({ authorization: "Bearer dsh_not_a_real_token_000000", "x-forwarded-for": "203.0.113.9" });
+    for (let i = 0; i < 120; i += 1) {
+      await expect(fulfillment.authenticateExtensionRequest(bad(), { scope: "t", limit: 1000 })).rejects.toMatchObject({ status: 401 });
+    }
+    await expect(fulfillment.authenticateExtensionRequest(bad(), { scope: "t", limit: 1000 })).rejects.toMatchObject({ status: 429 });
+    expect(mocks.prisma.shop.findUnique).toHaveBeenCalledTimes(120);
+  });
+
+  it("limits each shop's token per scope", async () => {
+    mocks.prisma.shop.findUnique.mockResolvedValue({ id: "shop1", isActive: true, settings: {} });
+    const good = () => request({ authorization: "Bearer dsh_abcdefghijklmnopqrstuvwxyz012345" });
+    await expect(fulfillment.authenticateExtensionRequest(good(), { scope: "orders-read", limit: 2 })).resolves.toMatchObject({ id: "shop1" });
+    await expect(fulfillment.authenticateExtensionRequest(good(), { scope: "orders-read", limit: 2 })).resolves.toMatchObject({ id: "shop1" });
+    await expect(fulfillment.authenticateExtensionRequest(good(), { scope: "orders-read", limit: 2 })).rejects.toMatchObject({ status: 429 });
+    expect(() => fulfillment.spendExtensionBudget("shop1", { scope: "capture", limit: 3, cost: 4 })).toThrow(/Too many requests/);
+  });
+
+  it("caps the body by declared length and by what actually arrives", async () => {
+    await expect(fulfillment.readJsonBody(request({ "content-length": "999999" }, "{}"), 1024)).rejects.toMatchObject({ status: 413 });
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`{"a":"${"x".repeat(4096)}"}`));
+        controller.close();
+      },
+    });
+    const chunked = new Request("https://app.example.com/x", { method: "POST", body: stream, duplex: "half" } as RequestInit);
+    await expect(fulfillment.readJsonBody(chunked, 1024)).rejects.toMatchObject({ status: 413 });
+    await expect(fulfillment.readJsonBody(request({}, "not json"), 1024)).rejects.toMatchObject({ status: 400 });
+    await expect(fulfillment.readJsonBody(request({}, '{"ok":1}'), 1024)).resolves.toEqual({ ok: 1 });
+  });
+});
+
+describe("extension order bodies", () => {
+  it("accepts a real report", () => {
+    expect(fulfillment.ExtensionPlacedBody.safeParse({ externalOrderIds: ["8190000000000000"], totalCost: "12.40", currency: "USD" }).success).toBe(true);
+    expect(fulfillment.ExtensionTrackingBody.safeParse({ number: "LP00123456789CN", carrier: "Cainiao" }).success).toBe(true);
+  });
+
+  it("rejects hostile or invented input", () => {
+    const placed = fulfillment.ExtensionPlacedBody;
+    expect(placed.safeParse({ externalOrderIds: [] }).success).toBe(false);
+    expect(placed.safeParse({ externalOrderIds: ["<script>"] }).success).toBe(false);
+    expect(placed.safeParse({ externalOrderIds: ["MOCK-LX1-42"] }).success).toBe(false);
+    expect(placed.safeParse({ externalOrderIds: Array.from({ length: 21 }, (_, i) => String(i)) }).success).toBe(false);
+    expect(placed.safeParse({ externalOrderIds: ["1"], totalCost: "-5" }).success).toBe(false);
+    expect(placed.safeParse({ externalOrderIds: ["1"], currency: "usd" }).success).toBe(false);
+    expect(placed.safeParse({ externalOrderIds: ["1"], status: "DELIVERED" }).success).toBe(false);
+    const tracking = fulfillment.ExtensionTrackingBody;
+    expect(tracking.safeParse({ number: "a b c d" }).success).toBe(false);
+    expect(tracking.safeParse({ number: "x".repeat(65) }).success).toBe(false);
+    expect(tracking.safeParse({ number: "LP001234", url: "https://evil.example" }).success).toBe(false);
+  });
+});
+
+describe("listAwaitingPlacement", () => {
+  it("returns what a supplier checkout needs, and nothing it does not", async () => {
+    mocks.prisma.purchaseOrder.findMany.mockResolvedValue([
+      {
+        id: "po1",
+        platform: "ALIEXPRESS",
+        currency: "USD",
+        totalCost: "8.99",
+        supplierNote: "No invoice please",
+        createdAt: new Date("2026-09-14T10:00:00Z"),
+        order: { name: "#1001", shippingAddress: { ...address, email: "jane@example.com" } },
+        items: [
+          {
+            title: "Wireless earbuds",
+            quantity: 2,
+            externalProductId: "1005006001",
+            externalSkuId: "12000031",
+            externalSkuAttr: "14:193#Black",
+            unitCost: "3.50",
+            currency: "USD",
+            carrierName: "AliExpress Standard Shipping",
+            supplierVariant: { attributes: [{ name: "Color", value: "Black" }], supplierProduct: { url: "https://www.aliexpress.com/item/1005006001.html" } },
+            orderLineItem: { variantTitle: "Black" },
+          },
+        ],
+      },
+    ]);
+
+    const [order] = await fulfillment.listAwaitingPlacement(makeShop());
+
+    expect(mocks.prisma.purchaseOrder.findMany.mock.calls[0][0].where).toEqual({ order: { shopId: "shop1", canceledAt: null }, status: "AWAITING_PLACEMENT" });
+    expect(order).toMatchObject({ id: "po1", orderName: "#1001", note: "No invoice please", createdAt: "2026-09-14T10:00:00.000Z" });
+    expect(order.shippingAddress).toMatchObject({ name: "Jane Doe", phone: "+15125550100", address1: "1 Main St", zip: "78701", countryCode: "US" });
+    expect(JSON.stringify(order)).not.toContain("jane@example.com");
+    expect(order.items[0]).toEqual({
+      title: "Wireless earbuds",
+      variantLabel: "Color: Black",
+      quantity: 2,
+      externalProductId: "1005006001",
+      productUrl: "https://www.aliexpress.com/item/1005006001.html",
+      externalSkuId: "12000031",
+      skuAttr: "14:193#Black",
+      unitCost: "3.50",
+      currency: "USD",
+      carrierName: "AliExpress Standard Shipping",
+    });
+  });
+});
+
+describe("markPlacedFromExtension", () => {
+  const waiting = {
+    id: "po1",
+    status: "AWAITING_PLACEMENT",
+    platform: "ALIEXPRESS",
+    currency: "USD",
+    itemsCost: "7.00",
+    shippingCost: "1.99",
+    totalCost: "8.99",
+    externalOrderId: null,
+    paymentUrl: null,
+    raw: { placementMode: "extension" },
+    order: { id: "order1", name: "#1001", shopifyOrderId: "gid://shopify/Order/1" },
+  };
+
+  it("is scoped to the token's shop", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(null);
+    const answer = await fulfillment.markPlacedFromExtension(makeShop(), "po_other_shop", { externalOrderIds: ["8190000000000000"] });
+    expect(answer.status).toBe(404);
+    expect(mocks.prisma.purchaseOrder.findFirst.mock.calls[0][0].where).toEqual({ id: "po_other_shop", order: { shopId: "shop1" } });
+  });
+
+  it("records the order ids, the payment link and the reported total, then re-evaluates", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(waiting);
+    mocks.prisma.purchaseOrder.updateMany.mockResolvedValue({ count: 1 });
+
+    const answer = await fulfillment.markPlacedFromExtension(makeShop(), "po1", { externalOrderIds: ["8190000000000001", "8190000000000002"], totalCost: "12.40", currency: "USD" });
+
+    expect(answer.status).toBe(200);
+    const call = mocks.prisma.purchaseOrder.updateMany.mock.calls[0][0];
+    expect(call.where).toEqual({ id: "po1", status: "AWAITING_PLACEMENT" });
+    expect(call.data).toMatchObject({
+      status: "AWAITING_PAYMENT",
+      externalOrderId: "8190000000000001",
+      totalCost: "12.40",
+      shippingCost: "5.40",
+      paymentUrl: "https://www.aliexpress.com/p/order/detail.html?orderId=8190000000000001",
+    });
+    expect(call.data.placedAt).toBeInstanceOf(Date);
+    expect(call.data.raw).toMatchObject({ placementMode: "extension", externalOrderIds: ["8190000000000001", "8190000000000002"], placedBy: "extension" });
+    expect(mocks.evaluateAndStoreOrder).toHaveBeenCalledWith(expect.objectContaining({ id: "shop1" }), "order1");
+    expect(mocks.addOrderTags).toHaveBeenCalled();
+  });
+
+  it("keeps the estimate when the total comes in another currency", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(waiting);
+    mocks.prisma.purchaseOrder.updateMany.mockResolvedValue({ count: 1 });
+    await fulfillment.markPlacedFromExtension(makeShop(), "po1", { externalOrderIds: ["8190000000000001"], totalCost: "310000", currency: "VND" });
+    const { data } = mocks.prisma.purchaseOrder.updateMany.mock.calls[0][0];
+    expect(data.totalCost).toBe("8.99");
+    expect(data.raw.reportedTotal).toEqual({ amount: "310000", currency: "VND" });
+  });
+
+  it("refuses to record an order whose Shopify order was cancelled meanwhile", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ ...waiting, order: { ...waiting.order, canceledAt: new Date() } });
+    const answer = await fulfillment.markPlacedFromExtension(makeShop(), "po1", { externalOrderIds: ["8190000000000001"] });
+    expect(answer.status).toBe(409);
+    expect(mocks.prisma.purchaseOrder.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("answers the same report twice with success and writes nothing the second time", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ ...waiting, status: "AWAITING_PAYMENT", externalOrderId: "8190000000000001", raw: { externalOrderIds: ["8190000000000001"] } });
+    const answer = await fulfillment.markPlacedFromExtension(makeShop(), "po1", { externalOrderIds: ["8190000000000001"] });
+    expect(answer).toMatchObject({ status: 200, body: { alreadyRecorded: true } });
+    expect(mocks.prisma.purchaseOrder.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("refuses a different id on a purchase order that is already placed", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ ...waiting, status: "AWAITING_PAYMENT", externalOrderId: "8190000000000001", raw: { externalOrderIds: ["8190000000000001"] } });
+    const answer = await fulfillment.markPlacedFromExtension(makeShop(), "po1", { externalOrderIds: ["8190000000000009"] });
+    expect(answer.status).toBe(409);
+    expect(mocks.prisma.purchaseOrder.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("gives the loser of a race the conflict, not a second write", async () => {
+    mocks.prisma.purchaseOrder.findFirst
+      .mockResolvedValueOnce(waiting)
+      .mockResolvedValueOnce({ ...waiting, status: "AWAITING_PAYMENT", externalOrderId: "8190000000000001", raw: { externalOrderIds: ["8190000000000001"] } });
+    mocks.prisma.purchaseOrder.updateMany.mockResolvedValue({ count: 0 });
+    const answer = await fulfillment.markPlacedFromExtension(makeShop(), "po1", { externalOrderIds: ["8190000000000009"] });
+    expect(answer.status).toBe(409);
+    expect(mocks.evaluateAndStoreOrder).not.toHaveBeenCalled();
+  });
+});
+
+describe("addTrackingFromExtension", () => {
+  it("refuses tracking for an order that has not been placed", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ id: "po1", status: "AWAITING_PLACEMENT" });
+    const answer = await fulfillment.addTrackingFromExtension(makeShop(), "po1", { number: "LP00123456789CN" });
+    expect(answer.status).toBe(409);
+    expect(mocks.prisma.trackingNumber.upsert).not.toHaveBeenCalled();
+  });
+
+  it("goes through the manual tracking path for a placed order", async () => {
+    mocks.prisma.purchaseOrder.findFirst
+      .mockResolvedValueOnce({ id: "po1", status: "AWAITING_PAYMENT" })
+      .mockResolvedValueOnce({ id: "po1", orderId: "order1", status: "AWAITING_PAYMENT" });
+    mocks.prisma.trackingNumber.upsert.mockResolvedValue({ id: "t1", number: "LP00123456789CN" });
+    mocks.prisma.trackingNumber.findMany.mockResolvedValue([]);
+
+    const answer = await fulfillment.addTrackingFromExtension(makeShop(), "po1", { number: "LP00123456789CN", carrier: "Cainiao" });
+
+    expect(answer).toMatchObject({ status: 200, body: { ok: true, trackingId: "t1" } });
+    expect(mocks.prisma.trackingNumber.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ create: expect.objectContaining({ number: "LP00123456789CN", carrierName: "Cainiao" }) }),
+    );
+    expect(mocks.prisma.purchaseOrder.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "SHIPPED" }) }));
+  });
+});
