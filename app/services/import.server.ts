@@ -1,6 +1,7 @@
 import type { ImportStatus, ImportedProduct, ImportedVariant, Prisma, SupplierProduct, SupplierVariant } from "@prisma/client";
 import prisma, { chunkedTransaction } from "~/db.server";
 import { computePrice } from "~/domain/pricing/engine";
+import { fallbackSku, storefrontVendor } from "~/domain/suppliers/listing";
 import type { PricingRuleInput } from "~/domain/pricing/types";
 import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
@@ -71,7 +72,8 @@ export async function addToImportList(
     supplierProductId: product.id,
     title: detail.title.slice(0, 255),
     description: settings.importDescription ? cleanDescription(detail.descriptionHtml, settings.cleanDescription) : "",
-    vendor: settings.defaultVendor || detail.storeName || null,
+    // Never detail.storeName: most themes print the vendor on the product page.
+    vendor: storefrontVendor(settings.defaultVendor, shop.name),
     productType: settings.defaultProductType || null,
     tags: settings.defaultTags.split(",").map((t) => t.trim()).filter(Boolean),
     images: detail.images.slice(0, settings.maxImages),
@@ -146,7 +148,7 @@ async function buildVariantRows(
     rows.push({
       supplierVariantId: cached?.id ?? null,
       title: sv.attributes.map((a) => a.value).join(" / ") || "Default Title",
-      sku: sv.sku ?? null,
+      sku: sv.sku || fallbackSku(product.platform, sv.externalSkuId),
       optionValues: sv.attributes.map((a) => a.value) as unknown as Prisma.InputJsonValue,
       image: sv.image ?? null,
       cost: cost.toString(),
