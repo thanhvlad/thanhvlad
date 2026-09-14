@@ -31,7 +31,7 @@ import { Thumb } from "~/components/Thumb";
 import type { ResolveResult } from "~/domain/mapping/types";
 import { FAILURE_LABELS } from "~/domain/mapping/resolve";
 import type { ShippingAddress } from "~/domain/orders/address";
-import type { OrderIssue } from "~/domain/orders/pipeline";
+import { waitingOnlyForExtension, type OrderIssue } from "~/domain/orders/pipeline";
 import { readForm, requireShop } from "~/lib/auth.server";
 import { errorMessage } from "~/lib/errors";
 import { adminUrl, formatDate, formatMoney, legacyId } from "~/lib/format";
@@ -199,9 +199,13 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       }
       case "approve-fulfillment": {
         const outcome = await approveFulfillmentRequest(shop, get("requestId"), actor);
-        return outcome.ok
-          ? { ok: true, messageKey: "msg.fulfillmentApproved" }
-          : { ok: false, error: outcome.error, issues: outcome.issues };
+        if (!outcome.ok) return { ok: false, error: outcome.error, issues: outcome.issues };
+        // Approving an AliExpress order only queues it for the extension, and
+        // "the supplier order has been placed" would send the merchant looking
+        // for an order that does not exist yet.
+        return outcome.awaitingPlacementIds?.length
+          ? { ok: true, messageKey: "orders.fulfillmentRequest.approvedAwaitingPlacement" }
+          : { ok: true, messageKey: "msg.fulfillmentApproved" };
       }
       case "decline-fulfillment": {
         const outcome = await declineFulfillmentRequest(shop, get("requestId"), get("reason"), actor);
@@ -245,11 +249,21 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       }
       case "cancel-po": {
         const result = await cancelPurchaseOrder(shop, get("purchaseOrderId"), get("reason") || undefined, actor);
-        return { ok: true, message: result.upstream ? "Canceled at the supplier." : "Canceled locally; cancel manually at the supplier if needed." };
+        const messageKey = result.alreadyCanceled
+          ? "orders.detail.cancelPo.alreadyCanceled"
+          : result.neverPlaced
+            ? "orders.detail.cancelPo.doneNeverPlaced"
+            : result.upstream
+              ? "orders.detail.cancelPo.doneUpstream"
+              : "orders.detail.cancelPo.doneLocal";
+        return { ok: true, messageKey };
       }
-      case "manual-po":
-        await markPurchaseOrderManual(shop, get("purchaseOrderId"), get("externalOrderId"), actor);
-        return { ok: true, messageKey: "msg.supplierOrderLinked" };
+      case "manual-po": {
+        const linked = await markPurchaseOrderManual(shop, get("purchaseOrderId"), get("externalOrderId"), actor);
+        return linked.discardedTracking
+          ? { ok: true, messageKey: "orders.detail.linkedDiscardedTracking", messageVars: { n: linked.discardedTracking } }
+          : { ok: true, messageKey: "msg.supplierOrderLinked" };
+      }
       case "add-tracking":
         await addManualTracking(shop, get("purchaseOrderId"), { number: get("number"), carrierName: get("carrier") || null, url: get("url") || null }, actor);
         return { ok: true, messageKey: "msg.trackingAdded" };
@@ -281,6 +295,10 @@ const TOAST_KEYS = new Set(["msg.addressSaved", "msg.lineItemUpdated", "msg.trac
 function toneFor(messageKey: string | undefined): "success" | "info" | "warning" {
   if (messageKey === "msg.trackingSyncedWithFailures") return "warning";
   if (messageKey === "orders.placement.readyMessage") return "info";
+  if (messageKey === "orders.fulfillmentRequest.approvedAwaitingPlacement") return "info";
+  if (messageKey === "orders.detail.linkedDiscardedTracking") return "warning";
+  if (messageKey === "orders.detail.cancelPo.doneLocal") return "warning";
+  if (messageKey === "orders.detail.cancelPo.alreadyCanceled") return "info";
   if (messageKey === "msg.fulfillmentDeclined") return "info";
   return "success";
 }
@@ -314,9 +332,11 @@ export default function OrderDetailPage() {
   const errors = order.issues.filter((i) => i.severity === "error");
   const warnings = order.issues.filter((i) => i.severity === "warning");
   const awaitingPlacement = order.purchaseOrders.filter((po) => po.status === "AWAITING_PLACEMENT");
-  // A pending order whose lines are all waiting for the extension has nothing
-  // left to send; offering "Send" there only re-reports the same purchase order.
-  const canPlace = order.stage === "AWAITING_ORDER" || order.stage === "FAILED" || (order.stage === "PENDING" && awaitingPlacement.length === 0);
+  // An order whose lines are all waiting for the extension reads as Awaiting
+  // order but has nothing left to send; offering "Send" there only finds the
+  // same purchase order again. Lines nobody sent keep the button.
+  const nothingToSend = waitingOnlyForExtension({ issues: order.issues, purchaseOrderStatuses: order.purchaseOrders.map((po) => po.status) });
+  const canPlace = !nothingToSend && (order.stage === "AWAITING_ORDER" || order.stage === "FAILED" || order.stage === "PENDING");
   const force = order.stage === "PENDING";
   const busy = fetcher.state !== "idle";
   const submit = (payload: Record<string, string>) => fetcher.submit(payload, { method: "post" });
@@ -419,7 +439,7 @@ export default function OrderDetailPage() {
                     </Text>
                   </InlineStack>
                   <Text as="p" tone="subdued">
-                    {t("orders.detail.approvalHelp")}
+                    {t("orders.fulfillmentRequest.approvalHelp")}
                   </Text>
                   {/* Shopify is told nothing until the merchant decides, and it
                       expects an answer within a day, so the deadline the app

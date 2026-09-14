@@ -19,6 +19,14 @@
       .order-name { font-weight: 600; }
       li.item { margin-top: 4px; }
       li.item a { cursor: pointer; }
+      details { margin-top: 6px; }
+      summary { cursor: pointer; color: #2c6ecb; font-weight: 600; }
+      form.action { display: grid; gap: 6px; margin-top: 6px; }
+      label.field { display: grid; gap: 2px; font-size: 12px; color: #6d7175; }
+      label.field input { font: inherit; font-size: 13px; color: #202223; padding: 6px 8px; border: 1px solid #c9cccf; border-radius: 6px; }
+      label.check { display: flex; gap: 6px; align-items: center; font-size: 12px; }
+      .result, #orders-result { min-height: 1.2em; font-size: 12px; }
+      #orders-result { margin-top: 8px; }
     </style>
   </head>
   <body>
@@ -27,9 +35,14 @@
     <div id="status"></div>
 
     <hr />
+    <div id="orders-result" role="status"></div>
     <h2 id="orders-heading">Orders to place</h2>
     <div id="orders-status"><small>Loading…</small></div>
     <ul id="orders"></ul>
+
+    <h2 id="tracking-heading">Waiting for tracking</h2>
+    <div id="tracking-status"></div>
+    <ul id="tracking"></ul>
 
     <p><small><a href="#" id="options">Configure app URL &amp; token</a></small></p>
     <script src="popup.js"></script>

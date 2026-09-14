@@ -257,8 +257,8 @@ export default function SearchPage() {
                 </Text>
               </InlineStack>
               <InlineGrid columns={{ xs: 1, sm: 2, md: 3, lg: 4 }} gap="400">
-                {data.results.items.map((item) => (
-                  <ResultCard key={item.externalId} item={item} platform={data.platform} currency={item.currency} />
+                {data.results.items.map((item, index) => (
+                  <ResultCard key={item.externalId} item={item} platform={data.platform} currency={item.currency} eager={index < EAGER_RESULT_IMAGES} />
                 ))}
               </InlineGrid>
               {(data.page > 1 || data.results.hasMore) && (
@@ -335,6 +335,14 @@ function withPage(params: URLSearchParams, page: number) {
 }
 
 /**
+ * Result cards whose photo loads straight away: the first row on a wide screen.
+ * Those photos are what the merchant sees on arrival, and lazy loading held them
+ * back until layout had settled, the slowest start for the largest paint on the
+ * page. Everything below the first row stays lazy.
+ */
+const EAGER_RESULT_IMAGES = 4;
+
+/**
  * One search hit.
  *
  * The card is built so the merchant can decide from three lines — picture,
@@ -342,7 +350,7 @@ function withPage(params: URLSearchParams, page: number) {
  * "add to shop" shortcut and the supplier link stay, but below the fold of the
  * decision, in the same row.
  */
-function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["items"][number]; platform: SupplierPlatform; currency: string }) {
+function ResultCard({ item, platform, currency, eager }: { item: SupplierSearchResult["items"][number]; platform: SupplierPlatform; currency: string; eager: boolean }) {
   const fetcher = useFetcher<typeof action>();
   const [pushing, setPushing] = useState(false);
   const t = useT();
@@ -383,7 +391,7 @@ function ResultCard({ item, platform, currency }: { item: SupplierSearchResult["
             <img
               src={item.image}
               alt={item.title}
-              loading="lazy"
+              loading={eager ? "eager" : "lazy"}
               width={480}
               height={480}
               style={{ width: "100%", height: "auto", aspectRatio: "1 / 1", objectFit: "contain", display: "block" }}

@@ -1,13 +1,18 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { logger } from "~/lib/logger.server";
-import { ExtensionApiError, authenticateExtensionRequest, listAwaitingPlacement } from "~/services/fulfillment.server";
+import { ExtensionApiError, authenticateExtensionRequest, listAwaitingPlacement, listAwaitingTracking } from "~/services/fulfillment.server";
 
 /**
  * Supplier orders waiting to be placed from the merchant's browser.
  *
  *   GET /api/extension/orders
  *   Authorization: Bearer <shop api token>
- *   → { ok: true, orders: [{ id, orderName, shippingAddress, items: [...] }] }
+ *   → { ok: true, orders: [{ id, orderName, shippingAddress, items: [...] }],
+ *       awaitingTracking: [{ id, orderName, platform, status, externalOrderIds, placedAt }] }
+ *
+ * `awaitingTracking` lists placed supplier orders with no tracking number yet,
+ * so the popup can offer "Add tracking" without the merchant hunting for the
+ * purchase order id. It carries no address.
  *
  * The response carries customer names, phone numbers and addresses, so unlike
  * the capture endpoint it sends NO CORS headers: no web page may read it. The
@@ -23,8 +28,8 @@ function json(body: unknown, status = 200, headers: Record<string, string> = {})
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   try {
     const shop = await authenticateExtensionRequest(request, { scope: "orders-read", limit: 60 });
-    const orders = await listAwaitingPlacement(shop);
-    return json({ ok: true, orders });
+    const [orders, awaitingTracking] = await Promise.all([listAwaitingPlacement(shop), listAwaitingTracking(shop)]);
+    return json({ ok: true, orders, awaitingTracking });
   } catch (error) {
     if (error instanceof ExtensionApiError) return json({ ok: false, error: error.message }, error.status, error.headers);
     logger.error("Extension order list failed", { error });

@@ -23,7 +23,7 @@ const mocks = vi.hoisted(() => {
       orderLineItem: { findMany: fn(), update: fn() },
       shop: { findUnique: fn() },
     },
-    tx: { $executeRaw: fn(), purchaseOrder: { findFirst: fn(), create: fn() } },
+    tx: { $executeRaw: fn(), purchaseOrder: { findFirst: fn(), create: fn(), update: fn() }, trackingNumber: { deleteMany: fn() } },
     logActivity: fn(),
     notify: fn(),
     evaluateAndStoreOrder: fn(),
@@ -635,5 +635,242 @@ describe("addTrackingFromExtension", () => {
       expect.objectContaining({ create: expect.objectContaining({ number: "LP00123456789CN", carrierName: "Cainiao" }) }),
     );
     expect(mocks.prisma.purchaseOrder.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "SHIPPED" }) }));
+  });
+});
+
+describe("linking a supplier order from the order page", () => {
+  const legacySimulated = {
+    id: "po1",
+    orderId: "order1",
+    status: "SHIPPED",
+    platform: "ALIEXPRESS",
+    externalOrderId: "MOCK-LX1-42",
+    raw: { response: { orderId: "MOCK-LX1-42" } },
+    order: { name: "#1001", canceledAt: null },
+  };
+
+  it("deletes the mock's unsynced tracking in the same transaction, so it can never reach the buyer", async () => {
+    // A tiny table stands in for TrackingNumber, so the tracking run after the
+    // link sees exactly what the link left behind.
+    const rows = [
+      { id: "t1", purchaseOrderId: "po1", number: "LP00987654321CN", syncedToShopify: false },
+      { id: "t2", purchaseOrderId: "po1", number: "LP00111111111CN", syncedToShopify: true },
+    ];
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(legacySimulated);
+    mocks.tx.trackingNumber.deleteMany.mockImplementation(async ({ where }: { where: { purchaseOrderId: string; syncedToShopify: boolean } }) => {
+      const doomed = rows.filter((r) => r.purchaseOrderId === where.purchaseOrderId && r.syncedToShopify === where.syncedToShopify);
+      for (const row of doomed) rows.splice(rows.indexOf(row), 1);
+      return { count: doomed.length };
+    });
+    mocks.tx.purchaseOrder.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({ ...legacySimulated, ...data }));
+
+    const linked = await fulfillment.markPurchaseOrderManual(makeShop(), "po1", "8190000000000077", "merchant@example.com");
+
+    expect(linked).toMatchObject({ discardedTracking: 1, status: "PLACED" });
+    expect(mocks.prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(mocks.tx.trackingNumber.deleteMany).toHaveBeenCalledWith({ where: { purchaseOrderId: "po1", syncedToShopify: false } });
+    const { data } = mocks.tx.purchaseOrder.update.mock.calls[0][0];
+    expect(data).toMatchObject({ externalOrderId: "8190000000000077", status: "PLACED" });
+    // Nothing depends on the id prefix any more to remember what happened.
+    expect(data.raw).toMatchObject({ simulated: false, simulatedHistory: true, discardedSimulatedTracking: 1 });
+    expect(mocks.logActivity).toHaveBeenCalledWith(
+      "shop1",
+      expect.objectContaining({ message: expect.stringMatching(/1 tracking number\(s\) made up by the Demo supplier were deleted/) }),
+    );
+    expect(rows.map((r) => r.number)).toEqual(["LP00111111111CN"]);
+
+    // The next tracking run: only unsynced rows are read, and none is left.
+    mocks.prisma.trackingNumber.findMany.mockImplementation(async () =>
+      rows
+        .filter((r) => !r.syncedToShopify)
+        .map((r) => ({ ...r, purchaseOrder: { ...legacySimulated, externalOrderId: "8190000000000077", items: [], trackings: [] } })),
+    );
+    await fulfillment.syncPendingTracking(makeShop(), undefined, {} as never);
+    expect(mocks.createFulfillmentWithTracking).not.toHaveBeenCalled();
+  });
+
+  it("leaves a real purchase order's tracking alone", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ ...legacySimulated, externalOrderId: null, status: "FAILED", raw: {} });
+    mocks.tx.purchaseOrder.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({ ...legacySimulated, ...data }));
+
+    const linked = await fulfillment.markPurchaseOrderManual(makeShop(), "po1", "8190000000000077");
+
+    expect(linked.discardedTracking).toBe(0);
+    expect(mocks.tx.trackingNumber.deleteMany).not.toHaveBeenCalled();
+    expect(mocks.tx.purchaseOrder.update.mock.calls[0][0].data.raw).toBeUndefined();
+  });
+
+  it("refuses an invented or malformed order number, and a cancelled order", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(legacySimulated);
+    await expect(fulfillment.markPurchaseOrderManual(makeShop(), "po1", "MOCK-LX1-99")).rejects.toThrow(/not a real supplier order number/);
+    await expect(fulfillment.markPurchaseOrderManual(makeShop(), "po1", "81900 <b>")).rejects.toThrow(/supplier's order number/);
+
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ ...legacySimulated, order: { name: "#1001", canceledAt: new Date() } });
+    await expect(fulfillment.markPurchaseOrderManual(makeShop(), "po1", "8190000000000077")).rejects.toThrow(/cancelled in Shopify/);
+    expect(mocks.prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("sends a purchase order still waiting for the extension through the extension's own path", async () => {
+    const waiting = {
+      id: "po1",
+      status: "AWAITING_PLACEMENT",
+      platform: "ALIEXPRESS",
+      currency: "USD",
+      itemsCost: "7.00",
+      shippingCost: "1.99",
+      totalCost: "8.99",
+      externalOrderId: null,
+      paymentUrl: null,
+      raw: { placementMode: "extension" },
+      order: { id: "order1", name: "#1001", shopifyOrderId: "gid://shopify/Order/1", canceledAt: null },
+    };
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(waiting);
+    mocks.prisma.purchaseOrder.updateMany.mockResolvedValue({ count: 1 });
+
+    const linked = await fulfillment.markPurchaseOrderManual(makeShop(), "po1", "8190000000000001", "merchant@example.com");
+
+    expect(linked.status).toBe("AWAITING_PAYMENT");
+    const call = mocks.prisma.purchaseOrder.updateMany.mock.calls[0][0];
+    expect(call.where).toEqual({ id: "po1", status: "AWAITING_PLACEMENT" });
+    expect(call.data).toMatchObject({ status: "AWAITING_PAYMENT", paymentUrl: expect.stringContaining("8190000000000001") });
+    expect(call.data.paymentDueAt).toBeInstanceOf(Date);
+    expect(call.data.raw.placedBy).toBe("order-page");
+    expect(mocks.logActivity).toHaveBeenCalledWith("shop1", expect.objectContaining({ actor: "merchant@example.com", action: "order.placed" }));
+    expect(mocks.prisma.$transaction).not.toHaveBeenCalled();
+  });
+});
+
+describe("recording an order the merchant already paid for", () => {
+  it("moves it straight to paid, with no payment deadline", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({
+      id: "po1",
+      status: "AWAITING_PLACEMENT",
+      platform: "ALIEXPRESS",
+      currency: "USD",
+      itemsCost: "7.00",
+      shippingCost: "1.99",
+      totalCost: "8.99",
+      externalOrderId: null,
+      paymentUrl: null,
+      raw: null,
+      order: { id: "order1", name: "#1001", shopifyOrderId: "gid://shopify/Order/1", canceledAt: null },
+    });
+    mocks.prisma.purchaseOrder.updateMany.mockResolvedValue({ count: 1 });
+
+    const answer = await fulfillment.markPlacedFromExtension(makeShop(), "po1", { externalOrderIds: ["8190000000000001"], paid: true });
+
+    expect(answer).toMatchObject({ status: 200, body: { ok: true, status: "PAID" } });
+    const { data } = mocks.prisma.purchaseOrder.updateMany.mock.calls[0][0];
+    expect(data).toMatchObject({ status: "PAID", paymentDueAt: null });
+    expect(data.paidAt).toBeInstanceOf(Date);
+    expect(data.paymentMarkedAt).toBeInstanceOf(Date);
+    // A null raw spreads to nothing rather than breaking the write.
+    expect(data.raw).toMatchObject({ externalOrderIds: ["8190000000000001"], placedBy: "extension" });
+  });
+
+  it("accepts only a real boolean for paid", () => {
+    expect(fulfillment.ExtensionPlacedBody.safeParse({ externalOrderIds: ["8190000000000001"], paid: true }).success).toBe(true);
+    expect(fulfillment.ExtensionPlacedBody.safeParse({ externalOrderIds: ["8190000000000001"], paid: "yes" }).success).toBe(false);
+  });
+});
+
+describe("cancelling a purchase order", () => {
+  it("cancels one waiting for the extension locally, without asking any supplier", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ id: "po1", orderId: "order1", status: "AWAITING_PLACEMENT", platform: "ALIEXPRESS", externalOrderId: null, raw: {} });
+
+    const result = await fulfillment.cancelPurchaseOrder(makeShop(), "po1", "Shopify order cancelled", "webhook");
+
+    expect(result).toEqual({ upstream: false, alreadyCanceled: false, neverPlaced: true });
+    expect(mocks.adapterForShop).not.toHaveBeenCalled();
+    expect(mocks.prisma.purchaseOrder.update).toHaveBeenCalledWith({
+      where: { id: "po1" },
+      data: expect.objectContaining({ status: "CANCELED", errorMessage: "Shopify order cancelled" }),
+    });
+    expect(mocks.logActivity).toHaveBeenCalledWith("shop1", expect.objectContaining({ message: expect.stringMatching(/Nothing had been ordered/) }));
+    expect(mocks.evaluateAndStoreOrder).toHaveBeenCalledWith(expect.anything(), "order1");
+  });
+
+  it("does not ask the supplier even if an id was somehow stored before placement", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ id: "po1", orderId: "order1", status: "AWAITING_PLACEMENT", platform: "ALIEXPRESS", externalOrderId: "8190000000000001", raw: {} });
+    await fulfillment.cancelPurchaseOrder(makeShop(), "po1");
+    expect(mocks.adapterForShop).not.toHaveBeenCalled();
+  });
+
+  it("asks the supplier for a placed one", async () => {
+    const cancelOrder = vi.fn().mockResolvedValue(true);
+    mocks.adapterForShop.mockResolvedValue({ adapter: { platform: "ALIEXPRESS", cancelOrder }, account: null });
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ id: "po1", orderId: "order1", status: "AWAITING_PAYMENT", platform: "ALIEXPRESS", externalOrderId: "8190000000000001", raw: {} });
+    const result = await fulfillment.cancelPurchaseOrder(makeShop(), "po1", "changed mind");
+    expect(cancelOrder).toHaveBeenCalledWith("8190000000000001", "changed mind");
+    expect(result.upstream).toBe(true);
+  });
+
+  it("leaves an already cancelled one untouched when the webhook repeats", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ id: "po1", orderId: "order1", status: "CANCELED", platform: "ALIEXPRESS", externalOrderId: null, raw: {} });
+    const result = await fulfillment.cancelPurchaseOrder(makeShop(), "po1");
+    expect(result.alreadyCanceled).toBe(true);
+    expect(mocks.prisma.purchaseOrder.update).not.toHaveBeenCalled();
+  });
+});
+
+describe("what the extension and the banners count", () => {
+  it("describes extension placement in the agreed words, never as the extension buying anything", () => {
+    expect(fulfillment.EXTENSION_PLACEMENT_STEPS).toBe(
+      "The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.",
+    );
+  });
+
+  const WAITING_WHERE = { where: { order: { shopId: "shop1", canceledAt: null }, status: "AWAITING_PLACEMENT" } };
+
+  it("leaves purchase orders on cancelled Shopify orders out of the waiting count", async () => {
+    mocks.prisma.purchaseOrder.count.mockResolvedValue(2);
+    await fulfillment.countAwaitingPlacement("shop1");
+    expect(mocks.prisma.purchaseOrder.count).toHaveBeenCalledWith(WAITING_WHERE);
+  });
+
+  it("counts the payment page's banner with the same rule", async () => {
+    const payments = await import("~/services/payments.server");
+    mocks.prisma.purchaseOrder.count.mockResolvedValue(1);
+    const queue = await payments.getPaymentQueue("shop1");
+    expect(queue.awaitingPlacement).toBe(1);
+    expect(mocks.prisma.purchaseOrder.count).toHaveBeenCalledWith(WAITING_WHERE);
+  });
+
+  it("offers tracking only for placed, real, untracked purchase orders on live orders", async () => {
+    mocks.prisma.purchaseOrder.findMany.mockResolvedValue([
+      {
+        id: "po9",
+        platform: "ALIEXPRESS",
+        status: "PAID",
+        externalOrderId: "8190000000000001",
+        raw: { externalOrderIds: ["8190000000000001", "8190000000000002"] },
+        placedAt: new Date("2026-09-14T08:00:00Z"),
+        order: { name: "#1009" },
+      },
+    ]);
+
+    const list = await fulfillment.listAwaitingTracking(makeShop());
+
+    expect(mocks.prisma.purchaseOrder.findMany.mock.calls[0][0].where).toEqual({
+      order: { shopId: "shop1", canceledAt: null },
+      status: { in: ["PLACED", "AWAITING_PAYMENT", "PAID"] },
+      externalOrderId: { not: null },
+      trackings: { none: {} },
+      NOT: { OR: [{ platform: "MOCK" }, { externalOrderId: { startsWith: "MOCK-" } }] },
+    });
+    expect(list).toEqual([
+      { id: "po9", orderName: "#1009", platform: "ALIEXPRESS", status: "PAID", externalOrderIds: ["8190000000000001", "8190000000000002"], placedAt: "2026-09-14T08:00:00.000Z" },
+    ]);
+  });
+
+  it("names the purchase orders still waiting for the extension when placement finds nothing new", async () => {
+    mocks.prisma.order.findUnique.mockResolvedValue(orderRow({ purchaseOrders: [{ id: "po1", status: "AWAITING_PLACEMENT" }] }));
+    mocks.prisma.purchaseOrderItem.findMany.mockResolvedValue([
+      { orderLineItemId: "li1", supplierVariantId: "sv1", purchaseOrder: { status: "AWAITING_PLACEMENT", createdAt: new Date(), errorCode: null } },
+    ]);
+
+    const outcome = await fulfillment.placeSupplierOrders(makeShop(), "order1");
+
+    expect(outcome).toMatchObject({ ok: true, purchaseOrderIds: ["po1"], awaitingPlacementIds: ["po1"] });
   });
 });

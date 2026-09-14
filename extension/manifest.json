@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DropshipHub Product Capture",
-  "version": "1.3.0",
-  "description": "Add the AliExpress or CJ product you are viewing to your DropshipHub import list, and see the supplier orders waiting for you to place.",
+  "version": "1.4.0",
+  "description": "Add AliExpress or CJ products to DropshipHub, open orders to place on AliExpress, and record their order numbers and tracking.",
   "permissions": [
     "activeTab",
     "scripting",

@@ -15,6 +15,7 @@ export type OrderStage =
 export type PurchaseOrderStatus =
   | "DRAFT"
   | "SUBMITTING"
+  | "AWAITING_PLACEMENT"
   | "PLACED"
   | "AWAITING_PAYMENT"
   | "PAID"
@@ -92,6 +93,27 @@ export function blocksPlacement(issue: OrderIssue): boolean {
 }
 
 /**
+ * The warning an order carries while a supplier order for it is priced but
+ * still has to be placed with the Chrome extension. Exported so screens can
+ * tell "everything is waiting for the extension" from "lines are still to send".
+ */
+export const AWAITING_EXTENSION_PLACEMENT = "AWAITING_EXTENSION_PLACEMENT";
+
+/**
+ * True when everything left to order on an order is already priced and waiting
+ * for the extension, so "Send to supplier" would only find the same purchase
+ * order again. An order that also has lines nobody sent (LINES_NOT_ORDERED)
+ * still has something to send.
+ */
+export function waitingOnlyForExtension(order: { issues: Array<Pick<OrderIssue, "code">>; purchaseOrderStatuses: string[] }): boolean {
+  if (!order.purchaseOrderStatuses.includes("AWAITING_PLACEMENT")) return false;
+  return !order.issues.some((issue) => issue.code === "LINES_NOT_ORDERED");
+}
+
+const AWAITING_EXTENSION_PLACEMENT_MESSAGE =
+  "A supplier order is waiting to be placed. The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.";
+
+/**
  * Derive the internal pipeline stage and the list of blocking problems for one
  * Shopify order. Pure: everything it needs is passed in, so the orders list,
  * the order detail page and the bulk "place orders" job all agree on state.
@@ -146,7 +168,15 @@ export function evaluateOrder(input: PipelineInput): PipelineResult {
     const anyAwaitingPayment = live.some(
       (po) => po.status === "PLACED" || po.status === "AWAITING_PAYMENT",
     );
-    const anyLive = anyShipped || anyPaid || anyAwaitingPayment;
+    // Priced and holding its lines, but nothing exists at the supplier until
+    // the merchant places it from the browser. It covers its lines, so they
+    // are not offered for placement a second time, yet it is not progress.
+    const anyAwaitingPlacement = live.some((po) => po.status === "AWAITING_PLACEMENT");
+    const anyLive = anyShipped || anyPaid || anyAwaitingPayment || anyAwaitingPlacement;
+
+    if (anyAwaitingPlacement) {
+      issues.push({ code: AWAITING_EXTENSION_PLACEMENT, severity: "warning", message: AWAITING_EXTENSION_PLACEMENT_MESSAGE });
+    }
 
     if (!anyLive) {
       if (failedCount > 0) {
@@ -161,6 +191,14 @@ export function evaluateOrder(input: PipelineInput): PipelineResult {
       const allTerminal = live.every((po) => TERMINAL_PO.includes(po.status));
       if (allDelivered || (allTerminal && input.fulfillmentStatus === "fulfilled" && outstanding.length === 0)) {
         return { stage: "FULFILLED", issues, canPlaceOrder: false, blockedLineItemIds: [] };
+      }
+      // Checked before any later progress: an order where one parcel ships
+      // while another supplier order was never placed still needs the
+      // merchant to buy something, and "Awaiting delivery" would hide that.
+      // Before this it fell through to PENDING and counted as needing
+      // attention although nothing was wrong with it.
+      if (anyAwaitingPlacement) {
+        return { stage: "AWAITING_ORDER", issues, canPlaceOrder: false, blockedLineItemIds: [] };
       }
       if (anyShipped) {
         return { stage: "AWAITING_DELIVERY", issues, canPlaceOrder: false, blockedLineItemIds: [] };
@@ -264,6 +302,7 @@ export function stageForPurchaseOrder(status: PurchaseOrderStatus): OrderStage {
   switch (status) {
     case "DRAFT":
     case "SUBMITTING":
+    case "AWAITING_PLACEMENT":
       return "AWAITING_ORDER";
     case "PLACED":
     case "AWAITING_PAYMENT":

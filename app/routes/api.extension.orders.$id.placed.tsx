@@ -17,8 +17,10 @@ import {
  *
  *   POST /api/extension/orders/:id/placed
  *   Authorization: Bearer <shop api token>
- *   { "externalOrderIds": ["8190000000000000"], "totalCost": "12.40", "currency": "USD" }
- *   → 200 { ok: true, status: "AWAITING_PAYMENT", paymentUrl }
+ *   { "externalOrderIds": ["8190000000000000"], "totalCost": "12.40", "currency": "USD", "paid": true }
+ *   → 200 { ok: true, status: "PAID" | "AWAITING_PAYMENT", paymentUrl }
+ *     ("paid" says the merchant paid at checkout; without it the order waits
+ *     in the payment queue with AliExpress's 24-hour deadline)
  *   → 200 { ok: true, alreadyRecorded: true } when the same ids are reported again
  *   → 409 when the purchase order is already recorded with other ids
  *

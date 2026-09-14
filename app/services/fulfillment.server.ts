@@ -275,7 +275,10 @@ export async function placeSupplierOrders(
     // here, and any of them can arrive second.
     const live = full.purchaseOrders.filter((po) => !["FAILED", "CANCELED", "DRAFT"].includes(po.status));
     if (live.length > 0) {
-      return { orderId, ok: true, purchaseOrderIds: live.map((po) => po.id) };
+      // The ones still waiting for the extension are named, so a caller that
+      // arrives second does not report an order nobody has bought as placed.
+      const waiting = live.filter((po) => po.status === "AWAITING_PLACEMENT").map((po) => po.id);
+      return { orderId, ok: true, purchaseOrderIds: live.map((po) => po.id), awaitingPlacementIds: waiting };
     }
     return { orderId, ok: false, purchaseOrderIds: [], error: "Nothing to order: every line is unmapped, fulfilled or already ordered." };
   }
@@ -478,7 +481,7 @@ export async function placeSupplierOrders(
       type: "order.placed",
       severity: "info",
       title: `${full.name} is ready to place with the Chrome extension`,
-      body: "Open the DropshipHub extension in Chrome and choose Orders to place. The supplier order is not placed until you do.",
+      body: `Nothing has been ordered yet. ${EXTENSION_PLACEMENT_STEPS}`,
       link: `/app/orders/${full.id}`,
       dedupeKey: `awaiting-placement:${full.id}`,
       dedupeMinutes: 60,
@@ -864,32 +867,113 @@ export async function retryPurchaseOrder(shop: ShopWithSettings, purchaseOrderId
   return placeSupplierOrders(shop, po.orderId, { actor, force: true });
 }
 
-/** Merchant placed it by hand; link the upstream id so tracking can sync. */
+/**
+ * The merchant placed a purchase order on the supplier's site by hand and links
+ * its order number from the order page.
+ *
+ * A purchase order still waiting for the extension goes through exactly the
+ * path the extension uses, so both reach Awaiting payment with a payment link,
+ * a due date, the placed tag and a fresh cost roll-up. Linking it straight to
+ * PLACED left none of those behind.
+ *
+ * A simulated purchase order (the mock gave it a MOCK- id before the mock was
+ * taken off real platforms) still holds the tracking numbers the mock made up.
+ * Once its id is replaced nothing marks it as simulated any more, so the next
+ * tracking run would have sent that invented number to a real buyer. Those
+ * unsynced rows are deleted in the same transaction as the link, and the
+ * purchase order records that it once was simulated.
+ */
 export async function markPurchaseOrderManual(shop: ShopWithSettings, purchaseOrderId: string, externalOrderId: string, actor?: string) {
-  const owned = await ownedPurchaseOrder(shop.id, purchaseOrderId);
-  const po = await prisma.purchaseOrder.update({
-    where: { id: owned.id },
-    data: { externalOrderId: externalOrderId.trim(), status: "PLACED", placedAt: new Date(), errorCode: null, errorMessage: null },
+  const parsed = SupplierOrderId.safeParse(externalOrderId);
+  if (!parsed.success) throw new Error(`The supplier order number ${parsed.error.issues[0].message}.`);
+  const id = parsed.data;
+
+  const owned = await ownedPurchaseOrder(shop.id, purchaseOrderId, { order: { select: { name: true, canceledAt: true } } });
+  if (owned.order.canceledAt) {
+    throw new Error(`${owned.order.name} was cancelled in Shopify, so the supplier order was not linked. Cancel it on the supplier's site instead.`);
+  }
+
+  if (owned.status === "AWAITING_PLACEMENT") {
+    const answer = await markPlacedFromExtension(shop, owned.id, { externalOrderIds: [id] }, { actor: actor ?? "merchant" });
+    if (answer.status !== 200) throw new Error(String(answer.body.error ?? "The supplier order could not be linked."));
+    return { purchaseOrderId: owned.id, status: String(answer.body.status), discardedTracking: 0 };
+  }
+
+  const simulated = isSimulatedPurchaseOrder(owned);
+  const raw = owned.raw && typeof owned.raw === "object" && !Array.isArray(owned.raw) ? (owned.raw as Record<string, unknown>) : {};
+  const { po, discarded } = await prisma.$transaction(async (tx) => {
+    const removed = simulated ? await tx.trackingNumber.deleteMany({ where: { purchaseOrderId: owned.id, syncedToShopify: false } }) : { count: 0 };
+    const updated = await tx.purchaseOrder.update({
+      where: { id: owned.id },
+      data: {
+        externalOrderId: id,
+        status: "PLACED",
+        placedAt: new Date(),
+        errorCode: null,
+        errorMessage: null,
+        ...(simulated
+          ? {
+              // The Demo supplier stays simulated whatever id it is given; a
+              // real platform with a real order number no longer is, and the
+              // history flag keeps the past visible without the id prefix.
+              raw: { ...raw, simulated: owned.platform === "MOCK", simulatedHistory: true, discardedSimulatedTracking: removed.count } as Prisma.InputJsonValue,
+            }
+          : {}),
+      },
+    });
+    return { po: updated, discarded: removed.count };
   });
-  await logActivity(shop.id, { actor, action: "order.manual_link", entity: "Order", entityId: po.orderId, message: `Supplier order ${externalOrderId} linked manually.` });
+
+  await logActivity(shop.id, {
+    actor,
+    action: "order.manual_link",
+    entity: "Order",
+    entityId: po.orderId,
+    message: discarded
+      ? `Supplier order ${id} linked manually. ${discarded} tracking number(s) made up by the Demo supplier were deleted so they can never reach the customer.`
+      : `Supplier order ${id} linked manually.`,
+    meta: { purchaseOrderId: po.id, ...(simulated ? { discardedSimulatedTracking: discarded } : {}) },
+  });
+  await rollupOrderCosts(po.orderId);
   await evaluateAndStoreOrder(shop, po.orderId);
-  return po;
+  return { purchaseOrderId: po.id, status: po.status, discardedTracking: discarded };
 }
 
+/**
+ * Cancel a purchase order.
+ *
+ * One still waiting for the extension exists nowhere but here, so there is no
+ * supplier to ask: it is cancelled locally without touching any adapter. The
+ * ORDERS_CANCELLED webhook relies on that for every such purchase order on a
+ * cancelled Shopify order. A purchase order already cancelled is left as it is,
+ * so a repeated webhook does not rewrite its date and reason.
+ */
 export async function cancelPurchaseOrder(shop: ShopWithSettings, purchaseOrderId: string, reason?: string, actor?: string) {
   const po = await ownedPurchaseOrder(shop.id, purchaseOrderId, { order: true });
+  if (po.status === "CANCELED") return { upstream: false, alreadyCanceled: true, neverPlaced: false };
+
+  const neverPlaced = po.status === "AWAITING_PLACEMENT";
   let upstream = false;
-  if (po.externalOrderId) {
+  if (po.externalOrderId && !neverPlaced) {
     const { adapter } = await adapterForShop(shop.id, po.platform);
     if (adapter.cancelOrder) {
       upstream = await adapter.cancelOrder(po.externalOrderId, reason).catch(() => false);
     }
   }
   await prisma.purchaseOrder.update({ where: { id: po.id }, data: { status: "CANCELED", canceledAt: new Date(), errorMessage: reason ?? null } });
-  await logActivity(shop.id, { actor, action: "order.supplier_canceled", entity: "Order", entityId: po.orderId, message: `Supplier order ${po.externalOrderId ?? po.id} canceled${upstream ? " at the supplier" : " locally (supplier could not cancel)"}.` });
+  await logActivity(shop.id, {
+    actor,
+    action: "order.supplier_canceled",
+    entity: "Order",
+    entityId: po.orderId,
+    message: neverPlaced
+      ? `${po.platform} order waiting to be placed with the Chrome extension was cancelled. Nothing had been ordered from the supplier.`
+      : `Supplier order ${po.externalOrderId ?? po.id} canceled${upstream ? " at the supplier" : " locally (supplier could not cancel)"}.`,
+    meta: { purchaseOrderId: po.id },
+  });
   await rollupOrderCosts(po.orderId);
   await evaluateAndStoreOrder(shop, po.orderId);
-  return { upstream };
+  return { upstream, alreadyCanceled: false, neverPlaced };
 }
 
 // ---------------------------------------------------------------------------
@@ -1447,6 +1531,13 @@ export async function addManualTracking(
 // thin; the rules live here so they are tested once.
 // ---------------------------------------------------------------------------
 
+/**
+ * How ordering through the extension works, in the words every screen and
+ * notification uses. The extension never places or pays for anything itself.
+ */
+export const EXTENSION_PLACEMENT_STEPS =
+  "The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.";
+
 /** Largest body each extension endpoint reads before refusing. */
 export const EXTENSION_BODY_LIMITS = {
   /** A captured product with a few hundred variants is well under this. */
@@ -1588,6 +1679,12 @@ export const ExtensionPlacedBody = z
       .trim()
       .regex(/^[A-Z]{3}$/, "must be a three-letter currency code")
       .optional(),
+    /**
+     * Whether the merchant already paid for it at checkout, which is how an
+     * AliExpress purchase normally goes. Left out, the order waits in the
+     * payment queue with AliExpress's 24-hour deadline, as before.
+     */
+    paid: z.boolean().optional(),
   })
   .strict();
 
@@ -1724,8 +1821,63 @@ export async function listAwaitingPlacement(shop: ShopWithSettings): Promise<Ext
   });
 }
 
+/**
+ * Purchase orders still to be placed with the extension, as the orders list and
+ * the payment page count them. A cancelled Shopify order is left out, exactly
+ * as the extension's own list leaves it out: the banners said there was more to
+ * buy than the extension offered, and buying for a cancelled order wastes money.
+ */
+export function awaitingPlacementWhere(shopId: string): Prisma.PurchaseOrderWhereInput {
+  return { order: { shopId, canceledAt: null }, status: "AWAITING_PLACEMENT" };
+}
+
 export async function countAwaitingPlacement(shopId: string): Promise<number> {
-  return prisma.purchaseOrder.count({ where: { order: { shopId }, status: "AWAITING_PLACEMENT" } });
+  return prisma.purchaseOrder.count({ where: awaitingPlacementWhere(shopId) });
+}
+
+/** Statuses in which a supplier order exists upstream but no tracking has come back yet. */
+const PLACED_WITHOUT_TRACKING: PurchaseOrderStatus[] = ["PLACED", "AWAITING_PAYMENT", "PAID"];
+
+/**
+ * Purchase orders the extension may add tracking to: placed, with no tracking
+ * number yet, on an order that is still live. A simulated purchase order is left
+ * out, since nothing was shipped for it and it has no real parcel to track.
+ */
+export function awaitingTrackingWhere(shopId: string): Prisma.PurchaseOrderWhereInput {
+  return {
+    order: { shopId, canceledAt: null },
+    status: { in: PLACED_WITHOUT_TRACKING },
+    externalOrderId: { not: null },
+    trackings: { none: {} },
+    NOT: SIMULATED_PO_WHERE,
+  };
+}
+
+export interface ExtensionTrackingCandidate {
+  id: string;
+  orderName: string;
+  platform: SupplierPlatform;
+  status: PurchaseOrderStatus;
+  externalOrderIds: string[];
+  placedAt: string | null;
+}
+
+/** GET /api/extension/orders, second list: placed supplier orders still waiting for tracking. */
+export async function listAwaitingTracking(shop: ShopWithSettings): Promise<ExtensionTrackingCandidate[]> {
+  const rows = await prisma.purchaseOrder.findMany({
+    where: awaitingTrackingWhere(shop.id),
+    select: { id: true, platform: true, status: true, externalOrderId: true, raw: true, placedAt: true, order: { select: { name: true } } },
+    orderBy: { placedAt: "asc" },
+    take: 50,
+  });
+  return rows.map((po) => ({
+    id: po.id,
+    orderName: po.order.name,
+    platform: po.platform,
+    status: po.status,
+    externalOrderIds: storedSupplierOrderIds(po),
+    placedAt: po.placedAt?.toISOString() ?? null,
+  }));
 }
 
 export interface ExtensionAnswer {
@@ -1778,7 +1930,9 @@ export async function markPlacedFromExtension(
   shop: ShopWithSettings,
   purchaseOrderId: string,
   input: z.infer<typeof ExtensionPlacedBody>,
+  options: { actor?: string } = {},
 ): Promise<ExtensionAnswer> {
+  const actor = options.actor ?? "extension";
   const po = await prisma.purchaseOrder.findFirst({
     where: { id: purchaseOrderId, order: { shopId: shop.id } },
     include: { order: { select: { id: true, name: true, shopifyOrderId: true, canceledAt: true } } },
@@ -1805,27 +1959,36 @@ export async function markPlacedFromExtension(
   const converted = await toShopCurrency(shop.currency, po.currency, po.itemsCost, shippingCost);
   const aliexpress = po.platform === "ALIEXPRESS";
   const now = new Date();
+  const paid = input.paid === true;
+  const status: PurchaseOrderStatus = paid ? "PAID" : "AWAITING_PAYMENT";
+  const raw = po.raw && typeof po.raw === "object" && !Array.isArray(po.raw) ? (po.raw as Record<string, unknown>) : {};
 
+  // No tracking rows are cleared here, unlike the manual link of a simulated
+  // purchase order: one waiting for placement was created in extension mode,
+  // is never simulated, and cannot carry tracking, which is refused until the
+  // purchase order is placed.
   const updated = await prisma.purchaseOrder.updateMany({
     // Conditional on the status, so two reports racing each other cannot both
     // win: the loser re-reads and gets the idempotent answer or a conflict.
     where: { id: po.id, status: "AWAITING_PLACEMENT" },
     data: {
-      status: "AWAITING_PAYMENT",
+      status,
       externalOrderId: primary,
       placedAt: now,
       totalCost: money(totalCost),
       shippingCost: money(shippingCost),
       ...converted,
       paymentUrl: aliexpress ? orderPaymentUrl(primary) : null,
-      // AliExpress cancels an unpaid order after 24 hours.
-      paymentDueAt: aliexpress ? new Date(now.getTime() + 24 * 3_600_000) : null,
+      // AliExpress cancels an unpaid order after 24 hours. One the merchant
+      // paid at checkout has no deadline and leaves the payment queue at once.
+      paymentDueAt: aliexpress && !paid ? new Date(now.getTime() + 24 * 3_600_000) : null,
+      ...(paid ? { paidAt: now, paymentMarkedAt: now } : {}),
       errorCode: null,
       errorMessage: null,
       raw: {
-        ...(po.raw as object),
+        ...raw,
         externalOrderIds: ids,
-        placedBy: "extension",
+        placedBy: actor === "extension" ? "extension" : "order-page",
         ...(input.totalCost ? { reportedTotal: { amount: input.totalCost, currency: reportedCurrency } } : {}),
       } as Prisma.InputJsonValue,
     },
@@ -1837,11 +2000,11 @@ export async function markPlacedFromExtension(
   }
 
   await logActivity(shop.id, {
-    actor: "extension",
+    actor,
     action: "order.placed",
     entity: "Order",
     entityId: po.order.id,
-    message: `${po.order.name}: supplier order ${ids.join(", ")} placed on ${po.platform} from the Chrome extension.`,
+    message: `${po.order.name}: supplier order ${ids.join(", ")} placed on ${po.platform}, recorded ${actor === "extension" ? "from the Chrome extension" : "on the order page"}${paid ? " as paid" : ""}.`,
     meta: { purchaseOrderId: po.id },
   });
   await rollupOrderCosts(po.order.id);
@@ -1853,7 +2016,7 @@ export async function markPlacedFromExtension(
     body: {
       ok: true,
       purchaseOrderId: po.id,
-      status: "AWAITING_PAYMENT",
+      status,
       externalOrderId: primary,
       paymentUrl: aliexpress ? orderPaymentUrl(primary) : null,
     },

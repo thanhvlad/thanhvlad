@@ -438,7 +438,7 @@ export default function PaymentsPage() {
             <BlockStack gap="200">
               <SectionHeader title={t("payments.howItWorks.title")} />
               <Text as="p" tone="subdued">
-                {t("payments.howItWorks.body")}
+                {t("orders.payments.howItWorks.body")}
               </Text>
             </BlockStack>
           </Card>

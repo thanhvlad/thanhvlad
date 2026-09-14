@@ -22,7 +22,7 @@ export const en = {
   "orders.list.action.sendToSupplierCount": "Send to supplier ({n})",
   "orders.list.action.sendSelected": "Send {n} to supplier",
   "orders.list.confirmSend.title": "Send {n} order(s) to the supplier?",
-  "orders.list.confirmSend.body": "A supplier order is placed for each selected order that is awaiting order. You then pay each one on the supplier's site; tracking comes back here by itself.",
+  "orders.list.confirmSend.body": "Each selected order that is awaiting order is priced and sent on to its supplier. For AliExpress nothing is bought yet: The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.",
   "orders.list.confirmSend.skipped": "{n} selected order(s) are not awaiting order and will be skipped.",
   "orders.list.confirmSend.confirm": "Send",
   "orders.list.empty.filteredHeading": "No orders match",
@@ -32,7 +32,7 @@ export const en = {
   // ---- Order detail ---------------------------------------------------------
   "orders.detail.action.sendToSupplier": "Send to supplier",
   "orders.detail.confirmSend.title": "Send {name} to the supplier?",
-  "orders.detail.confirmSend.body": "A supplier order will be placed for the items below. You pay it on the supplier's site afterwards; tracking comes back here by itself.",
+  "orders.detail.confirmSend.body": "The items below are priced and sent on to their supplier. For AliExpress nothing is bought yet: The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.",
   "orders.detail.confirmSend.forceBody": "This order has blocking issues. Placing it anyway sends it to the supplier as it is.",
   "orders.detail.confirmSend.confirm": "Send",
   "orders.detail.customer": "Customer",
@@ -48,7 +48,12 @@ export const en = {
   "orders.detail.noMapping": "Not linked to a supplier product",
   "orders.detail.noSupplierOrderBody": "Send this order to the supplier to create one.",
   "orders.detail.linkSupplierOrder": "Link supplier order",
-  "orders.detail.linkSupplierOrderBody": "If you placed this order on the supplier's site yourself, paste its order id so tracking can be picked up.",
+  "orders.detail.linkSupplierOrderBody": "Already placed and paid for this order on the supplier's site? Enter its order number to record it. Tracking you add afterwards, here or in the Chrome extension, is sent to Shopify.",
+  "orders.detail.linkedDiscardedTracking": "Supplier order linked. {n} tracking number(s) made up by the Demo supplier were deleted, so they can never reach the customer. Add the real tracking when it arrives.",
+  "orders.detail.cancelPo.doneUpstream": "Canceled at the supplier.",
+  "orders.detail.cancelPo.doneLocal": "Canceled here. The supplier could not be asked, so cancel it on the supplier's site too if it was placed.",
+  "orders.detail.cancelPo.doneNeverPlaced": "Canceled. It was still waiting to be placed with the Chrome extension, so nothing had been ordered.",
+  "orders.detail.cancelPo.alreadyCanceled": "This supplier order was already canceled.",
   "orders.detail.supplierOrderId": "Supplier order id",
   "orders.detail.addTracking": "Add tracking",
   "orders.detail.trackingNumber": "Tracking number",
@@ -67,20 +72,22 @@ export const en = {
   // ---- Placement with the Chrome extension ------------------------------------
   "orders.placement.badge": "Waiting to be placed",
   "orders.placement.title": "Waiting to be placed with the extension",
-  "orders.placement.body": "Nothing has been ordered from the supplier yet. Open the DropshipHub extension in Chrome, choose Orders to place, and buy each item on its product page. This order moves to Awaiting payment once the extension reports it placed.",
+  "orders.placement.body": "Nothing has been ordered from the supplier yet. The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.",
   "orders.placement.openProduct": "Open on AliExpress",
   "orders.placement.readyMessage": "{n} supplier order(s) priced and waiting to be placed with the Chrome extension. Nothing has been ordered yet.",
   "orders.placement.listBannerTitle": "{n} supplier order(s) are waiting to be placed with the Chrome extension",
-  "orders.placement.listBannerBody": "They are priced but not ordered. Open the DropshipHub extension in Chrome and choose Orders to place.",
+  "orders.placement.listBannerBody": "They are priced but not ordered. The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.",
   "orders.placement.setUpExtension": "Set up the extension",
   "orders.placement.paymentsBannerTitle": "{n} more supplier order(s) must be placed with the Chrome extension before they can be paid",
-  "orders.placement.paymentsBannerBody": "They are not in this queue because they do not exist at the supplier yet.",
+  "orders.placement.paymentsBannerBody": "They are not in this queue because they do not exist at the supplier yet. The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.",
 
   // ---- Simulated supplier orders -----------------------------------------------
   "orders.simulated.title": "Simulated supplier order",
   "orders.simulated.body": "This supplier order was made up by the Demo supplier. Nothing was ordered or paid for, and its tracking is never sent to a real customer. Cancel it, then send the order to a real supplier.",
 
   // ---- Fulfilment requests from Shopify ------------------------------------------
+  "orders.fulfillmentRequest.approvalHelp": "Nothing has been ordered from the supplier yet. Approving accepts Shopify's request and sends the order on to its supplier. For AliExpress: The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.",
+  "orders.fulfillmentRequest.approvedAwaitingPlacement": "Approved, and Shopify's request is accepted. The supplier order is waiting to be placed with the Chrome extension; nothing has been ordered yet.",
   "orders.fulfillmentRequest.decideBy": "Shopify has not been answered yet. Unless you approve it, the request is declined automatically on {when}.",
   "orders.fulfillmentRequest.how.step3": "With approval on (the default), it prices the order and waits for you: approving places the supplier order and accepts the request, declining rejects it, and a request nobody approves within 20 hours is declined automatically so Shopify is never left waiting. With approval off, it places the supplier order and accepts straight away.",
 
@@ -89,6 +96,7 @@ export const en = {
   "orders.payments.blockedTitle": "Your browser blocked the payment page. {n} page(s) to open",
   "orders.payments.moreBody": "A browser opens one new tab per click, so open the rest one at a time.",
   "orders.payments.payOrder": "Pay {order} ({amount})",
+  "orders.payments.howItWorks.body": "AliExpress does not let an app charge your account, so every supplier order is paid on AliExpress itself. The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify. An order recorded as not yet paid waits here: choose Pay to open it on AliExpress, pay, then mark it paid. AliExpress cancels an unpaid order after 24 hours, which is what the deadline column counts down to.",
 } as const;
 
 export const vi: Partial<Record<keyof typeof en, string>> = {
@@ -110,7 +118,7 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   "orders.list.action.sendToSupplierCount": "Gửi nhà cung cấp ({n})",
   "orders.list.action.sendSelected": "Gửi {n} đơn cho nhà cung cấp",
   "orders.list.confirmSend.title": "Gửi {n} đơn cho nhà cung cấp?",
-  "orders.list.confirmSend.body": "App sẽ đặt một đơn nhà cung cấp cho mỗi đơn đã chọn đang ở trạng thái chờ đặt. Sau đó bạn thanh toán từng đơn trên trang nhà cung cấp; mã vận đơn sẽ tự về đây.",
+  "orders.list.confirmSend.body": "Mỗi đơn đã chọn đang ở trạng thái chờ đặt sẽ được tính giá và chuyển cho nhà cung cấp của nó. Với AliExpress, chưa có gì được mua: Tiện ích Chrome liệt kê các đơn đang chờ đặt và mở từng sản phẩm trên AliExpress. Bạn tự đặt và thanh toán đơn ở đó, rồi ghi lại mã đơn AliExpress trong tiện ích; mã vận đơn bạn thêm ở đó sẽ được gửi sang Shopify.",
   "orders.list.confirmSend.skipped": "{n} đơn đã chọn chưa ở trạng thái chờ đặt nên sẽ bị bỏ qua.",
   "orders.list.confirmSend.confirm": "Gửi",
   "orders.list.empty.filteredHeading": "Không có đơn nào khớp",
@@ -120,7 +128,7 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   // ---- Order detail ---------------------------------------------------------
   "orders.detail.action.sendToSupplier": "Gửi nhà cung cấp",
   "orders.detail.confirmSend.title": "Gửi đơn {name} cho nhà cung cấp?",
-  "orders.detail.confirmSend.body": "App sẽ đặt đơn nhà cung cấp cho các món bên dưới. Sau đó bạn thanh toán trên trang nhà cung cấp; mã vận đơn sẽ tự về đây.",
+  "orders.detail.confirmSend.body": "Các món bên dưới sẽ được tính giá và chuyển cho nhà cung cấp. Với AliExpress, chưa có gì được mua: Tiện ích Chrome liệt kê các đơn đang chờ đặt và mở từng sản phẩm trên AliExpress. Bạn tự đặt và thanh toán đơn ở đó, rồi ghi lại mã đơn AliExpress trong tiện ích; mã vận đơn bạn thêm ở đó sẽ được gửi sang Shopify.",
   "orders.detail.confirmSend.forceBody": "Đơn này đang có lỗi chặn. Vẫn đặt nghĩa là gửi nguyên trạng cho nhà cung cấp.",
   "orders.detail.confirmSend.confirm": "Gửi",
   "orders.detail.customer": "Khách hàng",
@@ -136,7 +144,12 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   "orders.detail.noMapping": "Chưa ghép với sản phẩm nhà cung cấp",
   "orders.detail.noSupplierOrderBody": "Gửi đơn này cho nhà cung cấp để tạo đơn.",
   "orders.detail.linkSupplierOrder": "Liên kết đơn nhà cung cấp",
-  "orders.detail.linkSupplierOrderBody": "Nếu bạn đã tự đặt đơn này trên trang nhà cung cấp, dán mã đơn vào đây để app lấy mã vận đơn.",
+  "orders.detail.linkSupplierOrderBody": "Bạn đã tự đặt và thanh toán đơn này trên trang nhà cung cấp? Nhập mã đơn để ghi lại. Mã vận đơn bạn thêm sau đó, ở đây hoặc trong tiện ích Chrome, sẽ được gửi sang Shopify.",
+  "orders.detail.linkedDiscardedTracking": "Đã liên kết đơn nhà cung cấp. {n} mã vận đơn do Nhà cung cấp mẫu tự tạo đã bị xoá để không bao giờ đến tay khách. Hãy thêm mã vận đơn thật khi có.",
+  "orders.detail.cancelPo.doneUpstream": "Đã huỷ bên nhà cung cấp.",
+  "orders.detail.cancelPo.doneLocal": "Đã huỷ trong app. App không hỏi được nhà cung cấp, nên nếu đơn đã được đặt, hãy huỷ cả trên trang nhà cung cấp.",
+  "orders.detail.cancelPo.doneNeverPlaced": "Đã huỷ. Đơn này vẫn đang chờ đặt qua tiện ích Chrome nên chưa có gì được đặt.",
+  "orders.detail.cancelPo.alreadyCanceled": "Đơn nhà cung cấp này đã được huỷ từ trước.",
   "orders.detail.supplierOrderId": "Mã đơn nhà cung cấp",
   "orders.detail.addTracking": "Thêm vận đơn",
   "orders.detail.trackingNumber": "Mã vận đơn",
@@ -155,20 +168,22 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   // ---- Placement with the Chrome extension ------------------------------------
   "orders.placement.badge": "Chờ đặt đơn",
   "orders.placement.title": "Đang chờ đặt đơn qua tiện ích Chrome",
-  "orders.placement.body": "Chưa có gì được đặt với nhà cung cấp. Mở tiện ích DropshipHub trên Chrome, chọn Đơn cần đặt, rồi mua từng món ngay trên trang sản phẩm. Đơn sẽ chuyển sang Chờ thanh toán khi tiện ích báo đã đặt xong.",
+  "orders.placement.body": "Chưa có gì được đặt với nhà cung cấp. Tiện ích Chrome liệt kê các đơn đang chờ đặt và mở từng sản phẩm trên AliExpress. Bạn tự đặt và thanh toán đơn ở đó, rồi ghi lại mã đơn AliExpress trong tiện ích; mã vận đơn bạn thêm ở đó sẽ được gửi sang Shopify.",
   "orders.placement.openProduct": "Mở trên AliExpress",
   "orders.placement.readyMessage": "Đã tính giá {n} đơn nhà cung cấp, đang chờ bạn đặt qua tiện ích Chrome. Chưa có đơn nào được đặt.",
   "orders.placement.listBannerTitle": "{n} đơn nhà cung cấp đang chờ đặt qua tiện ích Chrome",
-  "orders.placement.listBannerBody": "Các đơn này đã có giá nhưng chưa được đặt. Mở tiện ích DropshipHub trên Chrome và chọn Đơn cần đặt.",
+  "orders.placement.listBannerBody": "Các đơn này đã có giá nhưng chưa được đặt. Tiện ích Chrome liệt kê các đơn đang chờ đặt và mở từng sản phẩm trên AliExpress. Bạn tự đặt và thanh toán đơn ở đó, rồi ghi lại mã đơn AliExpress trong tiện ích; mã vận đơn bạn thêm ở đó sẽ được gửi sang Shopify.",
   "orders.placement.setUpExtension": "Cài tiện ích",
   "orders.placement.paymentsBannerTitle": "Còn {n} đơn nhà cung cấp phải đặt qua tiện ích Chrome trước khi thanh toán được",
-  "orders.placement.paymentsBannerBody": "Các đơn này không nằm trong danh sách vì chưa hề tồn tại bên nhà cung cấp.",
+  "orders.placement.paymentsBannerBody": "Các đơn này không nằm trong danh sách vì chưa hề tồn tại bên nhà cung cấp. Tiện ích Chrome liệt kê các đơn đang chờ đặt và mở từng sản phẩm trên AliExpress. Bạn tự đặt và thanh toán đơn ở đó, rồi ghi lại mã đơn AliExpress trong tiện ích; mã vận đơn bạn thêm ở đó sẽ được gửi sang Shopify.",
 
   // ---- Simulated supplier orders -----------------------------------------------
   "orders.simulated.title": "Đơn nhà cung cấp giả lập",
   "orders.simulated.body": "Đơn này do Nhà cung cấp mẫu tự tạo ra. Không có gì được đặt hay thanh toán, và mã vận đơn của nó không bao giờ được gửi cho khách thật. Hãy huỷ đơn này rồi gửi đơn hàng cho một nhà cung cấp thật.",
 
   // ---- Fulfilment requests from Shopify ------------------------------------------
+  "orders.fulfillmentRequest.approvalHelp": "Chưa có gì được đặt với nhà cung cấp. Bấm duyệt thì app nhận yêu cầu của Shopify và chuyển đơn cho nhà cung cấp. Với AliExpress: Tiện ích Chrome liệt kê các đơn đang chờ đặt và mở từng sản phẩm trên AliExpress. Bạn tự đặt và thanh toán đơn ở đó, rồi ghi lại mã đơn AliExpress trong tiện ích; mã vận đơn bạn thêm ở đó sẽ được gửi sang Shopify.",
+  "orders.fulfillmentRequest.approvedAwaitingPlacement": "Đã duyệt và đã nhận yêu cầu của Shopify. Đơn nhà cung cấp đang chờ bạn đặt qua tiện ích Chrome; chưa có gì được đặt.",
   "orders.fulfillmentRequest.decideBy": "Shopify vẫn đang chờ trả lời. Nếu bạn không duyệt, yêu cầu sẽ tự động bị từ chối vào {when}.",
   "orders.fulfillmentRequest.how.step3": "Khi bật duyệt (mặc định), app tính giá rồi chờ bạn: duyệt thì app đặt đơn nhà cung cấp và nhận yêu cầu, từ chối thì app báo từ chối, còn yêu cầu không ai duyệt trong 20 giờ sẽ tự động bị từ chối để Shopify không phải chờ mãi. Khi tắt duyệt, app đặt đơn nhà cung cấp và nhận yêu cầu ngay.",
 
@@ -177,4 +192,5 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   "orders.payments.blockedTitle": "Trình duyệt đã chặn trang thanh toán. Còn {n} trang cần mở",
   "orders.payments.moreBody": "Mỗi lần bấm, trình duyệt chỉ cho mở một thẻ mới, nên hãy mở lần lượt từng trang còn lại.",
   "orders.payments.payOrder": "Thanh toán {order} ({amount})",
+  "orders.payments.howItWorks.body": "AliExpress không cho ứng dụng tự trừ tiền tài khoản của bạn, nên mọi đơn nhà cung cấp đều được thanh toán ngay trên AliExpress. Tiện ích Chrome liệt kê các đơn đang chờ đặt và mở từng sản phẩm trên AliExpress. Bạn tự đặt và thanh toán đơn ở đó, rồi ghi lại mã đơn AliExpress trong tiện ích; mã vận đơn bạn thêm ở đó sẽ được gửi sang Shopify. Đơn được ghi là chưa thanh toán sẽ nằm ở đây: bấm Thanh toán để mở đơn trên AliExpress, trả tiền, rồi đánh dấu đã thanh toán. AliExpress tự huỷ đơn chưa thanh toán sau 24 giờ, đó là mốc cột Hạn chót đang đếm ngược.",
 };

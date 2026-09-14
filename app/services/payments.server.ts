@@ -4,7 +4,7 @@ import { errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
 import { d, money, sum } from "~/lib/money";
 import { logActivity } from "./activity.server";
-import { rollupOrderCosts, syncPurchaseOrder } from "./fulfillment.server";
+import { awaitingPlacementWhere, rollupOrderCosts, syncPurchaseOrder } from "./fulfillment.server";
 import { notify } from "./notifications.server";
 import { evaluateAndStoreOrder } from "./orders.server";
 import type { ShopWithSettings } from "./shop.server";
@@ -94,7 +94,9 @@ export async function getPaymentQueue(shopId: string, now: Date = new Date()): P
     },
     orderBy: [{ paymentDueAt: "asc" }, { placedAt: "asc" }],
   });
-  const awaitingPlacement = await prisma.purchaseOrder.count({ where: { order: { shopId }, status: "AWAITING_PLACEMENT" } });
+  // The same rule the orders list and the extension use, so the banner never
+  // promises more orders to place than the extension actually lists.
+  const awaitingPlacement = await prisma.purchaseOrder.count({ where: awaitingPlacementWhere(shopId) });
 
   const items: UnpaidPurchaseOrder[] = rows.map((po) => ({
     id: po.id,
