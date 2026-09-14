@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import type { HeadersFunction, LoaderFunctionArgs } from "@remix-run/node";
-import { Link, Outlet, useLoaderData, useNavigation, useRouteError, useRouteLoaderData } from "@remix-run/react";
+import { Link, Outlet, useLoaderData, useNavigation, useRouteError, useRouteLoaderData, type ShouldRevalidateFunction } from "@remix-run/react";
 import { boundary } from "@shopify/shopify-app-remix/server";
 import { AppProvider } from "@shopify/shopify-app-remix/react";
 import { NavMenu, type useAppBridge } from "@shopify/app-bridge-react";
@@ -50,6 +50,43 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 type LayoutData = Awaited<ReturnType<typeof loader>>;
+
+/**
+ * Screens whose actions can change what this layout shows: the unread and
+ * unpaid counts in the navigation, the locale, and the staff role behind the
+ * read-only banner. Orders are here because placing a purchase order adds to
+ * the unpaid count.
+ */
+const LAYOUT_AFFECTING_PATHS = ["/app/notifications", "/app/payments", "/app/orders", "/app/settings"];
+
+/**
+ * Whether the layout loader runs again.
+ *
+ * Remix re-runs every loader on the page after any action, so each fetcher
+ * submission anywhere in the app (saving a mapping, pushing a product, marking
+ * a row) paid for two count queries whose answers could not have changed. The
+ * layout now reloads only after actions on the screens listed above, and not
+ * when a screen merely changes its own search parameters (a tab, a filter, a
+ * page). Notifications created later by background jobs appear on the next
+ * full load or the next action on one of those screens, as they already did.
+ */
+export function layoutShouldRevalidate({
+  formMethod,
+  formAction,
+  currentUrl,
+  nextUrl,
+  defaultShouldRevalidate,
+}: Pick<Parameters<ShouldRevalidateFunction>[0], "formMethod" | "formAction" | "currentUrl" | "nextUrl" | "defaultShouldRevalidate">): boolean {
+  if (!defaultShouldRevalidate) return false;
+  if (formMethod && formMethod.toUpperCase() !== "GET") {
+    const target = new URL(formAction ?? nextUrl.pathname, nextUrl).pathname;
+    return LAYOUT_AFFECTING_PATHS.some((path) => target === path || target.startsWith(`${path}/`));
+  }
+  if (currentUrl.pathname === nextUrl.pathname && currentUrl.search !== nextUrl.search) return false;
+  return true;
+}
+
+export const shouldRevalidate: ShouldRevalidateFunction = (args) => layoutShouldRevalidate(args);
 
 export default function App() {
   const data = useLoaderData<typeof loader>();

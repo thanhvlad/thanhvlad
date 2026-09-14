@@ -1,7 +1,7 @@
 import type { Prisma } from "@prisma/client";
 import prisma, { chunkedTransaction } from "~/db.server";
 import { planVariantSync, type InventoryPolicyInput, type SyncAction } from "~/domain/inventory/rules";
-import { errorMessage } from "~/lib/errors";
+import { AppError, errorMessage } from "~/lib/errors";
 import { logger } from "~/lib/logger.server";
 import { logActivity } from "./activity.server";
 import { notify } from "./notifications.server";
@@ -10,18 +10,44 @@ import type { ShopWithSettings } from "./shop.server";
 import type { GraphqlClient } from "./shopify/graphql.server";
 import { setInventoryQuantities, setProductStatus, updateVariantPrices } from "./shopify/products.server";
 import { refreshSupplierProduct } from "./suppliers/catalog.server";
+import { SUPPLIER_API_UNAVAILABLE } from "./suppliers/index.server";
 import { findAlternativeSuppliers } from "./supplier-comparison.server";
 
 export interface InventorySyncSummary {
   productsChecked: number;
   suppliersRefreshed: number;
   suppliersFailed: number;
+  /**
+   * Supplier products that were not refreshed because this server has no API
+   * for them, which is the normal state of a product captured with the Chrome
+   * extension. Not a failure: nothing is wrong, there is simply nothing to ask.
+   */
+  suppliersSkipped: number;
   priceUpdates: number;
   inventoryUpdates: number;
   unpublished: number;
   costUpdates: number;
   notifications: number;
   errors: string[];
+  /** Why each skipped supplier product was left alone, in words a merchant can act on. */
+  skipped: string[];
+}
+
+/** Error codes meaning "no supplier API to ask", as opposed to "the supplier API failed". */
+const NO_SUPPLIER_API_CODES = new Set([SUPPLIER_API_UNAVAILABLE, "SUPPLIER_NOT_CONFIGURED"]);
+
+export const REFRESH_BY_RECAPTURE_REASON = "refresh by re-capturing with the extension";
+
+/**
+ * Whether a refresh error only says the server cannot reach this supplier.
+ *
+ * With SUPPLIER_DRIVER=mock or no AliExpress keys - the production setup while
+ * orders go through the extension - every captured product threw here. Each
+ * one was counted as a supplier failure and shown as a critical figure on the
+ * inventory screen every hour, for products that were fine.
+ */
+export function isNoSupplierApiError(error: unknown): boolean {
+  return error instanceof AppError && NO_SUPPLIER_API_CODES.has(error.code);
 }
 
 export async function getInventoryPolicy(shopId: string) {
@@ -74,7 +100,7 @@ export async function runInventorySync(
   const policyRow = await getInventoryPolicy(shop.id);
   const policy = toPolicyInput(policyRow);
   const pricingRule = await resolvePricingRule(shop.id, null);
-  const summary: InventorySyncSummary = { productsChecked: 0, suppliersRefreshed: 0, suppliersFailed: 0, priceUpdates: 0, inventoryUpdates: 0, unpublished: 0, costUpdates: 0, notifications: 0, errors: [] };
+  const summary: InventorySyncSummary = { productsChecked: 0, suppliersRefreshed: 0, suppliersFailed: 0, suppliersSkipped: 0, priceUpdates: 0, inventoryUpdates: 0, unpublished: 0, costUpdates: 0, notifications: 0, errors: [], skipped: [] };
   const planned: SyncAction[] = [];
 
   if (!policyRow.isEnabled && !options.productIds) {
@@ -92,12 +118,18 @@ export async function runInventorySync(
   const supplierProductIds = new Set<string>();
   for (const p of products) for (const v of p.variants) for (const m of v.variantMappings) supplierProductIds.add(m.supplierVariant.supplierProductId);
   const removed = new Set<string>();
+  const notRefreshable = new Set<string>();
   for (const id of supplierProductIds) {
     try {
       const refreshed = await refreshSupplierProduct(shop.id, id);
       if (refreshed) summary.suppliersRefreshed += 1;
       else removed.add(id);
     } catch (error) {
+      if (isNoSupplierApiError(error)) {
+        notRefreshable.add(id);
+        summary.suppliersSkipped += 1;
+        continue;
+      }
       summary.suppliersFailed += 1;
       summary.errors.push(`Supplier ${id}: ${errorMessage(error)}`);
     }
@@ -109,9 +141,17 @@ export async function runInventorySync(
   for (const product of products) {
     summary.productsChecked += 1;
     const actions: SyncAction[] = [];
+    let skippedVariants = 0;
     for (const variant of product.variants) {
       const mapping = variant.variantMappings[0];
       if (!mapping) continue;
+      if (notRefreshable.has(mapping.supplierVariant.supplierProductId)) {
+        // Nothing new is known about this supplier product, so there is nothing
+        // to act on. Planning from the stored capture would re-send the same
+        // numbers as if the supplier had just confirmed them.
+        skippedVariants += 1;
+        continue;
+      }
       const sv = freshById.get(mapping.supplierVariantId);
       const supplierProductRemoved = removed.has(mapping.supplierVariant.supplierProductId);
       const plan = planVariantSync(
@@ -133,6 +173,7 @@ export async function runInventorySync(
       );
       actions.push(...plan.actions);
     }
+    if (skippedVariants > 0) summary.skipped.push(`${product.title}: ${REFRESH_BY_RECAPTURE_REASON}`);
     planned.push(...actions);
     if (options.onProgress) await options.onProgress(1);
     if (options.dryRun || actions.length === 0) continue;
@@ -151,7 +192,9 @@ export async function runInventorySync(
     await logActivity(shop.id, {
       actor: options.actor,
       action: "inventory.synced",
-      message: `Auto-update checked ${summary.productsChecked} product(s): ${summary.priceUpdates} price, ${summary.inventoryUpdates} stock, ${summary.unpublished} unpublished, ${summary.costUpdates} cost updates.`,
+      message:
+        `Auto-update checked ${summary.productsChecked} product(s): ${summary.priceUpdates} price, ${summary.inventoryUpdates} stock, ${summary.unpublished} unpublished, ${summary.costUpdates} cost updates.` +
+        (summary.skipped.length > 0 ? ` ${summary.skipped.length} skipped (${REFRESH_BY_RECAPTURE_REASON}).` : ""),
       meta: { ...summary },
     });
   }

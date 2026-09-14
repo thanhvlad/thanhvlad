@@ -5,9 +5,18 @@ import { useSettingsPageAction } from "~/components/settings-page-action";
 import { requireShop } from "~/lib/auth.server";
 import { env } from "~/lib/env.server";
 import { useT } from "~/lib/use-t";
+import { aiEndpointStatus } from "~/services/ai-landing.server";
 import { emailProvider } from "~/services/email.server";
 import { queueStats } from "~/services/jobs/index.server";
 
+/**
+ * The operational picture of this deployment, for the merchant and for support.
+ *
+ * The public /healthz endpoint used to print it too, where anyone could read
+ * that orders do not reach a supplier API, that jobs run inside the web process
+ * and where merchant text is sent for AI rewrites. Behind the admin session it
+ * stays one click away for the people who need it.
+ */
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { shop } = await requireShop(request);
   const config = env();
@@ -19,6 +28,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     supplierDriver: config.SUPPLIER_DRIVER,
     queueMode: queue.mode,
     email: emailProvider(),
+    ai: aiEndpointStatus(),
   };
 };
 
@@ -89,6 +99,21 @@ export default function SupportSettings() {
               {
                 term: t("settings.advanced.email"),
                 description: <Badge tone={data.email === "none" ? "attention" : "success"}>{data.email === "none" ? t("common.disabled") : data.email}</Badge>,
+              },
+              {
+                term: t("support.environment.aiEndpoint"),
+                description: !data.ai.configured ? (
+                  <Badge tone="attention">{t("support.environment.aiNotConfigured")}</Badge>
+                ) : (
+                  <InlineStack gap="200" blockAlign="center">
+                    <Badge tone={data.ai.direct ? "success" : "attention"}>
+                      {data.ai.direct ? t("support.environment.aiDirect") : t("support.environment.aiGateway")}
+                    </Badge>
+                    <Text as="span" tone="subdued">
+                      {data.ai.host}
+                    </Text>
+                  </InlineStack>
+                ),
               },
             ]}
           />

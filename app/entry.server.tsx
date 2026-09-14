@@ -31,6 +31,18 @@ export function handleError(error: unknown, { request }: LoaderFunctionArgs | Ac
 }
 
 /**
+ * How long browsers keep refusing plain http for this host: one day for now.
+ *
+ * HSTS cannot be withdrawn early; a browser that saw a year keeps enforcing a
+ * year. While the domain, its certificate renewal behind Caddy and the install
+ * flow are still new, a mistake must be recoverable within a day. Raise it to
+ * 31536000 (one year) once the app has run on this domain for a few weeks with
+ * certificates renewing on their own and no plain-http endpoint anyone needs,
+ * and only then consider includeSubDomains, which pins every subdomain too.
+ */
+export const HSTS_MAX_AGE_SECONDS = 86_400;
+
+/**
  * Security headers the Shopify helper leaves to us.
  *
  * `addDocumentResponseHeaders` only sets `frame-ancestors` when the request
@@ -59,7 +71,7 @@ export function addPublicDocumentHeaders(request: Request, headers: Headers) {
   const forwardedProto = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
   const https = url.protocol === "https:" || forwardedProto === "https";
   if (process.env.NODE_ENV === "production" && https) {
-    headers.set("Strict-Transport-Security", "max-age=31536000");
+    headers.set("Strict-Transport-Security", `max-age=${HSTS_MAX_AGE_SECONDS}`);
   }
 }
 

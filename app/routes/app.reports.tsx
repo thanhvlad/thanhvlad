@@ -9,7 +9,8 @@ import { readForm, requireShop } from "~/lib/auth.server";
 import type { I18nKey } from "~/lib/i18n";
 import { formatMoney, formatPercent } from "~/lib/format";
 import { useMessage, useT } from "~/lib/use-t";
-import { getReport, rollupRange } from "~/services/reports.server";
+import { enqueue } from "~/services/jobs/index.server";
+import { getReport } from "~/services/reports.server";
 
 const RANGES: Record<string, number> = { "7d": 7, "30d": 30, "90d": 90, "365d": 365 };
 
@@ -35,14 +36,22 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   return { currency: shop.currency, range, report };
 };
 
+/**
+ * Recalculate the daily metrics for the selected range, in the background.
+ *
+ * The rollup used to run inside this request. Twelve months is one read of the
+ * orders and hundreds of upserts; with jobs running in the web process that held
+ * a request open long enough for the admin to show its own timeout, and a second
+ * click started the same work again. The rollup-metrics job does the same work,
+ * the dedupe key makes repeated clicks for one range a single job, and the page
+ * says the figures follow shortly.
+ */
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { shop } = await requireShop(request);
   const { get } = await readForm(request);
   const days = RANGES[get("range")] ?? 30;
-  const to = new Date();
-  const from = new Date(to.getTime() - (days - 1) * 86_400_000);
-  const rolled = await rollupRange(shop.id, from, to);
-  return { ok: true, messageKey: "msg.metricsRecalculated", messageVars: { n: rolled } };
+  await enqueue("rollup-metrics", { shopId: shop.id, days }, { dedupeKey: `metrics-recalculate-${shop.id}-${days}` });
+  return { ok: true, messageKey: "reports.recalculate.queued", messageVars: { n: days } };
 };
 
 /**
