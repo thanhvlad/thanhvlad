@@ -25,7 +25,11 @@ function appOrigin(raw) {
   // and the browser reports only "Failed to fetch". Keep the origin, drop the rest.
   const value = /^https?:\/\//i.test(raw.trim()) ? raw.trim() : `https://${raw.trim()}`;
   try {
-    return new URL(value).origin;
+    const url = new URL(value);
+    // A mistyped http:// app URL would send the Bearer token in clear text.
+    // Plain http is only for a local app.
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1"].includes(url.hostname))) return null;
+    return url.origin;
   } catch {
     return null;
   }
@@ -185,7 +189,7 @@ async function send(button, msg) {
   const base = appOrigin(appUrl);
   if (!base) {
     msg.className = "msg err";
-    msg.textContent = `"${appUrl}" is not a valid app URL. Fix it in the extension options.`;
+    msg.textContent = `"${appUrl}" is not a valid app URL. It must use https:// (http:// only for localhost). Fix it in the extension options.`;
     button.disabled = false;
     return;
   }

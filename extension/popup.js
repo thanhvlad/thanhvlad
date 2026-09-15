@@ -35,7 +35,11 @@ function appOrigin(raw) {
   // and the browser reports only "Failed to fetch". Keep the origin, drop the rest.
   const value = /^https?:\/\//i.test(raw.trim()) ? raw.trim() : `https://${raw.trim()}`;
   try {
-    return new URL(value).origin;
+    const url = new URL(value);
+    // A mistyped http:// app URL would send the Bearer token, and customers'
+    // addresses in the answer, in clear text. Plain http is only for a local app.
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1"].includes(url.hostname))) return null;
+    return url.origin;
   } catch {
     return null;
   }
@@ -91,7 +95,7 @@ async function settings() {
   const { appUrl, token } = await chrome.storage.sync.get(["appUrl", "token"]);
   if (!appUrl || !token) return { error: "Set the app URL and token in options." };
   const base = appOrigin(appUrl);
-  if (!base) return { error: `"${appUrl}" is not a valid app URL.` };
+  if (!base) return { error: `"${appUrl}" is not a valid app URL. It must use https:// (http:// only for localhost).` };
   return { base, token };
 }
 
@@ -240,6 +244,15 @@ function explainRefusal(status, answer, what) {
   return `Not saved: the app answered ${status}${reason ? ` (${reason})` : ""}.`;
 }
 
+/**
+ * An order recorded here, or one the app no longer has waiting, needs no
+ * checkout any more. A checkout tab still open for it would otherwise keep
+ * the customer's address in the extension's memory until the job expired.
+ */
+function forgetCheckout(purchaseOrderId) {
+  chrome.runtime.sendMessage({ type: "checkout:forget", purchaseOrderId }).catch(() => undefined);
+}
+
 function renderPlaceForm(config, order) {
   const form = el("form", { className: "action" });
   const numbers = el("input", { type: "text", placeholder: "e.g. 8190000000000000" });
@@ -281,6 +294,7 @@ function renderPlaceForm(config, order) {
       // the server keeps the estimate when the currencies differ.
       if (amount) Object.assign(body, { totalCost: amount, currency: order.currency });
       const { status, answer } = await postJson(config, `/api/extension/orders/${encodeURIComponent(order.id)}/placed`, body);
+      if ((status === 200 && answer.ok) || status === 404 || status === 409) forgetCheckout(order.id);
       if (status === 200 && answer.ok && answer.alreadyRecorded) {
         await refreshOrders(config, `${order.orderName} was already recorded as AliExpress order ${answer.externalOrderId}. Nothing changed.`, "ok");
       } else if (status === 200 && answer.ok) {

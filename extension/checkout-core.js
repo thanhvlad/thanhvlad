@@ -33,6 +33,11 @@
   const REGIONAL_OFFSET = 2n ** 51n;
   const DIGITS = /^\d{1,20}$/;
 
+  // Any id at or above 2^51 is read as regional. Global ids issued today are
+  // about 1.005e15, well under 2^51 (2.25e15); if AliExpress ever issues a
+  // global id past 2^51 this test misreads it, and the product check on the
+  // page (sameProduct against the page's own productId) fails rather than
+  // opening another product.
   function globalProductId(id) {
     const text = String(id ?? "").trim();
     if (!DIGITS.test(text)) return null;
@@ -347,7 +352,10 @@
    * otherwise match nothing.
    */
   function stateTitleCandidates(province, provinceCode) {
-    return [...new Set([collapse(province), usStateName(provinceCode), usStateName(province)].filter(Boolean))];
+    // Full names first: the first candidate is what gets typed to filter the
+    // list, and typing "TX" filtered the State list down to nothing, because
+    // "texas" does not contain "tx", before "Texas" could ever be matched.
+    return [...new Set([usStateName(provinceCode), usStateName(province), collapse(province)].filter(Boolean))];
   }
 
   /**
@@ -366,7 +374,9 @@
     if (inputs.length !== 8) {
       return { ok: false, reason: `The form has ${inputs.length} text boxes, not the 8 of the US address form DropshipHub knows.` };
     }
-    if (selects < 4) return { ok: false, reason: `The form has ${selects} drop-downs, not the 4 of the US address form.` };
+    // Exactly 4: State and City are taken as the third and fourth, and an extra
+    // drop-down in front of them would shift both onto the wrong lists.
+    if (selects !== 4) return { ok: false, reason: `The form has ${selects} drop-downs, not the 4 of the US address form.` };
     const dial = String(inputs[2]?.value ?? "").trim();
     if (!/^\+\d{1,4}$/.test(dial)) return { ok: false, reason: "The third box is not the phone country code." };
     if (dial !== "+1") return { ok: false, reason: `The phone country code is ${dial}, not +1 for the United States.` };
@@ -375,6 +385,69 @@
     const misplaced = [0, 1, 3, 4, 5, 7].find((i) => zipLike.test(String(inputs[i]?.placeholder ?? "")));
     if (misplaced !== undefined) return { ok: false, reason: "The boxes are not in the order of the US address form." };
     return { ok: true, dialCode: dial };
+  }
+
+  /**
+   * Whether "Set as default shipping address" is ticked: "ticked", "unticked"
+   * or "missing". The fill never clicks that box, but the form it fills may
+   * already have it ticked, for instance when the merchant opened the edit
+   * form of their own default address. Filling that form would put the
+   * customer's address over the merchant's default the moment they press
+   * Confirm, so a ticked box stops the fill, and the panel says the box is
+   * unticked only after reading it. Anything that is not clearly unticked
+   * (aria-checked="mixed", a "checked" or "indeterminate" class) counts as
+   * ticked.
+   *
+   * `boxes` describe every checkbox-like node of the address dialog:
+   * { checked: boolean | null, ariaChecked: string | null, classes: string[] }.
+   */
+  function defaultBoxState(boxes) {
+    const list = Array.isArray(boxes) ? boxes.filter((box) => box && typeof box === "object") : [];
+    if (list.length === 0) return "missing";
+    const ticked = list.some((box) => {
+      const aria = String(box.ariaChecked ?? "").toLowerCase();
+      const classes = Array.isArray(box.classes) ? box.classes.map(String) : [];
+      return (
+        box.checked === true ||
+        aria === "true" ||
+        aria === "mixed" ||
+        classes.some((c) => /^(is-)?(checked|indeterminate)$|[-_](checked|indeterminate)$/i.test(c))
+      );
+    });
+    return ticked ? "ticked" : "unticked";
+  }
+
+  /**
+   * Positions of the address form's text boxes that already hold something
+   * other than the customer's values. AliExpress uses the same form to edit a
+   * saved address, and the fill overwrote that address with the customer's
+   * name, phone and street, ready to be saved over the merchant's own. A new
+   * address form is empty apart from the phone country code; a value the fill
+   * itself typed on an earlier press is one of `intended` and is allowed, so
+   * pressing Fill address again still works.
+   */
+  function foreignFormValues(values, intended) {
+    const allowed = new Set((Array.isArray(intended) ? intended : []).map(normalizeTitle).filter(Boolean));
+    const list = Array.isArray(values) ? values : [];
+    const foreign = [];
+    list.forEach((value, index) => {
+      const text = collapse(value);
+      if (!text || /^\+\d{1,4}$/.test(text) || allowed.has(normalizeTitle(text))) return;
+      foreign.push(index);
+    });
+    return foreign;
+  }
+
+  /**
+   * The keys whose value on the page is not the value the fill typed. A
+   * React re-render can put a controlled input's old value back, and a State
+   * or City change can clear the boxes after it, so the fill reads every box
+   * back rather than report "Address filled" on the strength of having typed.
+   */
+  function mismatchedFields(expected, actual) {
+    const want = expected && typeof expected === "object" ? expected : {};
+    const have = actual && typeof actual === "object" ? actual : {};
+    return Object.keys(want).filter((key) => collapse(want[key]) !== collapse(have[key]));
   }
 
   // ---------------------------------------------------------------------------
@@ -513,9 +586,32 @@
    *
    * `d` is a plain descriptor the content script builds from the element:
    * { tag, type, role, classes, ancestorClasses, text, ariaLabel, title,
-   *   inForm, ariaChecked, containsForbidden }.
+   *   inForm, ariaChecked, containsForbidden, control, activators }.
+   *
+   * Classifying the clicked element alone was not enough. A click bubbles,
+   * and the browser activates the nearest ancestor that has activation
+   * behaviour: a <span> inside an untyped <button> in the address form
+   * submits the form, and a <span> inside the "Set as default shipping
+   * address" <label> ticks its box. So `activators` describes every ancestor
+   * that a click could activate (buttons, inputs, labels, links, summaries,
+   * ARIA buttons and checkboxes), and the click is refused when any of them
+   * would be. `control` is a <label>'s labelled control, which a click on the
+   * label toggles wherever in the page that control sits.
    */
   function clickRefusal(d) {
+    const own = refusalOf(d, true);
+    if (own) return own;
+    for (const activator of Array.isArray(d.activators) ? d.activators : []) {
+      // An ancestor is judged on its own descriptor and its label control;
+      // its own activators list, if any, is ignored, so a malformed
+      // descriptor cannot send this into a loop.
+      const refusal = refusalOf(activator, true);
+      if (refusal) return `The click would reach a control around it. ${refusal}`;
+    }
+    return null;
+  }
+
+  function refusalOf(d, withControl) {
     if (!d || typeof d !== "object") return "Nothing to click.";
     const tag = String(d.tag ?? "").toLowerCase();
     const type = String(d.type ?? "").toLowerCase();
@@ -540,6 +636,10 @@
     if (d.containsForbidden) return "It contains a control DropshipHub never clicks.";
     const words = [d.text, d.ariaLabel, d.title].map((v) => String(v ?? "")).join(" ");
     if (COMMIT_WORDS.test(words) || COMMIT_WORDS_VI.test(words)) return "Its label commits an order, a payment or the address.";
+    if (tag === "label" && withControl && d.control) {
+      const refusal = refusalOf(d.control, false);
+      if (refusal) return `It is the label of a control DropshipHub never clicks. ${refusal}`;
+    }
     return null;
   }
 
@@ -554,6 +654,10 @@
    */
   const JOB_MAX_AGE_MS = 4 * 3_600_000;
   const PURCHASE_ORDER_ID = /^[A-Za-z0-9_-]{8,64}$/;
+
+  function isPurchaseOrderId(value) {
+    return typeof value === "string" && PURCHASE_ORDER_ID.test(value);
+  }
 
   function shortText(value, max = 300) {
     return value == null ? null : String(value).slice(0, max);
@@ -629,7 +733,7 @@
     const reason = typeof answer?.error === "string" ? answer.error : "";
     if (status === 400) return `Not saved. Check what you entered: ${reason}`;
     if (status === 401) return "Not saved: the app refused the token. Check the token in the extension options.";
-    if (status === 404) return "Not saved: this order is no longer in DropshipHub. Cancel this checkout.";
+    if (status === 404) return "Not saved: this order is no longer in DropshipHub.";
     if (status === 409) return `Not saved: ${reason}`;
     if (status === 413) return "Not saved: what you entered is too long.";
     if (status === 429) return `Not saved: ${reason || "too many requests. Try again in a minute."}`;
@@ -666,12 +770,16 @@
     usStateName,
     stateTitleCandidates,
     usFormStructure,
+    defaultBoxState,
+    foreignFormValues,
+    mismatchedFields,
     parseMoneyText,
     formatAmount,
     expectedCost,
     compareTotals,
     clickRefusal,
     buildJob,
+    isPurchaseOrderId,
     isJobExpired,
     isLastItem,
     jobOrderIds,

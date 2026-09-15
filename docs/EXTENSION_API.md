@@ -187,23 +187,36 @@ in the popup. Page facts it relies on are in `docs/ALIEXPRESS_PAGE_MODEL.md`.
 4. **Fill address** fills AliExpress's US address form: it opens "Add new address" and
    "Enter manually" if needed, chooses the country, fills first and last name, the mobile
    number without +1, the street (at most 35 characters, the rest moved to "Apt, suite,
-   unit"), ZIP, State and City ("Other" when AliExpress does not list the city, highlighted
-   for you to check). It stops, and leaves the Copy buttons, for any other country or any form
-   that does not look like the measured US form. Nothing is filled until you press the button.
+   unit"), State, City ("Other" when AliExpress does not list the city, highlighted for you to
+   check) and ZIP, then reads every box back and highlights any that does not show what it
+   typed. It stops, and leaves the Copy buttons, for any other country, any form that does not
+   look like the measured US form, a form that already holds another address (the edit form of
+   a saved address), or a form whose "Set as default shipping address" is ticked. Nothing is
+   filled until you press the button. It works with AliExpress in English or Vietnamese only;
+   on a site in another language it stops with a message.
 5. **You** check the address and press Confirm, then place and pay for the order on
    AliExpress. The extension never clicks Place order, Confirm, Pay, Buy now, any payment
    choice or "Set as default shipping address": every click it makes goes through one guard
-   that refuses those controls.
+   that refuses those controls, including when the element clicked sits inside one of them.
+   The panel says the default box is unticked only after reading it.
 6. Enter the AliExpress order number in the panel. If the page you land on after placing
-   carries `orderId=` or `orderIds=` in its address, the panel suggests those numbers; it
-   never records them without your click. With more items, **Next item** opens the next
-   product in the same tab, and the numbers are sent to DropshipHub with the last item.
+   carries `orderId=` or `orderIds=` in its address, the panel shows those numbers beside the
+   box with a **Use** button; they go into the box, and to DropshipHub, only on your clicks.
+   With more items, **Next item** opens the next product in the same tab, and the numbers are
+   sent to DropshipHub with the last item.
 
 The checkout job, including the customer's address, lives only in the extension's
 `chrome.storage.session` (memory only, cleared when the browser closes) and is removed when
-the purchase order is recorded, when you cancel, when the tab closes, or after four hours. It
-is never written to the console or handed to the page's scripts, and the only part of it that
-goes into a URL is the destination country, which AliExpress's own checkout address carries.
+the purchase order is recorded (in the panel or with the popup's "Mark as placed"), when the
+app answers that it is gone (404) or already recorded with other numbers (409), when you
+cancel, when the tab closes, or after four hours. It is never written to the console or handed
+to the page's scripts, and the only part of it that goes into a URL is the destination country,
+which AliExpress's own checkout address carries. A field you **Copy** goes to the operating
+system's clipboard, which the extension cannot clear: it can outlive the checkout, for example
+in Windows clipboard history.
+
+The app URL must use `https://`; the extension refuses plain `http://` except for `localhost`
+and `127.0.0.1`, because the token travels with every request.
 
 ## Installing the extension
 

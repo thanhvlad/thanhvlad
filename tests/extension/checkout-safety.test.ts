@@ -43,6 +43,27 @@ describe("clicks go through the guard only", () => {
     expect(guard.indexOf("if (refusal) return refusal;")).toBeLessThan(guard.indexOf(".click("));
   });
 
+  it("judges every control around the clicked element that the click would activate", () => {
+    const describer = functionSource(checkout, "describeForGuard");
+    const guard = functionSource(checkout, "guardedClick");
+    // guardedClick classifies the descriptor that carries the activators.
+    expect(guard).toContain("core.clickRefusal(describeForGuard(element))");
+    // Every ancestor up to the document, not only the nearest one.
+    expect(describer).toMatch(/for \(let node = element\.parentElement; node; node = node\.parentElement\)/);
+    expect(describer).toContain("node.matches(ACTIVATORS)");
+    expect(describer).toContain("activators");
+    for (const selector of ["button", "input", "label", "summary", "a[href]", '[role="button"]', '[role="checkbox"]', '[role="radio"]', '[role="switch"]', "[aria-checked]"]) {
+      expect(checkout).toMatch(new RegExp(`const ACTIVATORS =\\s*'[^']*${selector.replace(/[[\]()]/g, "\\$&")}`));
+    }
+    // A label is judged with the control it toggles.
+    expect(functionSource(checkout, "describeElement")).toMatch(/element instanceof HTMLLabelElement && element\.control/);
+    expect(core).toMatch(/for \(const activator of Array\.isArray\(d\.activators\)/);
+  });
+
+  it('hands the guard the control around "Enter manually", not the span inside it', () => {
+    expect(functionSource(checkout, "enterManuallyIfNeeded")).toContain(`guardedClick(link.closest("button, a, [role='button']") ?? link)`);
+  });
+
   it("never submits a form, presses a key or dispatches pointer events elsewhere", () => {
     for (const source of [checkout, core, background]) {
       expect(source).not.toMatch(/\.submit\(|requestSubmit|KeyboardEvent|PointerEvent|TouchEvent|new Event\("submit"/);
@@ -68,6 +89,45 @@ describe("clicks go through the guard only", () => {
     expect(count(checkout, /fillAddress\(/)).toBe(2);
     const handler = checkout.slice(checkout.indexOf('button("Fill address"'), checkout.indexOf("const record = recordBlock(job);"));
     expect(handler).toContain("await fillAddress(job, values, fillStatus);");
+    // Every panel button ignores clicks that are not the merchant's own.
+    const helper = functionSource(checkout, "button");
+    expect(helper).toContain("if (!event.isTrusted) return;");
+    expect(helper.indexOf("if (!event.isTrusted) return;")).toBeLessThan(helper.indexOf("onClick(event)"));
+  });
+
+  it("reads the default box and the form's values before it types or chooses anything", () => {
+    const fill = functionSource(checkout, "fillAddress");
+    const refusals = [...fill.matchAll(/if \(formRefusesFill\(form, values, status, (true|false)\)\) return;/g)];
+    expect(refusals.map((m) => m[1])).toEqual(["false", "true"]);
+    // The first check comes before "Enter manually" and the country; the
+    // whole-form check before State, City and every typed box.
+    expect(fill.indexOf("formRefusesFill(")).toBeLessThan(fill.indexOf("enterManuallyIfNeeded("));
+    const lastCheck = refusals[1].index ?? -1;
+    for (const step of ["stateSelect, stateCandidates[0]", "chooseInSelect(citySelect", "setInputValue("]) {
+      expect(fill.indexOf(step), step).toBeGreaterThan(lastCheck);
+    }
+    const guard = functionSource(checkout, "formRefusesFill");
+    expect(guard).toContain("core.foreignFormValues(");
+    expect(guard).toMatch(/if \(box === "ticked"\) \{[\s\S]*return true;/);
+    expect(guard).toMatch(/if \(box === "missing" && requireBox\) \{[\s\S]*return true;/);
+  });
+
+  it('says "left unticked" only after reading the box', () => {
+    const finish = functionSource(checkout, "finishFill");
+    expect(count(checkout, /left unticked/)).toBe(1);
+    expect(finish.indexOf("readDefaultBox(")).toBeGreaterThan(-1);
+    expect(finish.indexOf("readDefaultBox(")).toBeLessThan(finish.indexOf("left unticked"));
+    expect(finish).toMatch(/if \(box === "ticked"\)/);
+    expect(finish).toMatch(/filledAll && !flags\.some\(Boolean\) && box === "unticked" \? "ok" : "warn"/);
+  });
+
+  it("stops the fill once the checkout is cancelled or the page moves on", () => {
+    const fill = functionSource(checkout, "fillAddress");
+    // Before opening the form, the country, State, City, "Other" and the typing.
+    expect(count(fill, /if \(!\(await fillMayContinue\(job, status\)\)\) return;/)).toBeGreaterThanOrEqual(6);
+    const check = functionSource(checkout, "fillMayContinue");
+    expect(check).toContain('ask({ type: "checkout:get" })');
+    expect(check).toContain("current.purchaseOrderId !== job.purchaseOrderId");
   });
 });
 
@@ -98,9 +158,22 @@ describe("customer data stays inside the extension", () => {
   });
 
   it("is cleared when a checkout finishes, is cancelled, or its tab closes", () => {
-    expect(functionSource(background, "finish", "")).toContain("if (answer.ok) await dropJob(job.tabId);");
+    const finish = functionSource(background, "finish", "");
+    expect(finish).toContain("const ended = !answer.ok && (answer.httpStatus === 404 || answer.httpStatus === 409);");
+    expect(finish).toContain("if (answer.ok || ended) await dropJob(job.tabId);");
     expect(background).toMatch(/case "checkout:cancel": \{\s*await dropJob\(tabId\);/);
     expect(background).toMatch(/chrome\.tabs\.onRemoved\.addListener\(\(tabId\) => \{\s*dropJob\(tabId\)/);
+  });
+
+  it("is cleared when the popup records the order, and when it expires without being read", () => {
+    expect(functionSource(background, "forgetCheckout", "")).toContain("await sweep(purchaseOrderId);");
+    // Only the extension's own pages may drop a job by purchase order.
+    expect(functionSource(background, "route", "")).toMatch(/checkout:forget"\) \{\s*if \(!fromExtensionPage\(sender\)\) return/);
+    expect(extensionFile("popup.js")).toMatch(/if \(\(status === 200 && answer\.ok\) \|\| status === 404 \|\| status === 409\) forgetCheckout\(order\.id\);/);
+    // Expired jobs are swept on every message, and when any tab finishes loading.
+    expect(background).toMatch(/chrome\.runtime\.onMessage\.addListener\([\s\S]*?sweep\(\)\s*\.catch\(\(\) => undefined\)\s*\.then\(\(\) => route\(message, sender\)\)/);
+    expect(background).toMatch(/chrome\.tabs\.onUpdated\.addListener\([\s\S]*?sweep\(\)/);
+    expect(background).toMatch(/chrome\.tabs\.onReplaced\.addListener/);
   });
 
   it("never crosses into the page's MAIN world", () => {

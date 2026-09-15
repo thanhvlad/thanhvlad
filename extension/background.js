@@ -12,8 +12,10 @@
  * default readable only by the extension's own pages and this worker, not by
  * content scripts. Content scripts ask for their own tab's job by message.
  *
- * A job is removed when its purchase order is recorded, when the merchant
- * cancels, when its tab closes, and when it is older than a few hours.
+ * A job is removed when its purchase order is recorded (here or with the
+ * popup's "Mark as placed"), when the app says it is gone or recorded with
+ * other numbers, when the merchant cancels, when its tab closes, and when it
+ * is older than a few hours.
  */
 
 importScripts("checkout-core.js");
@@ -59,6 +61,27 @@ async function sweep(purchaseOrderId) {
 chrome.tabs.onRemoved.addListener((tabId) => {
   dropJob(tabId).catch(() => undefined);
 });
+
+// A prerendered or discarded tab can be swapped for a new tab id. The job
+// follows it; otherwise it sat under the old id, unreachable, with the address
+// in it, until it expired.
+chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+  (async () => {
+    const job = await readJob(removedTabId);
+    if (!job) return;
+    await writeJob({ ...job, tabId: addedTabId });
+    await dropJob(removedTabId);
+  })().catch(() => undefined);
+});
+
+// The four-hour expiry used to run only when that tab's job was read, or once
+// when the worker started. A job whose tab stayed open on another site was
+// never read, and kept the customer's address in memory past its expiry. So
+// expired jobs are also swept on every message and whenever a tab finishes
+// loading; alarms would need a new permission.
+chrome.tabs.onUpdated.addListener((_tabId, change) => {
+  if (change.status === "complete") sweep().catch(() => undefined);
+});
 sweep().catch(() => undefined);
 
 // ---------------------------------------------------------------------------
@@ -71,7 +94,11 @@ function appOrigin(raw) {
   const trimmed = String(raw ?? "").trim();
   const value = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
   try {
-    return new URL(value).origin;
+    const url = new URL(value);
+    // A mistyped http:// app URL would send the Bearer token, and the order
+    // numbers with it, in clear text. Plain http is only for a local app.
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1"].includes(url.hostname))) return null;
+    return url.origin;
   } catch {
     return null;
   }
@@ -88,7 +115,7 @@ function appOrigin(raw) {
 async function postPlaced(job, paid) {
   const { appUrl, token } = await chrome.storage.sync.get(["appUrl", "token"]);
   const base = appUrl ? appOrigin(appUrl) : null;
-  if (!base || !token) return { ok: false, error: "Set the app URL and token in the extension options, then press Send again." };
+  if (!base || !token) return { ok: false, error: "Set the app URL (https://) and token in the extension options, then press Send again." };
   const ids = core.jobOrderIds(job);
   if (ids.length === 0) return { ok: false, error: "No AliExpress order number has been recorded yet." };
   if (ids.length > 20) return { ok: false, error: "A purchase order can carry at most 20 AliExpress order numbers." };
@@ -167,6 +194,9 @@ async function handleTabMessage(message, tabId) {
       return { ok: true };
     }
     case "checkout:reopen-product": {
+      // A recorded item goes forward (Next item, Send), never back to its
+      // product page, where a second checkout for it could start.
+      if (job.stage === "recorded") return { ok: false, error: "This item's order number is already recorded." };
       await writeJob({ ...job, stage: "product" });
       await chrome.tabs.update(tabId, { url: core.productPageUrl(item.externalProductId) });
       return { ok: true };
@@ -203,24 +233,44 @@ async function handleTabMessage(message, tabId) {
 
 async function finish(job, paid) {
   const answer = await postPlaced(job, paid);
-  // Recorded: the job and the address in it are no longer needed. Refused or
-  // unreachable: the job stays, so the merchant can retry or cancel without
-  // typing the order numbers again.
-  if (answer.ok) await dropJob(job.tabId);
-  return { ...answer, done: answer.ok, orderName: job.orderName };
+  // Recorded: the job and the address in it are no longer needed. A 404 (the
+  // purchase order is gone) or 409 (recorded with other numbers, or its
+  // Shopify order was cancelled) cannot succeed on a retry either, and the job
+  // used to stay with the address in it. Unreachable, 401, 429 and the like:
+  // the job stays, so the merchant can retry without typing the numbers again.
+  const ended = !answer.ok && (answer.httpStatus === 404 || answer.httpStatus === 409);
+  if (answer.ok || ended) await dropJob(job.tabId);
+  return { ...answer, done: answer.ok, ended, orderName: job.orderName };
+}
+
+/**
+ * The popup recorded the purchase order itself with "Mark as placed", or
+ * learned it is gone. A checkout tab still open for it would otherwise keep the
+ * customer's address in memory until it expired.
+ */
+async function forgetCheckout(purchaseOrderId) {
+  if (!core.isPurchaseOrderId(purchaseOrderId)) return { ok: false, error: "No such order." };
+  await sweep(purchaseOrderId);
+  return { ok: true };
+}
+
+function route(message, sender) {
+  if (message.type === "checkout:start" || message.type === "checkout:forget") {
+    if (!fromExtensionPage(sender)) return { ok: false, error: "Not allowed." };
+    return message.type === "checkout:start" ? startCheckout(message.order) : forgetCheckout(message.purchaseOrderId);
+  }
+  if (fromAliExpressTab(sender)) return handleTabMessage(message, sender.tab.id);
+  return { ok: false, error: "Not allowed." };
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== "string" || !message.type.startsWith("checkout:")) return false;
-  let work;
-  if (message.type === "checkout:start") {
-    work = fromExtensionPage(sender) ? startCheckout(message.order) : Promise.resolve({ ok: false, error: "Not allowed." });
-  } else if (fromAliExpressTab(sender)) {
-    work = handleTabMessage(message, sender.tab.id);
-  } else {
-    work = Promise.resolve({ ok: false, error: "Not allowed." });
-  }
-  work.then(sendResponse, () => sendResponse({ ok: false, error: "Something went wrong in the extension. Try again." }));
+  // Expired jobs go first, on every message, so an abandoned job cannot
+  // outlive its expiry just because its own tab never asks for it.
+  sweep()
+    .catch(() => undefined)
+    .then(() => route(message, sender))
+    .then(sendResponse, () => sendResponse({ ok: false, error: "Something went wrong in the extension. Try again." }));
   // Keeps the channel open for the asynchronous answer.
   return true;
 });

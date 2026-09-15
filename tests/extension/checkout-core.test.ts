@@ -236,7 +236,11 @@ describe("option titles", () => {
     expect(Object.keys(core.US_STATES)).toHaveLength(56);
     expect(core.stateTitleCandidates("Texas", "TX")).toEqual(["Texas"]);
     expect(core.stateTitleCandidates(null, "TX")).toEqual(["Texas"]);
-    expect(core.stateTitleCandidates("TX", null)).toEqual(["TX", "Texas"]);
+    // The full name comes first, because the first candidate is typed to
+    // filter the list and "TX" filters "Texas" out.
+    expect(core.stateTitleCandidates("TX", null)).toEqual(["Texas", "TX"]);
+    expect(core.stateTitleCandidates("tx", "TX")).toEqual(["Texas", "tx"]);
+    expect(core.stateTitleCandidates("Armed Forces Americas", "AA")).toEqual(["Armed Forces Americas"]);
     expect(core.stateTitleCandidates(null, null)).toEqual([]);
   });
 });
@@ -283,7 +287,55 @@ describe("usFormStructure", () => {
     expect(core.usFormStructure(reordered).ok).toBe(false);
 
     expect(core.usFormStructure({ ...usForm(), selectCount: 3 }).ok).toBe(false);
+    // An extra drop-down would shift State and City onto the wrong lists.
+    expect(core.usFormStructure({ ...usForm(), selectCount: 5 }).ok).toBe(false);
     expect(core.usFormStructure(null).ok).toBe(false);
+  });
+});
+
+describe("defaultBoxState - rule 6 is read, not assumed", () => {
+  it("reads a native, ARIA or Fusion checkbox as ticked", () => {
+    expect(core.defaultBoxState([{ checked: true, ariaChecked: null, classes: ["next-checkbox-input"] }])).toBe("ticked");
+    expect(core.defaultBoxState([{ checked: null, ariaChecked: "true", classes: [] }])).toBe("ticked");
+    expect(core.defaultBoxState([{ checked: null, ariaChecked: "mixed", classes: [] }])).toBe("ticked");
+    expect(core.defaultBoxState([{ checked: null, ariaChecked: null, classes: ["next-checkbox-wrapper", "checked"] }])).toBe("ticked");
+    expect(core.defaultBoxState([{ checked: null, ariaChecked: null, classes: ["comet-checkbox-checked"] }])).toBe("ticked");
+    expect(core.defaultBoxState([{ checked: null, ariaChecked: null, classes: ["next-checkbox-wrapper", "indeterminate"] }])).toBe("ticked");
+  });
+
+  it("reads unticked only when every box says so, and missing when there is none", () => {
+    const wrapper = { checked: null, ariaChecked: null, classes: ["next-checkbox-wrapper"] };
+    const input = { checked: false, ariaChecked: "false", classes: ["next-checkbox-input"] };
+    expect(core.defaultBoxState([wrapper, input])).toBe("unticked");
+    expect(core.defaultBoxState([{ checked: null, ariaChecked: null, classes: ["next-checkbox-unchecked"] }])).toBe("unticked");
+    expect(core.defaultBoxState([wrapper, { ...input, checked: true }])).toBe("ticked");
+    expect(core.defaultBoxState([])).toBe("missing");
+    expect(core.defaultBoxState(null)).toBe("missing");
+  });
+});
+
+describe("foreignFormValues - an edit form is not filled", () => {
+  const intended = ["Jane", "Doe", "5125550100", "1 Main St", "", "78701"];
+
+  it("accepts a new form, and one the fill itself typed into before", () => {
+    expect(core.foreignFormValues(["", "", "+1", "", "", "", "", ""], intended)).toEqual([]);
+    expect(core.foreignFormValues(["Jane", " doe ", "+1", "5125550100", "1 Main St", "", "78701", ""], intended)).toEqual([]);
+  });
+
+  it("points at every box holding something else", () => {
+    expect(core.foreignFormValues(["Minh", "Nguyen", "+84", "901234567", "12 Le Loi", "", "", ""], intended)).toEqual([0, 1, 3, 4]);
+    expect(core.foreignFormValues(["", "", "+1", "", "", "", "", "Leave at door"], intended)).toEqual([7]);
+    expect(core.foreignFormValues(["x"], null)).toEqual([0]);
+    expect(core.foreignFormValues(null, intended)).toEqual([]);
+  });
+});
+
+describe("mismatchedFields - the fill reads its boxes back", () => {
+  it("names the boxes that do not show what was typed", () => {
+    const expected = { firstName: "Jane", lastName: "Doe", unit: "", zip: "78701" };
+    expect(core.mismatchedFields(expected, { firstName: "Jane", lastName: "Doe ", unit: null, zip: "78701" })).toEqual([]);
+    expect(core.mismatchedFields(expected, { firstName: "", lastName: "Doe", unit: "", zip: "" })).toEqual(["firstName", "zip"]);
+    expect(core.mismatchedFields(expected, null)).toEqual(["firstName", "lastName", "zip"]);
   });
 });
 
@@ -381,6 +433,39 @@ describe("clickRefusal - the one guard every programmatic click passes", () => {
   it("refuses a missing descriptor", () => {
     expect(core.clickRefusal(null)).toEqual(expect.any(String));
   });
+
+  // A click bubbles, and the browser activates the nearest button, label or
+  // input around the node clicked. The guard judges those as well.
+  describe("controls around the element, which the click would activate", () => {
+    const span = (activators: object[]) => ({ tag: "SPAN", classes: [], ancestorClasses: ["deliver-address-form"], text: "Enter manually", inForm: true, activators });
+
+    it("refuses a span inside an untyped button in a form, which submits it", () => {
+      expect(core.clickRefusal(span([]))).toBeNull();
+      expect(core.clickRefusal(span([{ tag: "BUTTON", type: null, classes: ["comet-btn"], text: "Enter manually", inForm: true }]))).toMatch(/submits a form/);
+    });
+
+    it("refuses a span inside a submit button, in a form or not", () => {
+      expect(core.clickRefusal({ ...span([{ tag: "BUTTON", type: "submit", classes: [], text: "Enter manually", inForm: false }]), inForm: false })).toMatch(/submits a form/);
+    });
+
+    it("refuses a span inside a label whose control is a checkbox", () => {
+      const label = { tag: "LABEL", classes: [], text: "Set as default shipping address", control: { tag: "INPUT", type: "checkbox", classes: [] } };
+      expect(core.clickRefusal({ tag: "SPAN", classes: [], text: "Set as default shipping address", inForm: true, activators: [label] })).toMatch(/checkbox/);
+      // The label itself, clicked directly, with the checkbox elsewhere in the page (label for="…").
+      expect(core.clickRefusal(label)).toMatch(/checkbox/);
+      expect(core.clickRefusal({ ...label, control: { tag: "INPUT", type: "text", classes: [] } })).toBeNull();
+    });
+
+    it("refuses a span inside Place order or a payment choice, whatever its own classes", () => {
+      expect(core.clickRefusal(span([{ tag: "BUTTON", type: "button", classes: ["place-order-primary-btn"], text: "" }]))).toMatch(/Place order/);
+      expect(core.clickRefusal({ tag: "SPAN", text: "Visa", activators: [{ tag: "DIV", role: "radio", text: "Visa" }] })).toMatch(/payment choice/);
+    });
+
+    it("allows a span inside a plain button that commits nothing", () => {
+      expect(core.clickRefusal(span([{ tag: "BUTTON", type: "button", classes: ["comet-btn"], text: "Enter manually", inForm: true }]))).toBeNull();
+      expect(core.clickRefusal({ tag: "SPAN", text: "Add new address", activators: [{ tag: "A", classes: [], text: "Add new address", inForm: false }] })).toBeNull();
+    });
+  });
 });
 
 describe("the checkout job", () => {
@@ -422,6 +507,13 @@ describe("the checkout job", () => {
     expect(job.items[1].carrierCode).toBeNull();
   });
 
+  it("recognises a purchase order id, and nothing else", () => {
+    expect(core.isPurchaseOrderId("po_cm123456")).toBe(true);
+    expect(core.isPurchaseOrderId("short")).toBe(false);
+    expect(core.isPurchaseOrderId("../../etc/passwd")).toBe(false);
+    expect(core.isPurchaseOrderId(12345678)).toBe(false);
+  });
+
   it("refuses orders a checkout cannot open", () => {
     expect(core.buildJob(null, 1, 0).error).toBeTruthy();
     expect(core.buildJob({ ...order, id: "x" }, 1, 0).error).toMatch(/valid id/);
@@ -449,7 +541,7 @@ describe("the checkout job", () => {
   it("explains the placed endpoint's refusals", () => {
     expect(core.explainRefusal(401, {})).toMatch(/token/);
     expect(core.explainRefusal(409, { error: "already recorded as supplier order 1" })).toBe("Not saved: already recorded as supplier order 1");
-    expect(core.explainRefusal(404, {})).toMatch(/Cancel this checkout/);
+    expect(core.explainRefusal(404, {})).toMatch(/no longer in DropshipHub/);
     expect(core.explainRefusal(400, { error: "externalOrderIds bad" })).toMatch(/externalOrderIds bad/);
     expect(core.explainRefusal(413, {})).toMatch(/too long/);
     expect(core.explainRefusal(429, {})).toMatch(/too many requests/);

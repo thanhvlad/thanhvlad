@@ -23,6 +23,11 @@ function normaliseAppUrl(raw) {
   } catch {
     return { error: `"${raw.trim()}" is not a valid URL.` };
   }
+  // The token travels with every request, so plain http would send it in
+  // clear text; the popup and the background worker refuse it too.
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && ["localhost", "127.0.0.1"].includes(parsed.hostname))) {
+    return { error: "The app URL must start with https:// (http:// works only for localhost)." };
+  }
   if (parsed.pathname !== "/" && parsed.pathname !== "") {
     return { error: `Enter only the origin, without a path. Did you mean ${parsed.origin} ?` };
   }
