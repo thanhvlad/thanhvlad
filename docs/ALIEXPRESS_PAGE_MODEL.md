@@ -309,6 +309,23 @@ when above it), the SKU text ("Mix 10pcs"), "Total:$12.50" and the buttons
 "Confirm received" / "Track status" (or "Pay now" under To pay). This page is
 the source for automatic order-number and status sync.
 
+The "Details" link opens `www.aliexpress.com/p/order/detail.html?orderId=<id>`
+(the .com host even from .us). It shows `.order-status` ("Awaiting
+delivery"), `.service-progress-node-info` nodes ("Paid", "Refund" deadline),
+the customer's address in `.order-detail-info`, and an
+`.order-detail-order-info` block of `.info-row`s: "Ref. Number: <id> Copy",
+"Order placed on:", "Paid on:", "Shipment completed on:", "Payment method:".
+Its logistics line ("Awaiting flight") links to
+`/p/tracking/index.html?tradeOrderId=<id>`, whose classes are hashed
+(`logistic-info-v2--<name>--<hash>`), so match on the name part:
+`[class*="logistic-info-v2--carrierTitle"]` is the carrier ("AliExpress
+Selection Standard Fast for Special Goods"),
+`[class*="logistic-info-v2--mailNoValue"]` the tracking number (measured:
+`SWX` plus 18 digits), `[class*="logistic-info-v2--nodeTitle"]` /
+`--nodeDesc` / `--nodeTime` the events ("In transit" / "Awaiting flight").
+The page also prints the customer's street and a masked name, so a sync
+script must read only the carrier, the number and the order id.
+
 ## Not yet measured
 
 - The page shown after Place order, and whether its URL carries the new order
