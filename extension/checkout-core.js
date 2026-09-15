@@ -100,6 +100,29 @@
     return Boolean(url && url.protocol === "https:" && isAliExpressHost(url.hostname) && url.pathname === "/p/trade/confirm.html");
   }
 
+  /** The orders list (/p/order/index.html) and an order's detail page (/p/order/detail.html). */
+  function isOrdersPage(raw) {
+    const url = parseUrl(raw);
+    return Boolean(url && url.protocol === "https:" && isAliExpressHost(url.hostname) && /^\/p\/order\//i.test(url.pathname));
+  }
+
+  function isOrderDetailPage(raw) {
+    const url = parseUrl(raw);
+    return Boolean(url && url.protocol === "https:" && isAliExpressHost(url.hostname) && /^\/p\/order\/detail\.html$/i.test(url.pathname));
+  }
+
+  function isTrackingPage(raw) {
+    const url = parseUrl(raw);
+    return Boolean(url && url.protocol === "https:" && isAliExpressHost(url.hostname) && /^\/p\/tracking\//i.test(url.pathname));
+  }
+
+  /** The orders list on the host the checkout tab is on, where the paid order appears. */
+  function ordersPageUrl(origin) {
+    const url = parseUrl(origin);
+    if (!url || url.protocol !== "https:" || !isAliExpressHost(url.hostname)) return null;
+    return `${url.origin}/p/order/index.html`;
+  }
+
   // ---------------------------------------------------------------------------
   // The confirm page URL
   // ---------------------------------------------------------------------------
@@ -451,6 +474,168 @@
   }
 
   // ---------------------------------------------------------------------------
+  // The comet address form (www.aliexpress.us in English, measured 2026-09-15)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Field positions among the comet form's inputs (`.deliver-address-form
+   * input`, twelve once "Enter manually" has been pressed). The inputs carry
+   * no name, id or placeholder, so position is all there is, and
+   * cometFormStructure is what makes position safe to type by.
+   */
+  const COMET_POSITIONS = Object.freeze({
+    country: 0,
+    firstName: 1,
+    lastName: 2,
+    dialCode: 3,
+    phone: 4,
+    search: 5,
+    street: 6,
+    unit: 7,
+    state: 8,
+    city: 9,
+    zip: 10,
+    instructions: 11,
+    count: 12,
+  });
+
+  /** The comet boxes the fill types into, and the ones a saved address would show up in. */
+  const COMET_TYPED = Object.freeze({ firstName: 1, lastName: 2, phone: 4, street: 6, unit: 7, zip: 10 });
+  const COMET_TEXT_BOXES = Object.freeze([1, 2, 4, 6, 7, 10, 11]);
+
+  /**
+   * Whether the open comet form is the measured US add-address form.
+   * `inputs` describe the form's inputs in order: { type, role, value }.
+   * The country box must already show the United States: changing the
+   * country there has not been measured, so the fill stops instead.
+   */
+  function cometFormStructure(snapshot, countryCandidates) {
+    const inputs = Array.isArray(snapshot?.inputs) ? snapshot.inputs : [];
+    if (inputs.length !== COMET_POSITIONS.count) {
+      return { ok: false, reason: `The form has ${inputs.length} boxes, not the ${COMET_POSITIONS.count} of the US address form DropshipHub knows.` };
+    }
+    const odd = inputs.findIndex((input) => NOT_TEXT_TYPES.has(String(input?.type ?? "").toLowerCase()));
+    if (odd >= 0) return { ok: false, reason: `Box ${odd + 1} is not a text box.` };
+    const dial = collapse(inputs[COMET_POSITIONS.dialCode]?.value);
+    if (!/^\+\d{1,4}$/.test(dial)) return { ok: false, reason: "The fourth box is not the phone country code." };
+    if (dial !== "+1") return { ok: false, reason: `The phone country code is ${dial}, not +1 for the United States.` };
+    if (String(inputs[COMET_POSITIONS.search]?.role ?? "").toLowerCase() !== "combobox") {
+      return { ok: false, reason: "The sixth box is not the address search box." };
+    }
+    const country = collapse(inputs[COMET_POSITIONS.country]?.value);
+    if (matchOption([country], countryCandidates) === null) {
+      return { ok: false, countryMismatch: true, reason: `The Country/region box shows "${country || "nothing"}", not the United States. Choose United States yourself, then press Fill address again.` };
+    }
+    return { ok: true, dialCode: dial };
+  }
+
+  const NOT_TEXT_TYPES = new Set(["checkbox", "radio", "hidden", "submit", "button", "image", "reset", "file"]);
+
+  /**
+   * The labels of a cascade list worth choosing from. At the state level the
+   * list also holds single-letter headers ("A", "C") between the states; a
+   * header is never an option.
+   */
+  function cascadeLabels(labels) {
+    return (Array.isArray(labels) ? labels : []).map(collapse).filter((label) => label.length >= 2);
+  }
+
+  /** The state (or any level's) option equal to one of the candidates, headers skipped; null when none. */
+  function chooseCascadeOption(labels, candidates) {
+    return matchOption(cascadeLabels(labels), candidates);
+  }
+
+  /**
+   * The city option: an exact match, else "Other", which AliExpress lists
+   * last in every state. A city chosen as "Other" is flagged so the merchant
+   * is told, and the save verification accepts it only with that flag.
+   */
+  function chooseCascadeCity(labels, city) {
+    const list = cascadeLabels(labels);
+    const exact = matchOption(list, [city]);
+    if (exact !== null) return { label: exact, isOther: false };
+    const other = matchOption(list, ["Other"]);
+    return other !== null ? { label: other, isOther: true } : null;
+  }
+
+  /**
+   * The house number and street word a saved address shows, "12345 northwest"
+   * for "12345 Northwest Evergreen Parkway". Two tokens, because a bare "1"
+   * would be found in any block of text.
+   */
+  function streetKey(street) {
+    return collapse(street).split(" ").slice(0, 2).join(" ");
+  }
+
+  /**
+   * Whether the confirm page's address block shows the customer's address:
+   * its text carries the customer's last name and the street's house number
+   * with the first street word. Used to skip a fill that is already done, and
+   * to verify a save. `text` is the block's textContent.
+   */
+  function addressBlockShows(text, values) {
+    const name = collapse(values?.lastName) || collapse(values?.firstName);
+    const key = streetKey(values?.street);
+    if (!name || !key) return false;
+    const block = normalizeTitle(text);
+    return block.includes(normalizeTitle(name)) && block.includes(normalizeTitle(key));
+  }
+
+  const SAVE_WORDS = { comet: /^(save|lưu)$/i, fusion: /^(confirm|xác nhận)$/i };
+
+  /**
+   * Why the address form must NOT be saved by the extension, or null when it
+   * may. This is the one deliberate exception to the click guard: Save on the
+   * add-new-address form commits the customer's address to the merchant's
+   * AliExpress address book, which is what placing the order means, and it is
+   * clicked only after every one of these reads back as intended.
+   *
+   * `s` describes the form as read from the page just before the click:
+   * { design: "comet" | "fusion",
+   *   boxes: [values of every text box a saved address would show in],
+   *   intended: { firstName, lastName, phone, street, unit, zip },
+   *   actual:   the same keys, read back by position,
+   *   country:  { shown, candidates },
+   *   state:    { shown, candidates },
+   *   city:     { shown, wanted, otherAccepted },
+   *   defaultSwitch: "on" | "off" | "missing",
+   *   button:   { tag, type, text, classes, ancestorClasses, inForm, disabled } }
+   */
+  function saveButtonRefusal(s) {
+    if (!s || typeof s !== "object") return "Nothing to verify.";
+    const design = s.design === "comet" || s.design === "fusion" ? s.design : null;
+    if (!design) return "The address form's design is not one DropshipHub has measured.";
+    const intended = s.intended && typeof s.intended === "object" ? s.intended : null;
+    if (!intended || Object.keys(intended).length === 0) return "Nothing was typed.";
+    if (foreignFormValues(s.boxes, Object.values(intended)).length > 0) {
+      return "The form holds a value DropshipHub did not type, so it may be a saved address being edited.";
+    }
+    const wrong = mismatchedFields(intended, s.actual);
+    if (wrong.length > 0) return `These boxes do not show what DropshipHub typed: ${wrong.join(", ")}.`;
+    if (matchOption([collapse(s.country?.shown)], s.country?.candidates) === null) return "The country is not the United States.";
+    if (matchOption([collapse(s.state?.shown)], s.state?.candidates) === null) return "The State box does not show the customer's state.";
+    const cityShown = collapse(s.city?.shown);
+    const cityOk = matchOption([cityShown], [s.city?.wanted]) !== null || (s.city?.otherAccepted === true && matchOption([cityShown], ["Other"]) !== null);
+    if (!cityOk) return "The City box does not show the customer's city.";
+    if (s.defaultSwitch !== "off") return s.defaultSwitch === "on" ? '"Set as default" is on.' : 'The "Set as default" switch was not found, so it cannot be read as off.';
+    const b = s.button && typeof s.button === "object" ? s.button : null;
+    if (!b) return "The Save button was not found.";
+    if (String(b.tag ?? "").toLowerCase() !== "button") return "The Save control is not a button.";
+    const type = String(b.type ?? "").toLowerCase();
+    if (type === "submit" || (!type && b.inForm)) return "The Save button would submit a form.";
+    if (b.disabled) return "The Save button is disabled.";
+    const text = collapse(b.text);
+    if (!SAVE_WORDS[design].test(text)) return `The button reads "${text.slice(0, 40)}", not ${design === "comet" ? "Save" : "Confirm"}.`;
+    const classes = Array.isArray(b.classes) ? b.classes.map(String) : [];
+    if (design === "comet" && !classes.includes("form-button-confirm")) return "The button is not the address form's Save button.";
+    const all = [...classes, ...(Array.isArray(b.ancestorClasses) ? b.ancestorClasses.map(String) : [])];
+    if (all.some((c) => c === "place-order-primary-btn" || c.startsWith("pl-order-toal-container__btn-box") || PAYMENT_CLASS.test(c))) {
+      return "The button is a Place order or payment control.";
+    }
+    return null;
+  }
+
+  // ---------------------------------------------------------------------------
   // Money
   // ---------------------------------------------------------------------------
 
@@ -546,20 +731,126 @@
   }
 
   /**
-   * Compares the page's total with the expectation, as a warning only. The
-   * page shows the account's display currency, which on the measured account
-   * was VND whatever the host, so a total in another currency is shown beside
-   * the expectation without a verdict: converting it here would be a guess.
+   * Every estimate DropshipHub has for this checkout, one per currency: the
+   * purchase order's own (VND on the measured account, captured from the
+   * Vietnamese product page) and the shop's (the same amount converted at
+   * placement). The page shows the account's currency (USD on the owner's
+   * account), so the one to compare is whichever shares it.
+   */
+  function expectedCosts(job) {
+    const own = expectedCost(job);
+    const list = own ? [own] : [];
+    const items = Array.isArray(job?.items) ? job.items : [];
+    const shopTotal = decimal(job?.shopExpectedTotal);
+    const shopCurrency = /^[A-Z]{3}$/.test(String(job?.shopCurrency ?? "")) ? job.shopCurrency : null;
+    if (items.length <= 1 && shopTotal !== null && shopCurrency && !list.some((e) => e.currency === shopCurrency)) {
+      list.push({ amount: shopTotal, currency: shopCurrency, scope: "order" });
+    }
+    return list;
+  }
+
+  /**
+   * Compares the page's total with the estimate in the page's currency, as a
+   * warning only. `expected` is one estimate or the list expectedCosts gives.
+   * When no estimate shares the page's currency there is no verdict: the
+   * amounts are shown side by side, because converting here would be a guess,
+   * and a warning built on a guess is a wrong warning.
    */
   function compareTotals(expected, pageText) {
     const page = parseMoneyText(pageText);
-    if (!expected) return { kind: "no-expectation", page };
+    const list = (Array.isArray(expected) ? expected : [expected]).filter((e) => e && Number.isFinite(e.amount));
+    if (list.length === 0) return { kind: "no-expectation", page };
     if (!page) return { kind: "unreadable", page: null };
-    if (!page.currency || page.currency !== expected.currency) return { kind: "other-currency", page };
-    const tolerance = Math.max(expected.amount * 0.1, 0.5);
-    if (page.amount > expected.amount + tolerance) return { kind: "higher", page };
-    if (page.amount < expected.amount - tolerance) return { kind: "lower", page };
-    return { kind: "close", page };
+    const match = page.currency ? list.find((e) => e.currency === page.currency) : null;
+    if (!match) return { kind: "other-currency", page, expectations: list };
+    const tolerance = Math.max(match.amount * 0.1, 0.5);
+    if (page.amount > match.amount + tolerance) return { kind: "higher", page, expected: match };
+    if (page.amount < match.amount - tolerance) return { kind: "lower", page, expected: match };
+    return { kind: "close", page, expected: match };
+  }
+
+  // ---------------------------------------------------------------------------
+  // The real total, for the app
+  // ---------------------------------------------------------------------------
+
+  const QUOTE_ROW_KINDS = [
+    [/subtotal|tạm tính/i, "subtotal"],
+    [/shipping|delivery|vận chuyển|phí giao/i, "shipping"],
+    [/additional charges|tax|fee|charges|thuế|phí/i, "charges"],
+    [/promo|coupon|discount|giảm/i, "discount"],
+  ];
+
+  function amountOf(text) {
+    const parsed = parseMoneyText(text);
+    return parsed ? parsed.amount : null;
+  }
+
+  /**
+   * What the confirm page says the order costs, from its total row and its
+   * summary rows ({ label, text } each). The currency is the total's. The
+   * subtotal is passed on only when subtotal + shipping + charges is the
+   * total: with a promo code applied it is not, and the app then takes the
+   * goods as total minus shipping and charges, which is what was paid for them.
+   */
+  function quoteFromPage(input) {
+    const total = parseMoneyText(input?.totalText);
+    if (!total || !total.currency) return null;
+    const parts = { subtotal: null, shipping: null, charges: null, discount: null };
+    for (const row of Array.isArray(input?.rows) ? input.rows : []) {
+      const label = String(row?.label ?? "");
+      const kind = (QUOTE_ROW_KINDS.find(([pattern]) => pattern.test(label)) ?? [])[1];
+      if (!kind || parts[kind] !== null) continue;
+      const amount = amountOf(row?.text);
+      if (amount !== null) parts[kind] = amount;
+    }
+    const shipping = parts.shipping ?? 0;
+    const charges = parts.charges ?? 0;
+    const quote = { currency: total.currency, total: total.amount, shipping, charges };
+    if (parts.subtotal !== null && Math.abs(parts.subtotal + shipping + charges - total.amount) < 0.01) quote.subtotal = parts.subtotal;
+    return validQuote(quote) ? quote : null;
+  }
+
+  function nonNegative(value) {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0;
+  }
+
+  function validQuote(quote) {
+    if (!quote || typeof quote !== "object") return false;
+    if (!/^[A-Z]{3}$/.test(String(quote.currency ?? ""))) return false;
+    if (!nonNegative(quote.total)) return false;
+    for (const key of ["subtotal", "shipping", "charges"]) {
+      if (quote[key] !== undefined && quote[key] !== null && !nonNegative(quote[key])) return false;
+    }
+    return true;
+  }
+
+  function round2(value) {
+    return Math.round(value * 100) / 100;
+  }
+
+  /**
+   * The quote for the whole purchase order from the quotes of its items so
+   * far: each item is its own AliExpress checkout, so the purchase order's
+   * total is their sum. The subtotal is summed only when every item has one.
+   * null until at least one item is quoted, or when currencies differ.
+   */
+  function sumQuotes(quotes) {
+    const list = (Array.isArray(quotes) ? quotes : []).filter((q) => validQuote(q));
+    if (list.length === 0) return null;
+    const currency = list[0].currency;
+    if (list.some((q) => q.currency !== currency)) return null;
+    const sum = (key) => round2(list.reduce((n, q) => n + (Number(q[key]) || 0), 0));
+    const out = { currency, total: sum("total"), shipping: sum("shipping"), charges: sum("charges") };
+    if (list.every((q) => nonNegative(q.subtotal))) out.subtotal = sum("subtotal");
+    return out;
+  }
+
+  /** The body POST /api/extension/orders/:id/quote takes, with plain decimal strings. */
+  function quoteBody(quote) {
+    if (!validQuote(quote)) return null;
+    const body = { currency: quote.currency, total: quote.total.toFixed(2), shipping: (quote.shipping ?? 0).toFixed(2), charges: (quote.charges ?? 0).toFixed(2), source: "confirm" };
+    if (nonNegative(quote.subtotal)) body.subtotal = quote.subtotal.toFixed(2);
+    return body;
   }
 
   // ---------------------------------------------------------------------------
@@ -572,6 +863,8 @@
   // Only on the element itself: the whole confirm page may sit in a wrapper
   // named for checkout, and refusing every click under it would refuse the fill.
   const CHECKOUT_CLASS = /(^|[-_])(checkout|place-?order|buy-?now)([-_]|$)/i;
+  const ADDRESS_LIST_CLASS = /^(mt-switch|switcher|ae-address-item-(edit|delete)-btn|comet-radio(-\w+)?|next-radio(-\w+)?)$/i;
+  const QUANTITY_OR_COUPON_CLASS = /input-number|coupon|promo/i;
 
   /**
    * Why a click on this element must not happen, or null when it may.
@@ -624,6 +917,11 @@
       return "It is AliExpress's Place order control.";
     }
     if (all.some((c) => PAYMENT_CLASS.test(c))) return "It is in a payment area.";
+    // The comet drawer's own commit-like controls: the "Set as default"
+    // switch, the saved-address radios and their edit and delete icons, and
+    // the quantity stepper and coupon rows of the page. None is ever needed.
+    if (all.some((c) => ADDRESS_LIST_CLASS.test(c))) return "It is the default switch or a saved address's choice, edit or delete control.";
+    if (all.some((c) => QUANTITY_OR_COUPON_CLASS.test(c))) return "It is a quantity or coupon control.";
     if (classes.some((c) => CHECKOUT_CLASS.test(c) || /buy-now--buynow/.test(c))) return "It is a checkout or Buy now control.";
     if (tag === "form") return "It is a form.";
     if (tag === "input" && ["submit", "image", "checkbox", "radio", "reset"].includes(type)) {
@@ -704,14 +1002,209 @@
         orderName: shortText(order.orderName, 60) ?? "",
         currency: shortText(order.currency, 3),
         expectedTotal: shortText(order.totalCost, 32),
+        shopCurrency: shortText(order.shopCurrency, 3),
+        shopExpectedTotal: shortText(order.shopTotalCost, 32),
         address,
         items,
         itemIndex: 0,
         recordedOrderIds: items.map(() => []),
+        // Per item: the confirm page's real total once read, with `sent`
+        // once the app has it, so it is posted once per item per job.
+        quotes: items.map(() => null),
+        // The last automatic fill's outcome for the current item, so a
+        // reload does not run a finished fill again.
+        fill: null,
+        payingAt: null,
         stage: "product",
         startedAt: now,
       },
     };
+  }
+
+  /** The fill outcome recorded for the job's current item, or null. */
+  function fillOutcomeFor(job) {
+    const fill = job?.fill;
+    return fill && typeof fill === "object" && fill.itemIndex === job.itemIndex ? fill : null;
+  }
+
+  /**
+   * Whether the confirm page should run the address fill by itself now.
+   * "shown" is whether the page's address block already shows the customer's
+   * address. Runs when nothing is recorded for this item, and again when a
+   * recorded "set" is no longer shown; a fill that stopped is left for the
+   * merchant's "Fill address again", so a reload cannot type into a form the
+   * merchant is now correcting by hand.
+   */
+  function shouldAutoFill(job, shown) {
+    if (!job || job.stage !== "confirm") return false;
+    if (shown) return false;
+    const outcome = fillOutcomeFor(job);
+    return outcome === null || outcome.result === "set";
+  }
+
+  // ---------------------------------------------------------------------------
+  // The AliExpress orders list, order detail and tracking pages
+  //
+  // The pages print the customer's address too; only what is parsed here is
+  // ever read: order ids, product ids, SKU text, status, total, date, carrier
+  // and tracking number. Everything takes plain values the content script has
+  // already pulled out of the page, so it is unit-tested without a DOM.
+  // ---------------------------------------------------------------------------
+
+  const ALIEXPRESS_ORDER_ID = /^\d{10,24}$/;
+  const TRACKING_NUMBER = /^[A-Za-z0-9-]{4,64}$/;
+
+  /** Status phrases the orders list uses, longest first so "Awaiting delivery" wins over "delivery". */
+  const ORDER_STATUS_PHRASES = [
+    "Awaiting confirmation",
+    "Awaiting delivery",
+    "Awaiting shipment",
+    "Awaiting payment",
+    "Awaiting receipt",
+    "Partially shipped",
+    "In transit",
+    "Processing",
+    "Completed",
+    "Cancelled",
+    "Canceled",
+    "Delivered",
+    "Received",
+    "Refunded",
+    "Shipped",
+    "To pay",
+    "Closed",
+    "Paid",
+  ];
+
+  function orderStatusFromText(text) {
+    const haystack = collapse(text);
+    for (const phrase of ORDER_STATUS_PHRASES) {
+      // A whole phrase, not the inside of a longer word ("paid" in "unpaid").
+      // textContent glues neighbouring elements together ("Awaiting
+      // deliveryDate: …"), so a capital letter right after the phrase is a
+      // new word, not more of the same one.
+      const pattern = new RegExp(`(^|[^A-Za-z0-9])${phrase.replace(/\s+/g, "\\s+")}(?=$|[^A-Za-z0-9]|[A-Z])`, "i");
+      if (pattern.test(haystack)) return phrase;
+    }
+    return "";
+  }
+
+  /** "…/p/order/detail.html?orderId=8190000000000001" -> "8190000000000001". */
+  function orderIdFromHref(href) {
+    const match = /[?&]orderId=(\d{10,24})(?!\d)/.exec(String(href ?? ""));
+    return match ? match[1] : null;
+  }
+
+  /**
+   * Product ids from a card's product links, in both forms: the regional id
+   * the .us host uses and the global id DropshipHub stores (the regional id
+   * minus 2^51). A stored id matches either way.
+   */
+  function productIdsFromHrefs(hrefs) {
+    const ids = new Set();
+    for (const href of Array.isArray(hrefs) ? hrefs : []) {
+      const match = /\/item\/(\d{1,20})\.html/.exec(String(href ?? ""));
+      if (!match) continue;
+      ids.add(match[1]);
+      const global = globalProductId(match[1]);
+      if (global) ids.add(global);
+      if (ids.size >= 40) break;
+    }
+    return [...ids];
+  }
+
+  function textAfter(text, label, max) {
+    const pattern = new RegExp(`${label}:?\\s*(.{1,${max}}?)\\s*(?=Ref\\.?|Order|Details|Total|Date|Track|Confirm|Pay|View|$)`, "i");
+    const match = pattern.exec(String(text ?? "").replace(/\s+/g, " "));
+    return match ? collapse(match[1]) : "";
+  }
+
+  /**
+   * One `.order-item` card of the orders list, from what the content script
+   * read off it: the Details link, the product links, the card's own status
+   * element text (may be empty) and the card's whole text. Nothing else on the
+   * card is looked at, and a card without an order id is nothing.
+   */
+  function parseOrderCard(input) {
+    const orderId = orderIdFromHref(input?.detailsHref);
+    if (!orderId) return null;
+    const cardText = String(input?.cardText ?? "");
+    const status = collapse(input?.statusText).slice(0, 60) || orderStatusFromText(cardText);
+    const totalText = textAfter(cardText, "Total", 40);
+    const totalMoney = parseMoneyText(totalText);
+    const total = totalMoney ? collapse(/^([^\d]{0,8}\d[\d.,' ]*\d?)/.exec(totalText)?.[1] ?? totalText).slice(0, 40) : "";
+    return {
+      orderId,
+      productIds: productIdsFromHrefs(input?.productHrefs),
+      skuText: collapse(input?.skuText).slice(0, 200),
+      status,
+      total,
+      date: textAfter(cardText, "Date", 40).slice(0, 40),
+    };
+  }
+
+  /** The one order on /p/order/detail.html: its id from the URL or the "Ref. Number" row, and `.order-status`. */
+  function parseOrderDetail(input) {
+    const url = parseUrl(input?.url);
+    const fromUrl = url ? url.searchParams.get("orderId") : null;
+    const fromRef = /(\d{10,24})(?!\d)/.exec(String(input?.refNumberText ?? ""));
+    const orderId = fromUrl && ALIEXPRESS_ORDER_ID.test(fromUrl) ? fromUrl : fromRef ? fromRef[1] : null;
+    if (!orderId) return null;
+    const statusText = collapse(input?.statusText);
+    return {
+      orderId,
+      productIds: productIdsFromHrefs(input?.productHrefs),
+      skuText: "",
+      status: (orderStatusFromText(statusText) || statusText).slice(0, 60),
+      total: "",
+      date: "",
+    };
+  }
+
+  /** The tracking page: the order id from its URL, the carrier and the tracking number. Nothing else on it is read. */
+  function parseTrackingPage(input) {
+    const url = parseUrl(input?.url);
+    const tradeOrderId = url ? url.searchParams.get("tradeOrderId") : null;
+    if (!tradeOrderId || !ALIEXPRESS_ORDER_ID.test(tradeOrderId)) return null;
+    const trackingNumber = collapse(input?.mailNoText);
+    if (!TRACKING_NUMBER.test(trackingNumber)) return null;
+    return { tradeOrderId, trackingNumber, carrier: collapse(input?.carrierText).slice(0, 80) };
+  }
+
+  /** The body POST /api/extension/orders/sync takes: only well-formed orders, at most 100. */
+  function ordersSyncBody(orders) {
+    const list = (Array.isArray(orders) ? orders : [])
+      .filter((o) => o && ALIEXPRESS_ORDER_ID.test(String(o.orderId ?? "")))
+      .slice(0, 100)
+      .map((o) => ({
+        orderId: String(o.orderId),
+        productIds: (Array.isArray(o.productIds) ? o.productIds : []).map(String).filter((id) => /^\d{1,24}$/.test(id)).slice(0, 40),
+        skuText: shortText(o.skuText, 200) ?? "",
+        status: shortText(o.status, 60) ?? "",
+        total: shortText(o.total, 40) ?? "",
+        date: shortText(o.date, 40) ?? "",
+      }));
+    return list.length > 0 ? { orders: list } : null;
+  }
+
+  /** One line per synced order, for the small panel on the orders page. */
+  function describeSyncResult(entry) {
+    const id = String(entry?.orderId ?? "");
+    const name = entry?.orderName ? String(entry.orderName) : "";
+    switch (entry?.result) {
+      case "recorded":
+        return `${name} recorded as AliExpress order ${id}.`;
+      case "already":
+        return `${name} is already recorded as AliExpress order ${id}${entry.closed ? " (closed on AliExpress; check it in DropshipHub)" : ""}.`;
+      case "advanced":
+        return `${name} (AliExpress order ${id}) is now ${String(entry.status ?? "").toLowerCase().replace(/_/g, " ")}.`;
+      case "ambiguous":
+        return `AliExpress order ${id} matches several DropshipHub orders (${(Array.isArray(entry.candidates) ? entry.candidates : []).map((c) => c?.orderName).filter(Boolean).join(", ")}). Record it in the extension's popup.`;
+      case "unmatched":
+        return `AliExpress order ${id}: no DropshipHub order matched.`;
+      default:
+        return `AliExpress order ${id}: ${String(entry?.error ?? "not synced")}.`;
+    }
   }
 
   function isJobExpired(job, now) {
@@ -745,6 +1238,9 @@
     STREET_MAX,
     JOB_MAX_AGE_MS,
     US_STATES,
+    COMET_POSITIONS,
+    COMET_TYPED,
+    COMET_TEXT_BOXES,
     globalProductId,
     productIdForHost,
     sameProduct,
@@ -754,6 +1250,10 @@
     isProductPage,
     productIdFromUrl,
     isConfirmPage,
+    isOrdersPage,
+    isOrderDetailPage,
+    isTrackingPage,
+    ordersPageUrl,
     buildConfirmUrl,
     readConfirmUrl,
     confirmUrlMismatches,
@@ -773,16 +1273,38 @@
     defaultBoxState,
     foreignFormValues,
     mismatchedFields,
+    cometFormStructure,
+    cascadeLabels,
+    chooseCascadeOption,
+    chooseCascadeCity,
+    streetKey,
+    addressBlockShows,
+    saveButtonRefusal,
     parseMoneyText,
     formatAmount,
     expectedCost,
+    expectedCosts,
     compareTotals,
+    quoteFromPage,
+    validQuote,
+    sumQuotes,
+    quoteBody,
     clickRefusal,
     buildJob,
+    fillOutcomeFor,
+    shouldAutoFill,
     isPurchaseOrderId,
     isJobExpired,
     isLastItem,
     jobOrderIds,
     explainRefusal,
+    orderStatusFromText,
+    orderIdFromHref,
+    productIdsFromHrefs,
+    parseOrderCard,
+    parseOrderDetail,
+    parseTrackingPage,
+    ordersSyncBody,
+    describeSyncResult,
   });
 })(globalThis);

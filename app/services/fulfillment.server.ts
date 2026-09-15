@@ -1616,6 +1616,8 @@ export const EXTENSION_BODY_LIMITS = {
   capture: 512 * 1024,
   /** Order ids, a total and a tracking number. */
   orders: 16 * 1024,
+  /** Up to a hundred orders read off the AliExpress orders list. */
+  sync: 64 * 1024,
 } as const;
 
 /** A refusal with the HTTP status the extension should see. */
@@ -1777,6 +1779,63 @@ export const ExtensionTrackingBody = z
   })
   .strict();
 
+/** A plain, non-negative decimal amount as the extension sends it. */
+const MoneyString = z
+  .string()
+  .trim()
+  .regex(/^\d{1,12}(\.\d{1,4})?$/, "must be a plain decimal amount");
+
+const CurrencyCode = z
+  .string()
+  .trim()
+  .regex(/^[A-Z]{3}$/, "must be a three-letter currency code");
+
+/** POST /api/extension/orders/:id/quote: what the AliExpress checkout page shows the order costs. */
+export const ExtensionQuoteBody = z
+  .object({
+    currency: CurrencyCode,
+    total: MoneyString,
+    subtotal: MoneyString.optional(),
+    shipping: MoneyString.optional(),
+    charges: MoneyString.optional(),
+    source: z.enum(["confirm"]),
+  })
+  .strict();
+
+const AliExpressOrderId = z
+  .string()
+  .trim()
+  .regex(/^\d{10,24}$/, "must be an AliExpress order number");
+
+/** One card of the AliExpress orders list, as the extension reads it. Never the customer's data. */
+const ExtensionSyncOrder = z
+  .object({
+    orderId: AliExpressOrderId,
+    productIds: z.array(z.string().trim().regex(/^\d{1,24}$/, "must be a product id")).max(40).default([]),
+    skuText: z.string().trim().max(300).optional(),
+    status: z.string().trim().max(60).optional(),
+    total: z.string().trim().max(60).optional(),
+    date: z.string().trim().max(60).optional(),
+  })
+  .strict();
+
+/** POST /api/extension/orders/sync */
+export const ExtensionSyncOrdersBody = z.object({ orders: z.array(ExtensionSyncOrder).min(1).max(100) }).strict();
+
+/** POST /api/extension/orders/sync-tracking */
+export const ExtensionSyncTrackingBody = z
+  .object({
+    tradeOrderId: AliExpressOrderId,
+    trackingNumber: z
+      .string()
+      .trim()
+      .min(4)
+      .max(64)
+      .regex(/^[A-Za-z0-9-]+$/, "must be a tracking number"),
+    carrier: z.string().trim().max(80).optional(),
+  })
+  .strict();
+
 /** The first problem with a hostile body, phrased for the extension to show. */
 export function describeZodError(error: z.ZodError): string {
   const first = error.issues[0];
@@ -1791,6 +1850,14 @@ export interface ExtensionOrder {
   platform: SupplierPlatform;
   currency: string;
   totalCost: string;
+  /**
+   * The same estimate in the shop's currency, converted at placement, when
+   * both parts are on record. The AliExpress checkout shows the account's
+   * currency, which may be neither the captured price's nor the shop's; the
+   * extension compares the page's total with whichever estimate shares it.
+   */
+  shopCurrency: string;
+  shopTotalCost: string | null;
   shippingAddress: {
     name: string;
     firstName: string | null;
@@ -1889,6 +1956,11 @@ export async function listAwaitingPlacement(shop: ShopWithSettings): Promise<Ext
       platform: po.platform,
       currency: po.currency,
       totalCost: money(po.totalCost),
+      shopCurrency: shop.currency,
+      shopTotalCost:
+        po.shopCurrency === shop.currency && po.shopItemsCost !== null && po.shopShippingCost !== null
+          ? money(d(po.shopItemsCost).plus(d(po.shopShippingCost)))
+          : null,
       shippingAddress: {
         name: address.name ?? [address.firstName, address.lastName].filter(Boolean).join(" "),
         ...consigneeNames(address),
@@ -2158,6 +2230,308 @@ export async function addTrackingFromExtension(
   }
 }
 
+/** Statuses in which the checkout page's total may still replace the estimate. */
+const QUOTABLE: PurchaseOrderStatus[] = ["AWAITING_PLACEMENT", "AWAITING_PAYMENT", "PLACED"];
+
+/**
+ * POST /api/extension/orders/:id/quote: the total AliExpress's checkout page
+ * shows for the purchase order, in the account's currency.
+ *
+ * The estimate was captured from the product page in that page's currency
+ * (VND on the measured account) and the checkout charges the account's (USD),
+ * so the estimate is neither the price paid nor comparable with it. The page's
+ * figure replaces it: goods = subtotal when the page's rows add up, else the
+ * total less shipping and charges; shipping = shipping plus charges (tax). The
+ * shop-currency fields are recomputed the way placement computes them, and
+ * the same total sent twice changes nothing.
+ */
+export async function recordSupplierQuote(shop: ShopWithSettings, purchaseOrderId: string, input: z.infer<typeof ExtensionQuoteBody>): Promise<ExtensionAnswer> {
+  const po = await prisma.purchaseOrder.findFirst({
+    where: { id: purchaseOrderId, order: { shopId: shop.id } },
+    include: { order: { select: { id: true, name: true } } },
+  });
+  if (!po) return { status: 404, body: { ok: false, error: "Purchase order not found" } };
+  if (!QUOTABLE.includes(po.status)) {
+    return { status: 409, body: { ok: false, error: `This purchase order is ${po.status.toLowerCase().replace(/_/g, " ")}, so its checkout total is not recorded.`, status: po.status } };
+  }
+
+  const total = d(input.total);
+  const shipping = d(input.shipping ?? 0).plus(d(input.charges ?? 0));
+  const goods = input.subtotal !== undefined ? d(input.subtotal) : total.minus(shipping);
+  const itemsCost = goods.isNegative() ? d(0) : goods;
+  const unchanged = po.currency === input.currency && d(po.totalCost).equals(total) && d(po.itemsCost).equals(itemsCost) && d(po.shippingCost).equals(shipping);
+  if (unchanged) return { status: 200, body: { ok: true, unchanged: true, purchaseOrderId: po.id, currency: input.currency, totalCost: money(total) } };
+
+  const converted = await toShopCurrency(shop.currency, input.currency, itemsCost, shipping);
+  await prisma.purchaseOrder.update({
+    where: { id: po.id },
+    data: {
+      currency: input.currency,
+      itemsCost: money(itemsCost),
+      shippingCost: money(shipping),
+      totalCost: money(total),
+      // With no rate on record for the page's currency the shop-currency
+      // amounts would still describe the old estimate, so they are cleared
+      // and the roll-up leaves this purchase order out rather than sum them.
+      ...(Object.keys(converted).length > 0 ? converted : { shopCurrency: null, shopItemsCost: null, shopShippingCost: null, fxRate: null }),
+      raw: { ...purchaseOrderRawReadBack(po.raw), quote: { source: input.source, at: new Date().toISOString() } } as Prisma.InputJsonValue,
+    },
+  });
+  await logActivity(shop.id, {
+    actor: "extension",
+    action: "order.supplier_quote",
+    entity: "Order",
+    entityId: po.order.id,
+    message: `${po.order.name}: AliExpress shows ${money(total)} ${input.currency} at checkout${po.currency !== input.currency ? ` (the estimate was ${money(po.totalCost)} ${po.currency})` : ""}.`,
+    meta: { purchaseOrderId: po.id },
+  });
+  await rollupOrderCosts(po.order.id);
+  await evaluateAndStoreOrder(shop, po.order.id);
+  return { status: 200, body: { ok: true, purchaseOrderId: po.id, currency: input.currency, totalCost: money(total), itemsCost: money(itemsCost), shippingCost: money(shipping) } };
+}
+
+/**
+ * What an AliExpress order's status text means for a purchase order, or null
+ * for a status this app does not know. Unpaid is checked before "paid", and
+ * a closed or cancelled order is reported but never applied by the sync.
+ */
+export function aliExpressStatusToPurchaseOrderStatus(text: string | null | undefined): PurchaseOrderStatus | null {
+  const s = (text ?? "").trim().toLowerCase();
+  if (!s) return null;
+  if (/\bto pay\b|awaiting payment|unpaid|chờ thanh toán|awaiting confirmation/.test(s)) return "AWAITING_PAYMENT";
+  if (/closed|cancel|refund|đã huỷ|đã hủy|đóng/.test(s)) return "CANCELED";
+  if (/awaiting delivery|shipped|in transit|awaiting receipt|out for delivery|đang giao|đã gửi/.test(s)) return "SHIPPED";
+  if (/completed|received|delivered|finished|hoàn thành|đã nhận/.test(s)) return "DELIVERED";
+  if (/awaiting shipment|processing|\bpaid\b|preparing|đang xử lý|chờ giao/.test(s)) return "PAID";
+  return null;
+}
+
+export interface ExtensionSyncResult {
+  orderId: string;
+  result: "recorded" | "already" | "advanced" | "ambiguous" | "unmatched";
+  purchaseOrderId?: string;
+  orderName?: string;
+  status?: PurchaseOrderStatus;
+  /** The order is closed or cancelled on AliExpress; the purchase order was left as it is. */
+  closed?: boolean;
+  candidates?: Array<{ purchaseOrderId: string; orderName: string }>;
+  error?: string;
+}
+
+/** How far back a purchase order waiting for the extension is matched to an AliExpress order. */
+const SYNC_MATCH_WINDOW_MS = 14 * 24 * 3_600_000;
+
+const REGIONAL_PRODUCT_OFFSET = 2n ** 51n;
+
+/** A product id in both forms: the regional one (global plus 2^51 on aliexpress.us) and the global one DropshipHub stores. */
+function productIdForms(ids: string[]): string[] {
+  const out = new Set<string>();
+  for (const id of ids) {
+    if (!/^\d{1,24}$/.test(id)) continue;
+    out.add(id);
+    const value = BigInt(id);
+    if (value >= REGIONAL_PRODUCT_OFFSET) out.add((value - REGIONAL_PRODUCT_OFFSET).toString());
+  }
+  return [...out];
+}
+
+function findByExternalOrderId(shopId: string, orderId: string) {
+  return prisma.purchaseOrder.findFirst({
+    where: {
+      order: { shopId },
+      // The column holds the first id; a purchase order placed as several
+      // AliExpress orders keeps the rest in raw.externalOrderIds.
+      OR: [{ externalOrderId: orderId }, { raw: { path: ["externalOrderIds"], array_contains: [orderId] } }],
+    },
+    include: { order: { select: { id: true, name: true } } },
+  });
+}
+
+function normalizedWords(value: string | null | undefined): string[] {
+  return String(value ?? "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= 2);
+}
+
+/**
+ * The variant values a purchase order item was placed for: the value part of
+ * each skuAttr axis ("14:691#Play blue light" -> "Play blue light") and the
+ * supplier variant's attribute values. An AliExpress card's SKU text names
+ * the variant the same way.
+ */
+function itemVariantValues(item: { externalSkuAttr: string | null; supplierVariant: { attributes: unknown } | null; orderLineItem: { variantTitle: string | null } | null }): string[] {
+  const values: string[] = [];
+  for (const axis of (item.externalSkuAttr ?? "").split(";")) {
+    const hash = axis.indexOf("#");
+    if (hash >= 0) values.push(axis.slice(hash + 1));
+  }
+  const attributes = item.supplierVariant?.attributes;
+  if (Array.isArray(attributes)) {
+    for (const a of attributes) if (a && typeof a === "object" && (a as { value?: unknown }).value) values.push(String((a as { value: unknown }).value));
+  }
+  for (const part of (item.orderLineItem?.variantTitle ?? "").split("/")) values.push(part);
+  return values.map((v) => v.trim()).filter(Boolean);
+}
+
+type SyncCandidate = Prisma.PurchaseOrderGetPayload<{
+  include: { items: { include: { supplierVariant: { select: { attributes: true } }; orderLineItem: { select: { variantTitle: true } } } }; order: { select: { id: true; name: true } } };
+}>;
+
+/** Purchase orders waiting for the extension, placed within the window, with an item for one of the AliExpress order's products. */
+async function placementCandidates(shopId: string, productIds: string[]): Promise<SyncCandidate[]> {
+  const ids = productIdForms(productIds);
+  if (ids.length === 0) return [];
+  const rows = await prisma.purchaseOrder.findMany({
+    where: {
+      order: { shopId, canceledAt: null },
+      status: "AWAITING_PLACEMENT",
+      platform: "ALIEXPRESS",
+      createdAt: { gte: new Date(Date.now() - SYNC_MATCH_WINDOW_MS) },
+      items: { some: { externalProductId: { in: ids } } },
+    },
+    include: {
+      items: { include: { supplierVariant: { select: { attributes: true } }, orderLineItem: { select: { variantTitle: true } } } },
+      order: { select: { id: true, name: true } },
+    },
+    orderBy: { createdAt: "asc" },
+    take: 50,
+  });
+  // Only purchase orders the extension is meant to place. AWAITING_PLACEMENT
+  // is created in extension mode alone, so a missing mode is accepted too.
+  return rows.filter((po) => {
+    const mode = po.raw && typeof po.raw === "object" ? (po.raw as { placementMode?: unknown }).placementMode : undefined;
+    return mode === undefined || mode === "extension";
+  });
+}
+
+/** Among several candidates, the one whose item's variant the card's SKU text names; null unless exactly one does. */
+function narrowBySkuText(candidates: SyncCandidate[], skuText: string | undefined): SyncCandidate | null {
+  const words = new Set(normalizedWords(skuText));
+  if (words.size === 0) return null;
+  const matching = candidates.filter((po) =>
+    po.items.some((item) =>
+      itemVariantValues(item).some((value) => {
+        const wanted = normalizedWords(value);
+        return wanted.length > 0 && wanted.every((w) => words.has(w));
+      }),
+    ),
+  );
+  return matching.length === 1 ? matching[0] : null;
+}
+
+/** Folds an AliExpress status into a known purchase order, never backwards, and reports a closed order without applying it. */
+async function advanceFromAliExpress(
+  shop: ShopWithSettings,
+  po: { id: string; status: PurchaseOrderStatus; paidAt: Date | null; shippedAt: Date | null; order: { id: string; name: string } },
+  upstream: PurchaseOrderStatus | null,
+  orderId: string,
+  statusText: string | undefined,
+): Promise<ExtensionSyncResult> {
+  const base: ExtensionSyncResult = { orderId, result: "already", purchaseOrderId: po.id, orderName: po.order.name, status: po.status };
+  if (upstream === null || po.status === "CANCELED") return base;
+  if (upstream === "CANCELED") return { ...base, closed: true };
+  const next = nextStatus(po.status, upstream);
+  if (next === po.status) return base;
+  const now = new Date();
+  await prisma.purchaseOrder.update({
+    where: { id: po.id },
+    data: {
+      status: next,
+      paidAt: ORDER_RANK[next] >= ORDER_RANK.PAID && !po.paidAt ? now : undefined,
+      shippedAt: ORDER_RANK[next] >= ORDER_RANK.SHIPPED && !po.shippedAt ? now : undefined,
+      // Once AliExpress shows the order paid the 24-hour deadline no longer applies.
+      paymentDueAt: ORDER_RANK[next] >= ORDER_RANK.PAID ? null : undefined,
+    },
+  });
+  await logActivity(shop.id, {
+    actor: "extension",
+    action: "order.supplier_status",
+    entity: "Order",
+    entityId: po.order.id,
+    message: `${po.order.name}: AliExpress order ${orderId} is now ${next} (AliExpress shows "${(statusText ?? "").slice(0, 60)}").`,
+    meta: { purchaseOrderId: po.id },
+  });
+  if (next === "SHIPPED" && shop.parsedSettings.notifications.onTrackingSynced) {
+    await notify(shop.id, { type: "order.shipped", title: `${po.order.name} shipped by supplier`, link: `/app/orders/${po.order.id}`, dedupeKey: `shipped:${po.id}`, dedupeMinutes: 1440 });
+  }
+  await rollupOrderCosts(po.order.id);
+  await evaluateAndStoreOrder(shop, po.order.id);
+  return { ...base, result: "advanced", status: next };
+}
+
+async function syncOneOrder(shop: ShopWithSettings, order: z.infer<typeof ExtensionSyncOrder>): Promise<ExtensionSyncResult> {
+  const upstream = aliExpressStatusToPurchaseOrderStatus(order.status);
+  const known = await findByExternalOrderId(shop.id, order.orderId);
+  if (known) return advanceFromAliExpress(shop, known, upstream, order.orderId, order.status);
+
+  const candidates = await placementCandidates(shop.id, order.productIds);
+  if (candidates.length === 0) return { orderId: order.orderId, result: "unmatched" };
+  const chosen = candidates.length === 1 ? candidates[0] : narrowBySkuText(candidates, order.skuText);
+  if (!chosen) {
+    return { orderId: order.orderId, result: "ambiguous", candidates: candidates.map((po) => ({ purchaseOrderId: po.id, orderName: po.order.name })) };
+  }
+  // The same path as the popup's "Mark as placed" and the checkout panel:
+  // status, payment link and deadline, the placed tag, the cost roll-up.
+  const paid = upstream !== "AWAITING_PAYMENT";
+  const answer = await markPlacedFromExtension(shop, chosen.id, { externalOrderIds: [order.orderId], paid }, { actor: "extension" });
+  if (answer.status !== 200) return { orderId: order.orderId, result: "unmatched", error: String(answer.body.error ?? "not recorded") };
+  const recorded: ExtensionSyncResult = {
+    orderId: order.orderId,
+    result: answer.body.alreadyRecorded ? "already" : "recorded",
+    purchaseOrderId: chosen.id,
+    orderName: chosen.order.name,
+    status: answer.body.status as PurchaseOrderStatus,
+  };
+  // An order first seen already shipped (the list opened days later) moves on at once.
+  const fresh = await findByExternalOrderId(shop.id, order.orderId);
+  if (fresh && upstream !== null && upstream !== "CANCELED" && ORDER_RANK[upstream] > ORDER_RANK[fresh.status]) {
+    const advanced = await advanceFromAliExpress(shop, fresh, upstream, order.orderId, order.status);
+    return { ...recorded, status: advanced.status };
+  }
+  return recorded;
+}
+
+/**
+ * POST /api/extension/orders/sync: the AliExpress orders the merchant's
+ * orders page lists. Each is matched to a purchase order of this shop by its
+ * AliExpress order id, or, for one not yet recorded, by product (and SKU text
+ * when several purchase orders wait for the same product). Idempotent: the
+ * same list again records nothing twice and never moves a status backwards.
+ */
+export async function syncOrdersFromExtension(shop: ShopWithSettings, input: z.infer<typeof ExtensionSyncOrdersBody>): Promise<ExtensionSyncResult[]> {
+  const results: ExtensionSyncResult[] = [];
+  const seen = new Set<string>();
+  for (const order of input.orders) {
+    if (seen.has(order.orderId)) continue;
+    seen.add(order.orderId);
+    try {
+      results.push(await syncOneOrder(shop, order));
+    } catch (error) {
+      logger.warn("Extension order sync failed for one order", { orderId: order.orderId, error });
+      results.push({ orderId: order.orderId, result: "unmatched", error: errorMessage(error) });
+    }
+  }
+  return results;
+}
+
+/**
+ * POST /api/extension/orders/sync-tracking: a tracking number read off an
+ * AliExpress tracking page, added through the same path as tracking typed on
+ * the order page or in the popup, once per number.
+ */
+export async function syncTrackingFromExtension(shop: ShopWithSettings, input: z.infer<typeof ExtensionSyncTrackingBody>): Promise<ExtensionAnswer> {
+  const po = await findByExternalOrderId(shop.id, input.tradeOrderId);
+  if (!po) return { status: 200, body: { ok: true, result: "unmatched", tradeOrderId: input.tradeOrderId } };
+  const existing = await prisma.trackingNumber.findFirst({ where: { purchaseOrderId: po.id, number: input.trackingNumber }, select: { id: true } });
+  if (existing) return { status: 200, body: { ok: true, result: "known", purchaseOrderId: po.id, orderName: po.order.name, number: input.trackingNumber } };
+  const answer = await addTrackingFromExtension(shop, po.id, { number: input.trackingNumber, ...(input.carrier ? { carrier: input.carrier } : {}) });
+  if (answer.status !== 200) return answer;
+  return { status: 200, body: { ...answer.body, result: "added", orderName: po.order.name } };
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -2233,6 +2607,8 @@ const PURCHASE_ORDER_RAW_KEYS = [
   "discardedSimulatedTracking",
   "placedBy",
   "reportedTotal",
+  // Where and when the extension read the real checkout total from.
+  "quote",
   // Older purchase orders kept the payment link here before the column existed.
   "paymentUrl",
 ] as const;

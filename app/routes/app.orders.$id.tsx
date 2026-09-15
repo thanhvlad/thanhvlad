@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { Link, useFetcher, useLoaderData } from "@remix-run/react";
 import { useAppBridge } from "@shopify/app-bridge-react";
@@ -310,6 +310,80 @@ function toneFor(messageKey: string | undefined): "success" | "info" | "warning"
 }
 
 type ActionResult = { ok?: boolean; message?: string; messageKey?: string; messageVars?: Record<string, string | number>; error?: string; issues?: string[] };
+
+const EXTENSION_SOURCE = "dropshiphub-extension";
+const PAGE_SOURCE = "dropshiphub";
+/** How long the page waits for the extension's "ready" before saying it is not here. */
+const EXTENSION_WAIT_MS = 1500;
+
+type ExtensionState = { kind: "idle" | "waiting" | "started" | "missing" | "error"; error?: string };
+
+/**
+ * "Order on AliExpress with the extension": the DSers-style button. The page
+ * posts the purchase order's id to its own window; the extension's bridge
+ * script, present only once the merchant has allowed the extension on this
+ * origin, relays it and the extension opens the checkout with the address
+ * filled in. Nothing but the id leaves the page, and the address the
+ * extension uses comes from the app's own API with the merchant's token.
+ */
+function ExtensionOrderButton({ purchaseOrderId }: { purchaseOrderId: string }) {
+  const t = useT();
+  const [state, setState] = useState<ExtensionState>({ kind: "idle" });
+  const ready = useRef(false);
+
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      if (event.source !== window || event.origin !== window.location.origin) return;
+      const data = event.data as { source?: unknown; type?: unknown; purchaseOrderId?: unknown; error?: unknown } | null;
+      if (!data || typeof data !== "object" || data.source !== EXTENSION_SOURCE) return;
+      if (data.type === "ready") ready.current = true;
+      if (data.purchaseOrderId !== purchaseOrderId) return;
+      if (data.type === "checkout:started") setState({ kind: "started" });
+      if (data.type === "checkout:error") setState({ kind: "error", error: typeof data.error === "string" ? data.error : "" });
+    };
+    window.addEventListener("message", onMessage);
+    // The bridge announced itself when the page loaded, possibly before this
+    // component existed; asking again costs nothing.
+    window.postMessage({ source: PAGE_SOURCE, type: "ping" }, window.location.origin);
+    return () => window.removeEventListener("message", onMessage);
+  }, [purchaseOrderId]);
+
+  const start = () => {
+    setState({ kind: "waiting" });
+    window.postMessage({ source: PAGE_SOURCE, type: "checkout:start", purchaseOrderId }, window.location.origin);
+    window.setTimeout(() => {
+      if (!ready.current) setState((current) => (current.kind === "waiting" ? { kind: "missing" } : current));
+    }, EXTENSION_WAIT_MS);
+  };
+
+  return (
+    <BlockStack gap="100">
+      <Button variant="primary" size="slim" onClick={start} loading={state.kind === "waiting"}>
+        {t("orders.placement.orderWithExtension")}
+      </Button>
+      {state.kind === "waiting" && (
+        <Text as="p" tone="subdued" variant="bodySm">
+          {t("orders.placement.extensionOpening")}
+        </Text>
+      )}
+      {state.kind === "started" && (
+        <Text as="p" tone="success" variant="bodySm">
+          {t("orders.placement.extensionStarted")}
+        </Text>
+      )}
+      {state.kind === "missing" && (
+        <Text as="p" tone="subdued" variant="bodySm">
+          {t("orders.placement.extensionMissing")} <Link to="/app/settings/advanced">{t("orders.placement.setUpExtension")}</Link>
+        </Text>
+      )}
+      {state.kind === "error" && (
+        <Text as="p" tone="critical" variant="bodySm">
+          {t("orders.placement.extensionError", { error: state.error ?? "" })}
+        </Text>
+      )}
+    </BlockStack>
+  );
+}
 
 export default function OrderDetailPage() {
   const t = useT();
@@ -674,6 +748,7 @@ export default function OrderDetailPage() {
                           )}
                         </InlineStack>
                         <InlineStack gap="100" wrap>
+                          {po.status === "AWAITING_PLACEMENT" && po.platform === "ALIEXPRESS" && <ExtensionOrderButton purchaseOrderId={po.id} />}
                           {po.paymentUrl && ["PLACED", "AWAITING_PAYMENT"].includes(po.status) && (
                             <Button size="slim" url={po.paymentUrl} external variant="primary">
                               {t("action.pay")}

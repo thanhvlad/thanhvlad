@@ -4,23 +4,30 @@
  * The checkout assist on AliExpress pages.
  *
  * The extension lists the orders waiting to be placed and opens each product
- * on AliExpress; the merchant places and pays for the order there and records
- * the AliExpress order number. This script is the part that runs in those
- * AliExpress tabs: on the product page it checks the purchase order's variant
- * and opens the confirm page for it, and on the confirm page it shows the
- * order, the address with Copy buttons, a Fill address button and the box for
- * the order number.
+ * on AliExpress. This script runs in those tabs: on the product page it checks
+ * the purchase order's variant and opens the confirm page for it; on the
+ * confirm page it fills the customer's address by itself as soon as the page
+ * is ready, saves it to the merchant's AliExpress address book once every box
+ * reads back as intended, sends the page's real total to the app, and shows
+ * the order beside the page's total. The merchant presses Pay now. The click
+ * on Pay now is observed (never made) and the orders page then records the
+ * AliExpress order number (orders.js).
  *
  * What it must never do is decided here, in code, not left to selectors:
  *
- * - Every programmatic click goes through guardedClick(), which refuses Place
- *   order, Pay, Buy now, payment choices, checkboxes, form submits and the
- *   address form's Confirm (DropshipHubCheckout.clickRefusal), judged for the
- *   clicked element and for every control around it the click would
- *   activate. No other code path clicks, submits or presses keys.
- * - Nothing is filled until the merchant presses Fill address in this panel,
- *   and nothing is filled into a form that already holds another address or
- *   has "Set as default shipping address" ticked.
+ * - Every programmatic click goes through guardedClick(), which refuses Pay
+ *   now / Place order, Buy now, payment choices, the address list's radios,
+ *   edit and delete icons, the "Set as default" switch, the quantity stepper,
+ *   coupons, checkboxes, form submits and every control whose label commits
+ *   something (DropshipHubCheckout.clickRefusal), judged for the clicked
+ *   element and for every control around it the click would activate.
+ * - The ONE exception is saveAddressForm(): Save (comet) or Confirm (Fusion)
+ *   on the add-new-address form, clicked only after every box, State, City,
+ *   the country and the default switch have been read back as intended
+ *   (DropshipHubCheckout.saveButtonRefusal). Otherwise the boxes are
+ *   highlighted and the merchant is asked to check and save themselves.
+ * - Nothing is typed into a form that already holds another address, or has
+ *   "Set as default" on, and never into the cascade modal's search box.
  * - The customer's data stays in this isolated world and the background
  *   worker's session storage: never logged, never put in a URL, never sent to
  *   the page's MAIN world (the SKU request to page-reader.js carries nothing).
@@ -40,6 +47,10 @@
   let panel = null;
   let lastUrl = location.href;
   let productCheckFor = null;
+  // The automatic fill runs once per item per page load; a reload consults
+  // the outcome recorded in the job instead (core.shouldAutoFill).
+  let autoFillFor = null;
+  let payObserverInstalled = false;
 
   const RELOADED = "The extension was reloaded or updated. Reload this page.";
 
@@ -78,12 +89,16 @@
     }
   }
 
+  function collapse(value) {
+    return String(value ?? "").replace(/\s+/g, " ").trim();
+  }
+
   // ---------------------------------------------------------------------------
-  // The one way this script clicks
+  // The one way this script clicks (plus saveAddressForm, the verified exception)
   // ---------------------------------------------------------------------------
 
   const FORBIDDEN_INSIDE =
-    'button.place-order-primary-btn, .pl-order-toal-container__btn-box, input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], button[type="submit"], input[type="submit"]';
+    'button.place-order-primary-btn, .pl-order-toal-container__btn-box, input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], [role="switch"], button[type="submit"], input[type="submit"], .mt-switch, .ae-address-item-edit-btn, .ae-address-item-delete-btn, .comet-input-number';
 
   /**
    * Elements a click can activate or toggle when it bubbles up to them. The
@@ -177,6 +192,7 @@
     label.field { display: grid; gap: 2px; font-size: 12px; color: #6d7175; }
     label.field input { font: inherit; color: #202223; padding: 6px 8px; border: 1px solid #c9cccf; border-radius: 6px; }
     label.check { display: flex; gap: 6px; align-items: center; font-size: 12px; }
+    details { font-size: 12px; } summary { cursor: pointer; color: #2c6ecb; font-weight: 600; }
     ul { margin: 0; padding-left: 16px; }
   `;
 
@@ -226,7 +242,7 @@
     const head = el("div", { className: "head" }, [el("span", { text: "DropshipHub checkout" }), toggle]);
     root.append(style, el("div", { className: "card" }, [head, body]));
     (document.body ?? document.documentElement).append(host);
-    panel = { host, body, onUrlChange: null };
+    panel = { host, body, onUrlChange: null, view: 0 };
     return panel;
   }
 
@@ -241,6 +257,7 @@
     body.textContent = "";
     body.hidden = false;
     panel.onUrlChange = null;
+    panel.view += 1;
     return body;
   }
 
@@ -257,7 +274,8 @@
     ]);
   }
 
-  const PLACE_YOURSELF = "You place and pay for this order on AliExpress yourself. DropshipHub never clicks Place order or Pay.";
+  const PAY_YOURSELF =
+    "You press Pay now on AliExpress yourself: DropshipHub never presses it. Once you have paid, open your AliExpress orders and DropshipHub records the order number by itself.";
 
   function cancelButton() {
     return button(
@@ -275,6 +293,13 @@
     const message = el("div");
     say(message, text, tone);
     body.append(message, button("Close", clearPanel, "act secondary"));
+  }
+
+  /** A collapsed block under the panel's main content. */
+  function disclosure(summaryText, content) {
+    const details = el("details");
+    details.append(el("summary", { text: summaryText }), content);
+    return details;
   }
 
   // ---------------------------------------------------------------------------
@@ -389,28 +414,47 @@
   function readPageTotalText() {
     const rows = [...document.querySelectorAll(".pl-order-toal-container__item")];
     for (const row of rows.reverse()) {
-      const text = (row.textContent ?? "").replace(/\s+/g, " ").trim();
+      const text = collapse(row.textContent);
       if (core.parseMoneyText(text)) return text.slice(0, 120);
     }
     return null;
   }
 
+  /** The summary rows (Subtotal, Shipping fee, Additional charges, Promo codes) as label + text. */
+  function readSummaryRows() {
+    return [...document.querySelectorAll(".pl-summary__item-pc")].map((row) => ({
+      label: collapse(row.firstElementChild?.textContent ?? row.textContent).slice(0, 80),
+      text: collapse(row.textContent).slice(0, 120),
+    }));
+  }
+
+  function describeExpectation(expectations) {
+    if (expectations.length === 0) return "DropshipHub has no cost estimate for this order.";
+    const amounts = expectations.map((e) => core.formatAmount(e.amount, e.currency)).join(" / ");
+    const scope = expectations[0].scope === "item" ? " for this item's goods; shipping comes on top" : " for the order, shipping estimate included";
+    return `DropshipHub expects ${amounts}${scope}.`;
+  }
+
   function costBlock(job) {
-    const expected = core.expectedCost(job);
+    const expectations = core.expectedCosts(job);
     const line = el("div");
     const detail = el("div", { className: "muted" });
+    const quoteLine = el("div");
+    let quoted = false;
     const render = () => {
       const pageText = readPageTotalText();
-      const verdict = core.compareTotals(expected, pageText);
-      const expectation = expected
-        ? `DropshipHub expects ${core.formatAmount(expected.amount, expected.currency)}${expected.scope === "item" ? " for this item's goods; shipping comes on top" : " for the order, shipping estimate included"}.`
-        : "DropshipHub has no cost estimate for this order.";
-      detail.textContent = `${expectation} AliExpress shows: ${pageText ?? "not readable yet"}.`;
+      const verdict = core.compareTotals(expectations, pageText);
+      detail.textContent = `${describeExpectation(expectations)} AliExpress shows: ${pageText ?? "not readable yet"}.`;
       if (verdict.kind === "close") say(line, "The total is close to DropshipHub's estimate.", "ok");
-      else if (verdict.kind === "higher") say(line, "The total is higher than DropshipHub's estimate. Check the price and shipping before you place the order.", "warn");
-      else if (verdict.kind === "lower") say(line, "The total is lower than DropshipHub's estimate. Check the variant and quantity before you place the order.", "warn");
-      else if (verdict.kind === "other-currency") say(line, "AliExpress shows the total in another currency, so compare it yourself.", "warn");
+      else if (verdict.kind === "higher") say(line, "The total is higher than DropshipHub's estimate. Check the price and shipping before you pay.", "warn");
+      else if (verdict.kind === "lower") say(line, "The total is lower than DropshipHub's estimate. Check the variant and quantity before you pay.", "warn");
+      else if (verdict.kind === "other-currency") say(line, "AliExpress shows the total in a currency DropshipHub has no estimate in, so the two amounts are shown side by side.", "");
+      else if (verdict.kind === "no-expectation" && verdict.page) say(line, "", "");
       else say(line, "Waiting for the page's total…", "");
+      if (verdict.page && !quoted) {
+        quoted = true;
+        sendQuote(job, pageText, quoteLine);
+      }
       // Done only once the page's total has been read. Stopping on any
       // verdict stopped at once for an order with no estimate, and the panel
       // then said "not readable yet" until the merchant pressed the button.
@@ -424,7 +468,21 @@
         if (render()) break;
       }
     })();
-    return el("div", { className: "stack" }, [line, detail, button("Check the total again", render, "act secondary")]);
+    return el("div", { className: "stack" }, [line, detail, quoteLine, button("Check the total again", render, "act secondary")]);
+  }
+
+  /**
+   * The page's real total goes to the app once per item per checkout: the
+   * captured price was in the product page's currency (VND on the measured
+   * account) and the checkout charges the account's (USD), so the estimate
+   * is not the price paid. The worker remembers what was sent in the job.
+   */
+  async function sendQuote(job, totalText, target) {
+    const quote = core.quoteFromPage({ totalText, rows: readSummaryRows() });
+    if (!quote) return;
+    const answer = await ask({ type: "checkout:quote", quote });
+    if (answer.ok) say(target, answer.alreadySent ? "The real price was already sent to DropshipHub." : "The real price was sent to DropshipHub.", "ok");
+    else if (answer.error && answer.error !== RELOADED) say(target, `The real price was not sent to DropshipHub: ${answer.error}`, "warn");
   }
 
   function urlChecks(job) {
@@ -513,7 +571,7 @@
     const notes = el("div", { className: "stack" });
     if (values.moved) notes.append(el("div", { className: "line warn", text: `The street line is longer than AliExpress's ${core.STREET_MAX} characters, so "${values.moved}" moved to Apt, suite, unit.` }));
     if (values.streetTooShort) notes.append(el("div", { className: "line warn", text: "The street line is shorter than the 5 characters AliExpress requires." }));
-    if (!values.phoneMatches) notes.append(el("div", { className: "line warn", text: "The phone number has another country's code. Check it before you confirm the address." }));
+    if (!values.phoneMatches) notes.append(el("div", { className: "line warn", text: "The phone number has another country's code. Check it before you pay." }));
     if (!values.firstName || !values.lastName) notes.append(el("div", { className: "line warn", text: "The order has no separate first and last name. Enter them yourself." }));
     return { node: el("div", { className: "stack" }, [el("div", { className: "muted", text: "Shipping address" }), rows, notes]), inputs };
   }
@@ -548,9 +606,8 @@
 
     const hint = job.items.length > 1
       ? "Each item is its own AliExpress order. The order numbers are sent to DropshipHub together when you record the last item."
-      : "Copy it from the order in your AliExpress account once you have placed it.";
+      : "Only needed if your AliExpress orders page did not record it by itself. Copy it from the order in your AliExpress account.";
     const children = [
-      el("div", { className: "muted", text: "After you place the order" }),
       el("label", { className: "field" }, [el("span", { text: "AliExpress order number(s)" }), numbers]),
     ];
     if (last) {
@@ -560,7 +617,7 @@
     children.push(suggestion, el("div", { className: "muted", text: hint }), submit, result);
 
     /**
-     * The page after Place order has not been measured. When an AliExpress
+     * The page after Pay now has not been measured. When an AliExpress
      * address carries long numeric order ids, they are shown beside the box
      * for the merchant to check, and go into it only when the merchant presses
      * Use. The address is whatever link was followed, so the suggestion is
@@ -596,9 +653,14 @@
       return;
     }
     const next = answer.status === "PAID"
-      ? "Add its tracking number in the extension once AliExpress ships it; tracking you add there is sent to Shopify."
+      ? "Its tracking number is recorded when you open the order's tracking page on AliExpress, or in the extension; tracking is sent to Shopify."
       : "Pay for it on AliExpress within 24 hours, or AliExpress cancels it.";
     showFinished(`Recorded ${answer.orderName} as AliExpress order ${ids}. ${next}`, "ok");
+  }
+
+  /** "Open my AliExpress orders": the worker navigates this tab to the orders list on the current host. */
+  function openOrdersButton() {
+    return button("Open my AliExpress orders", () => ask({ type: "checkout:open-orders" }), "act secondary");
   }
 
   function renderConfirm(job) {
@@ -607,51 +669,158 @@
     const checks = urlChecks(job);
     const address = addressBlock(job, values);
     const fillStatus = el("div", { className: "stack" });
-    const fill = button("Fill address", async () => {
-      fill.disabled = true;
-      fillStatus.textContent = "";
-      try {
-        await fillAddress(job, values, fillStatus);
-      } catch {
-        report(fillStatus, "The fill stopped unexpectedly. Use the Copy buttons for the remaining fields.", "err");
-      } finally {
-        fill.disabled = false;
-        // Typing left focus in AliExpress's City search box. Keys meant for
-        // the panel then went into the page's form, and Enter in a text box
-        // can submit a form that has a submit button.
-        if (fill.isConnected) fill.focus();
-      }
-    });
+    const fill = button("Fill address again", () => runFill(job, values, fillStatus, fill), "act secondary");
     const record = recordBlock(job);
 
     body.append(
       itemBlock(job),
       checks.node,
       costBlock(job),
-      address.node,
-      el("div", { className: "stack" }, [fill, fillStatus]),
-      el("div", { className: "note", text: PLACE_YOURSELF }),
-      record.node,
+      el("div", { className: "stack" }, [el("div", { className: "muted", text: "Address" }), fillStatus, fill]),
+      el("div", { className: "note", text: PAY_YOURSELF }),
+      disclosure("Customer address (copy by hand)", address.node),
+      disclosure("Enter the order number yourself", record.node),
       cancelButton(),
     );
     panel.onUrlChange = () => {
       checks.render();
       record.suggest();
     };
+    observePayClick();
+    autoFill(job, values, fillStatus, fill);
   }
 
-  /** The confirm stage on any other AliExpress page, where the merchant lands after Place order. */
+  /**
+   * The address fill, run by itself as soon as the confirm page is ready.
+   * Skipped when the page's address block already shows the customer's
+   * address, and when the job records a fill that stopped (the merchant may
+   * be correcting the form by hand, and "Fill address again" is there).
+   */
+  async function autoFill(job, values, status, fillButton) {
+    const key = `${job.purchaseOrderId}:${job.itemIndex}`;
+    if (autoFillFor === key) return;
+    autoFillFor = key;
+    const view = panel.view;
+    report(status, "Waiting for the page's address block…");
+    const block = await waitFor(() => document.querySelector(".pl-address-item-container"), 20000);
+    if (panel?.view !== view) return;
+    status.textContent = "";
+    if (!block) {
+      report(status, "The page's address block has not appeared. Once it has, press Fill address again.", "warn");
+      return;
+    }
+    const shown = core.addressBlockShows(block.textContent, values);
+    if (shown) {
+      report(status, "The address on this page is the customer's. Check the total, then press Pay now on AliExpress yourself.", "ok");
+      const outcome = core.fillOutcomeFor(job);
+      if (!outcome || outcome.result !== "set") await ask({ type: "checkout:fill-result", result: "set", reason: "The page already showed the address." });
+      return;
+    }
+    if (!core.shouldAutoFill(job, shown)) {
+      const outcome = core.fillOutcomeFor(job);
+      report(status, `The last fill stopped: ${outcome?.reason ?? "see the form."} Check the form, or press Fill address again.`, "warn");
+      return;
+    }
+    await runFill(job, values, status, fillButton);
+  }
+
+  /** One fill, from the automatic run or the button, with its outcome recorded in the job. */
+  async function runFill(job, values, status, fillButton) {
+    fillButton.disabled = true;
+    status.textContent = "";
+    let outcome = { result: "failed", reason: "The fill stopped unexpectedly." };
+    try {
+      outcome = await fillAddress(job, values, status);
+    } catch {
+      report(status, "The fill stopped unexpectedly. Use the Copy buttons for the remaining fields.", "err");
+    } finally {
+      fillButton.disabled = false;
+      // Typing left focus in AliExpress's form. Keys meant for the panel then
+      // went into the page's form, and Enter in a text box can submit a form
+      // that has a submit button.
+      if (fillButton.isConnected) fillButton.focus();
+    }
+    await ask({ type: "checkout:fill-result", result: outcome.result, reason: outcome.reason });
+  }
+
+  /**
+   * Observes the merchant's own click on Pay now, so the job moves to
+   * "paying" and the orders page can record the order number afterwards. It
+   * only listens: it never prevents, delays or makes that click.
+   */
+  function observePayClick() {
+    if (payObserverInstalled) return;
+    payObserverInstalled = true;
+    document.addEventListener(
+      "click",
+      (event) => {
+        if (!event.isTrusted || !(event.target instanceof Element)) return;
+        if (!event.target.closest("button.place-order-primary-btn")) return;
+        ask({ type: "checkout:paying" }).then((answer) => {
+          if (answer.ok) refresh(true);
+        });
+      },
+      true,
+    );
+  }
+
+  /** The confirm stage on any other AliExpress page, where the merchant may have landed after Pay now. */
   function renderRecordOnly(job) {
     const body = freshBody();
     const record = recordBlock(job);
     body.append(
       itemBlock(job),
-      el("div", { className: "note", text: PLACE_YOURSELF }),
-      record.node,
+      el("div", { className: "note", text: PAY_YOURSELF }),
+      openOrdersButton(),
+      disclosure("Enter the order number yourself", record.node),
       button("Open this item's checkout again", () => ask({ type: "checkout:reopen-product" }), "act secondary"),
       cancelButton(),
     );
     panel.onUrlChange = record.suggest;
+  }
+
+  /**
+   * Stage "paying": Pay now was pressed. The orders page records the order
+   * number and the worker drops the job; until then this view polls so it
+   * disappears by itself once that has happened.
+   */
+  function renderPaying(job) {
+    const body = freshBody();
+    const view = panel.view;
+    const record = recordBlock(job);
+    const line = el("div");
+    say(line, "Payment started on AliExpress. When it is done, open your AliExpress orders and DropshipHub records the order number by itself.", "ok");
+    body.append(itemBlock(job), line);
+    if (core.isOrdersPage(location.href)) {
+      body.append(el("div", { className: "muted", text: "Looking for the new order in this list… If AliExpress has not listed it yet, reload this page in a moment." }));
+    } else {
+      body.append(openOrdersButton());
+    }
+    body.append(
+      disclosure("Enter the order number yourself", record.node),
+      button("I have not paid yet: back to the checkout", async () => {
+        const answer = await ask({ type: "checkout:not-paid" });
+        if (answer.ok) refresh(true);
+      }, "act secondary"),
+      cancelButton(),
+    );
+    panel.onUrlChange = record.suggest;
+    (async () => {
+      while (panel && panel.view === view) {
+        await sleep(3000);
+        if (!panel || panel.view !== view) return;
+        const answer = await ask({ type: "checkout:get" });
+        if (answer.error === RELOADED) return;
+        if (!answer.ok || !answer.job) {
+          clearPanel();
+          return;
+        }
+        if (answer.job.stage !== "paying") {
+          refresh();
+          return;
+        }
+      }
+    })();
   }
 
   function renderRecorded(job) {
@@ -686,13 +855,18 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Fill address (only ever from the Fill address button)
+  // The address fill: shared parts
   // ---------------------------------------------------------------------------
 
   function report(target, text, tone) {
     const line = el("div");
     say(line, text, tone);
     target.append(line);
+  }
+
+  /** The fill's outcome, recorded in the job: "set", "partial" (typed, not saved) or "failed" (nothing or little typed). */
+  function outcome(result, reason) {
+    return { result, reason: String(reason ?? "").slice(0, 300) };
   }
 
   const marked = new Set();
@@ -713,35 +887,43 @@
     marked.clear();
   }
 
-  function addressForm() {
+  /** The Fusion design's form: a real <form> built from next-* components. */
+  function fusionForm() {
     return document.querySelector("form.deliver-address-form");
   }
 
-  // The address search box is a next-select-auto-complete; it counts as select
-  // 1 in the measured order whether or not it also carries next-select, and its
-  // input must not be mistaken for a text box.
-  const SELECT = ".next-select, .next-select-auto-complete";
+  /** The comet design's form: a div.mt-form inside the address drawer; there is no <form>. */
+  function cometForm() {
+    const node = document.querySelector(".deliver-address-form");
+    return node && !(node instanceof HTMLFormElement) ? node : null;
+  }
 
-  function topSelects(form) {
-    return [...form.querySelectorAll(SELECT)].filter((node) => !node.parentElement?.closest(SELECT));
+  /** Whichever address form is open, with its design, or null. */
+  function openAddressForm() {
+    const fusion = fusionForm();
+    if (fusion) return { design: "fusion", form: fusion };
+    const comet = cometForm();
+    if (comet) return { design: "comet", form: comet };
+    return null;
+  }
+
+  function addressFormOf(design) {
+    return design === "comet" ? cometForm() : fusionForm();
   }
 
   const NOT_TEXT = new Set(["checkbox", "radio", "hidden", "submit", "button", "image", "reset", "file"]);
-
-  function plainInputs(form) {
-    return [...form.querySelectorAll("input")].filter((input) => !NOT_TEXT.has((input.getAttribute("type") ?? "").toLowerCase()) && !input.closest(SELECT));
-  }
 
   /**
    * Types into one of the address form's own inputs the way React expects.
    * React keeps its own copy of a controlled input's value: a value set
    * without the input event never reaches its state, and the next render puts
    * the old value back. The native setter plus input and change events is how
-   * the page's own typing looks to it. Anything outside the address form - a
-   * payment field above all - is refused.
+   * the page's own typing looks to it. Anything outside the address form (a
+   * payment field, the cascade modal's search box) is refused, as is any box
+   * that is not a text box.
    */
   function setInputValue(input, value) {
-    if (!(input instanceof HTMLInputElement) || !input.closest("form.deliver-address-form")) return false;
+    if (!(input instanceof HTMLInputElement) || !input.closest(".deliver-address-form")) return false;
     if (NOT_TEXT.has((input.getAttribute("type") ?? "").toLowerCase())) return false;
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
     input.focus();
@@ -753,6 +935,365 @@
 
   function isVisible(node) {
     return node.getClientRects().length > 0;
+  }
+
+  const FIELD_LABELS = { firstName: "First name", lastName: "Last name", phone: "Mobile number", street: "Street", unit: "Apt, suite, unit", zip: "ZIP" };
+
+  function intendedValues(values) {
+    return { firstName: values.firstName, lastName: values.lastName, phone: values.phone, street: values.street, unit: values.unit, zip: values.zip };
+  }
+
+  /**
+   * Whether the fill may go on to its next step. A step waits seconds for
+   * AliExpress, and meanwhile the merchant can press Cancel or the page can
+   * move on; the fill used to keep typing the customer's address into the form
+   * after the checkout holding it had been cancelled.
+   */
+  async function fillMayContinue(job, status) {
+    const answer = await ask({ type: "checkout:get" });
+    const current = answer.ok ? answer.job : null;
+    if (!current || current.stage !== "confirm" || current.purchaseOrderId !== job.purchaseOrderId || current.itemIndex !== job.itemIndex) {
+      report(status, "This checkout was cancelled or has moved on, so the fill stopped.", "warn");
+      return false;
+    }
+    if (!core.isConfirmPage(location.href)) {
+      report(status, "The page changed, so the fill stopped.", "warn");
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Opens the add-address form when none is open: "Add new address" when the
+   * account has no saved address, else "Change" on the saved address and then
+   * the list's "Add new address" button. Returns { design, form } or null.
+   */
+  async function openFormIfNeeded(status) {
+    const open = openAddressForm();
+    if (open) return open;
+    const wrap = document.querySelector(".pl-address-item__new-btn-wrap");
+    if (wrap) {
+      const add = wrap.querySelector("button, [role='button'], a") ?? wrap;
+      const refused = guardedClick(add);
+      if (refused) {
+        report(status, `Click "Add new address" on the page yourself, then press Fill address again. (${refused})`, "warn");
+        return null;
+      }
+    } else {
+      const change = document.querySelector("span.pl-address-item__arrrow a, span.pl-address-item__arrrow");
+      if (!change) {
+        report(status, 'Open the add-address form on this page ("Add new address", or "Change" and then "Add new address"), then press Fill address again.', "warn");
+        return null;
+      }
+      const refusedChange = guardedClick(change);
+      if (refusedChange) {
+        report(status, `Click "Change" beside the address yourself, then press Fill address again. (${refusedChange})`, "warn");
+        return null;
+      }
+      const drawer = await waitFor(() => [...document.querySelectorAll(".comet-drawer.pl-address-model-cls")].find(isVisible), 8000);
+      if (!drawer) {
+        report(status, "The address list did not open. Open it yourself, press Add new address, then press Fill address again.", "err");
+        return null;
+      }
+      const add = await waitFor(() => drawer.querySelector("button.add-address"), 5000);
+      if (!add) {
+        report(status, 'Could not find "Add new address" in the address list. Press it yourself, then press Fill address again.', "warn");
+        return null;
+      }
+      const refusedAdd = guardedClick(add);
+      if (refusedAdd) {
+        report(status, `Press "Add new address" in the list yourself, then press Fill address again. (${refusedAdd})`, "warn");
+        return null;
+      }
+    }
+    const form = await waitFor(openAddressForm, 8000);
+    if (!form) report(status, "The add-address form did not open. Open it yourself, then press Fill address again.", "err");
+    return form;
+  }
+
+  async function fillAddress(job, values, status) {
+    clearMarks();
+    if (!core.isConfirmPage(location.href)) {
+      report(status, "Fill address works on AliExpress's checkout page only.", "err");
+      return outcome("failed", "Not on the checkout page.");
+    }
+    if (job.address.countryCode !== "US") {
+      // Only the US form has been measured; other countries render other
+      // fields (Vietnam: province, district, ward) in other positions.
+      const reason = `DropshipHub can fill only AliExpress's US address form, and this order ships to ${values.country}.`;
+      report(status, `${reason} Use the Copy buttons to enter the address.`, "warn");
+      return outcome("failed", reason);
+    }
+    if (!(await fillMayContinue(job, status))) return outcome("failed", "The checkout moved on.");
+
+    const open = await openFormIfNeeded(status);
+    if (!open) return outcome("failed", "The add-address form did not open.");
+    return open.design === "comet" ? fillCometForm(job, values, status, open.form) : fillFusionForm(job, values, status, open.form);
+  }
+
+  // ---------------------------------------------------------------------------
+  // The comet form (www.aliexpress.us in English): boxes by position, one
+  // cascade modal for State and City
+  // ---------------------------------------------------------------------------
+
+  const COMET = core.COMET_POSITIONS;
+
+  function cometInputs(form) {
+    return [...form.querySelectorAll("input")];
+  }
+
+  /** The drawer around the comet form, where "Set as default" and Save sit. */
+  function cometScope(form) {
+    return form.closest(".comet-drawer, .deliver-address-wrap") ?? form.parentElement ?? form;
+  }
+
+  /** The "Set as default" switch, for reading only: nothing here clicks or sets it. */
+  function cometSwitch(form) {
+    return cometScope(form).querySelector(".mt-switch");
+  }
+
+  function cometSwitchState(form) {
+    const node = cometSwitch(form);
+    if (!node) return "missing";
+    const on = [...node.classList].some((c) => /--checked$|(^|-)checked$/i.test(c)) || node.getAttribute("aria-checked") === "true";
+    return on ? "on" : "off";
+  }
+
+  function cometSnapshot(form) {
+    return { inputs: cometInputs(form).map((input) => ({ type: input.getAttribute("type") ?? "", role: input.getAttribute("role") ?? "", value: input.value })) };
+  }
+
+  /**
+   * Stops the fill, before it changes anything, in a form that is not a new
+   * address: one whose boxes hold something DropshipHub did not type (the
+   * edit form of a saved address), or whose "Set as default" switch is on.
+   * `requireSwitch` is set once the whole form is showing.
+   */
+  function cometRefusesFill(form, values, status, requireSwitch) {
+    const inputs = cometInputs(form);
+    const boxes = core.COMET_TEXT_BOXES.filter((i) => i < inputs.length).map((i) => inputs[i]);
+    const foreign = core.foreignFormValues(boxes.map((box) => box.value), Object.values(intendedValues(values)));
+    if (foreign.length > 0) {
+      for (const index of foreign) mark(boxes[index], "#b3261e");
+      report(status, "This form already holds an address DropshipHub did not enter (highlighted), so nothing was filled. It may be a saved address being edited. Go back, press Add new address, then press Fill address again.", "warn");
+      return true;
+    }
+    const state = cometSwitchState(form);
+    if (state === "on") {
+      mark(cometSwitch(form), "#b3261e");
+      report(status, '"Set as default" is on for this form (highlighted), so nothing was filled. Switch it off yourself, then press Fill address again.', "warn");
+      return true;
+    }
+    if (state === "missing" && requireSwitch) {
+      report(status, 'Could not find "Set as default" on the form, so nothing was filled. AliExpress may have changed the form. Use the Copy buttons.', "warn");
+      return true;
+    }
+    return false;
+  }
+
+  async function cometEnterManually(form, status) {
+    if (cometInputs(form).length >= COMET.count) return form;
+    const link = [...cometScope(form).querySelectorAll("div.text-button-container")].find((node) => /^(enter manually|nhập thủ công)$/i.test(collapse(node.textContent)));
+    if (!link) {
+      report(status, 'Could not find "Enter manually" on the form. Press it yourself, then press Fill address again.', "warn");
+      return null;
+    }
+    const refused = guardedClick(link);
+    if (refused) {
+      report(status, `Press "Enter manually" on the form yourself, then press Fill address again. (${refused})`, "warn");
+      return null;
+    }
+    const ready = await waitFor(() => {
+      const current = cometForm();
+      return current && cometInputs(current).length >= COMET.count ? current : null;
+    }, 5000);
+    if (!ready) report(status, 'The street boxes did not appear after "Enter manually". Use the Copy buttons.', "warn");
+    return ready;
+  }
+
+  function visibleCascadeModal() {
+    return [...document.querySelectorAll(".mt-drawer-modal")].find(isVisible) ?? null;
+  }
+
+  /** The cascade modal's options: every div.group-item with its span.item-label text. */
+  function cascadeItems(modal) {
+    const items = [...modal.querySelectorAll(".group-item")].map((item) => ({ item, label: collapse(item.querySelector("span.item-label")?.textContent ?? item.textContent) }));
+    return { items, labels: items.map((entry) => entry.label) };
+  }
+
+  function cascadeItem(modal, label) {
+    return cascadeItems(modal).items.find((entry) => entry.label === label)?.item ?? null;
+  }
+
+  /** Closes the cascade modal with its own close icon, so a half-chosen state is not left behind. */
+  function closeCascade() {
+    const modal = visibleCascadeModal();
+    const close = modal?.querySelector(".drawer-cascade-header span.mt-icon-close, span.mt-icon-close");
+    if (close) guardedClick(close);
+  }
+
+  /**
+   * Chooses State and City in the one cascade modal: clicking the State box
+   * opens "Select address" at the state level (letter headers plus states),
+   * a state moves the same modal to its cities ("Other" last), and a city
+   * closes it and fills both boxes. Nothing is ever typed into the modal's
+   * search box: it hides the list while it has text.
+   */
+  async function chooseInCascade(job, form, values, stateCandidates, status) {
+    const stateBox = cometInputs(form)[COMET.state];
+    if (!stateBox) return { error: "The State box was not found." };
+    const refused = guardedClick(stateBox);
+    if (refused) return { error: `DropshipHub did not open the State list: ${refused}` };
+    const modal = await waitFor(visibleCascadeModal, 6000);
+    if (!modal) return { error: "The State list did not open. Choose the state and city yourself." };
+    const stateLabels = await waitFor(() => {
+      const current = visibleCascadeModal();
+      const labels = current ? cascadeItems(current).labels : [];
+      return labels.length > 0 ? labels : null;
+    }, 6000);
+    if (!stateLabels) {
+      closeCascade();
+      return { error: "The State list stayed empty. Choose the state and city yourself." };
+    }
+    const stateLabel = core.chooseCascadeOption(stateLabels, stateCandidates);
+    if (!stateLabel) {
+      closeCascade();
+      return { error: `"${stateCandidates[0] ?? (values.state || "the state")}" is not in AliExpress's State list. Choose the state and city yourself.` };
+    }
+    const refusedState = guardedClick(cascadeItem(visibleCascadeModal() ?? modal, stateLabel));
+    if (refusedState) {
+      closeCascade();
+      return { error: `DropshipHub did not choose the state: ${refusedState}` };
+    }
+    const cityLabels = await waitFor(() => {
+      const current = visibleCascadeModal();
+      if (!current) return null;
+      const labels = cascadeItems(current).labels;
+      if (labels.length === 0) return null;
+      const steps = collapse(current.querySelector(".drawer-cascade-steps")?.textContent);
+      const moved = core.normalizeTitle(steps).includes(core.normalizeTitle(stateLabel)) || JSON.stringify(labels) !== JSON.stringify(stateLabels);
+      return moved ? labels : null;
+    }, 8000);
+    if (!cityLabels) {
+      closeCascade();
+      return { error: `The city list did not appear after choosing ${stateLabel}. Choose the state and city yourself.` };
+    }
+    const city = core.chooseCascadeCity(cityLabels, values.city);
+    if (!city) {
+      closeCascade();
+      return { error: `Could not choose "${values.city}" in the City list, and it has no "Other". Choose the state and city yourself.` };
+    }
+    if (!(await fillMayContinue(job, status))) {
+      closeCascade();
+      return { error: "The checkout moved on." };
+    }
+    const refusedCity = guardedClick(cascadeItem(visibleCascadeModal() ?? modal, city.label));
+    if (refusedCity) {
+      closeCascade();
+      return { error: `DropshipHub did not choose the city: ${refusedCity}` };
+    }
+    const filled = await waitFor(() => {
+      if (visibleCascadeModal()) return null;
+      const current = cometForm();
+      const inputs = current ? cometInputs(current) : [];
+      return inputs.length === COMET.count && collapse(inputs[COMET.state].value) && collapse(inputs[COMET.city].value) ? true : null;
+    }, 8000);
+    if (!filled) return { error: "State and City did not fill after the choice. Choose them yourself." };
+    return { state: stateLabel, city: city.label, cityOther: city.isOther };
+  }
+
+  async function fillCometForm(job, values, status, form) {
+    const countryCandidates = core.countryTitleCandidates(job.address.countryCode);
+    let inputs = cometInputs(form);
+    if (inputs.length < COMET.search + 1) {
+      report(status, `The form has ${inputs.length} boxes, fewer than the US address form. AliExpress may have changed the form. Use the Copy buttons.`, "warn");
+      return outcome("failed", "The form has too few boxes.");
+    }
+    // Country first: changing it re-renders the form for another country,
+    // and doing that here has not been measured, so the fill stops instead.
+    const country = collapse(inputs[COMET.country].value);
+    if (core.matchOption([country], countryCandidates) === null) {
+      mark(inputs[COMET.country], "#b98900");
+      const reason = `The Country/region box shows "${country || "nothing"}", not the United States.`;
+      report(status, `${reason} Choose United States yourself (highlighted), then press Fill address again.`, "warn");
+      return outcome("failed", reason);
+    }
+    if (cometRefusesFill(form, values, status, false)) return outcome("failed", "The form is not a new address.");
+    form = await cometEnterManually(form, status);
+    if (!form) return outcome("failed", 'The street boxes did not appear after "Enter manually".');
+
+    const structure = core.cometFormStructure(cometSnapshot(form), countryCandidates);
+    if (!structure.ok) {
+      report(status, `Stopped before typing: ${structure.reason} AliExpress may have changed the form. Use the Copy buttons.`, "warn");
+      return outcome("failed", structure.reason);
+    }
+    if (cometRefusesFill(form, values, status, true)) return outcome("failed", "The form is not a new address.");
+    if (!(await fillMayContinue(job, status))) return outcome("failed", "The checkout moved on.");
+
+    const intended = intendedValues(values);
+    inputs = cometInputs(form);
+    const typedInto = Object.fromEntries(Object.entries(core.COMET_TYPED).map(([key, index]) => [key, inputs[index]]));
+    for (const [key, input] of Object.entries(typedInto)) setInputValue(input, intended[key]);
+    // Delivery Instructions (box 12) stays empty; the search box (6) and the
+    // "Set as default" switch are never touched.
+    const flags = [];
+    if (!values.firstName) flags.push(typedInto.firstName);
+    if (!values.lastName) flags.push(typedInto.lastName);
+    if (!values.phoneMatches) flags.push(typedInto.phone);
+    if (values.moved || values.streetTooShort) flags.push(typedInto.street, typedInto.unit);
+
+    if (!(await fillMayContinue(job, status))) return outcome("partial", "The checkout moved on.");
+    const stateCandidates = core.stateTitleCandidates(job.address.province, job.address.provinceCode);
+    const cascade = await chooseInCascade(job, form, values, stateCandidates, status);
+    if (cascade.error) {
+      const current = cometForm();
+      const now = current ? cometInputs(current) : [];
+      flags.push(now[COMET.state], now[COMET.city]);
+      for (const node of flags) mark(node, "#b98900");
+      report(status, `${cascade.error} Then press Save on the form yourself.`, "warn");
+      return outcome("partial", cascade.error);
+    }
+    if (cascade.cityOther) {
+      report(status, `"${values.city}" is not in AliExpress's city list for ${cascade.state}, so "Other" was chosen. The saved address shows "Other" as the city; check it before you pay.`, "warn");
+    }
+
+    // Read every box back once React has had a render to put an old value
+    // back, by position on the form as it is now.
+    await sleep(400);
+    const current = cometForm();
+    const now = current ? cometInputs(current) : [];
+    if (!current || now.length !== COMET.count) {
+      report(status, "The address form changed after typing. Check it and press Save yourself.", "warn");
+      return outcome("partial", "The address form changed after typing.");
+    }
+    const actual = Object.fromEntries(Object.entries(core.COMET_TYPED).map(([key, index]) => [key, now[index].value]));
+    const wrong = core.mismatchedFields(intended, actual);
+    if (wrong.length > 0) {
+      for (const key of wrong) flags.push(now[core.COMET_TYPED[key]]);
+      for (const node of flags) mark(node, "#b98900");
+      const reason = `These boxes do not show what DropshipHub typed: ${wrong.map((key) => FIELD_LABELS[key]).join(", ")}.`;
+      report(status, `${reason} Enter them yourself with the Copy buttons, then press Save.`, "warn");
+      return outcome("partial", reason);
+    }
+    for (const node of flags) mark(node, "#b98900");
+    return saveAddressForm({ design: "comet", form: current, values, intended, countryCandidates, stateCandidates, cityOther: cascade.cityOther === true, status });
+  }
+
+  // ---------------------------------------------------------------------------
+  // The Fusion form (next-* components): the fallback design
+  // ---------------------------------------------------------------------------
+
+  // The address search box is a next-select-auto-complete; it counts as select
+  // 1 in the measured order whether or not it also carries next-select, and its
+  // input must not be mistaken for a text box.
+  const SELECT = ".next-select, .next-select-auto-complete";
+
+  function topSelects(form) {
+    return [...form.querySelectorAll(SELECT)].filter((node) => !node.parentElement?.closest(SELECT));
+  }
+
+  function plainInputs(form) {
+    return [...form.querySelectorAll("input")].filter((input) => !NOT_TEXT.has((input.getAttribute("type") ?? "").toLowerCase()) && !input.closest(SELECT));
   }
 
   function visibleMenus() {
@@ -795,9 +1336,12 @@
     return li.getAttribute("title") || (li.textContent ?? "").trim();
   }
 
+  function selectText(select) {
+    return collapse(select?.querySelector(".next-select-values, .next-select-value")?.textContent ?? "");
+  }
+
   function selectShows(select, candidates) {
-    const shown = select.querySelector(".next-select-values, .next-select-value")?.textContent ?? "";
-    return core.matchOption([shown.trim()], candidates) !== null;
+    return core.matchOption([selectText(select)], candidates) !== null;
   }
 
   /**
@@ -826,25 +1370,6 @@
     return { title: optionTitle(option) };
   }
 
-  async function openFormIfNeeded(status) {
-    const open = addressForm();
-    if (open) return open;
-    const wrap = document.querySelector(".pl-address-item__new-btn-wrap");
-    const add = wrap ? wrap.querySelector("button, [role='button'], a") ?? wrap : null;
-    if (!add) {
-      report(status, 'Open the add-address form on this page ("Add new address"), then press Fill address again.', "warn");
-      return null;
-    }
-    const refused = guardedClick(add);
-    if (refused) {
-      report(status, `Click "Add new address" on the page yourself, then press Fill address again. (${refused})`, "warn");
-      return null;
-    }
-    const form = await waitFor(addressForm, 8000);
-    if (!form) report(status, "The add-address form did not open. Open it yourself, then press Fill address again.", "err");
-    return form;
-  }
-
   async function enterManuallyIfNeeded(form, status) {
     if (plainInputs(form).length >= 8) return form;
     const scope = form.closest("[role='dialog'], .next-dialog") ?? form;
@@ -865,7 +1390,7 @@
       return null;
     }
     const ready = await waitFor(() => {
-      const current = addressForm();
+      const current = fusionForm();
       return current && plainInputs(current).length >= 8 ? current : null;
     }, 5000);
     if (!ready) report(status, 'The street boxes did not appear after "Enter manually". Use the Copy buttons.', "warn");
@@ -890,20 +1415,14 @@
     );
   }
 
-  const FIELD_LABELS = { firstName: "First name", lastName: "Last name", phone: "Mobile number", street: "Street", unit: "Apt, suite, unit", zip: "ZIP" };
-
-  function intendedValues(values) {
-    return { firstName: values.firstName, lastName: values.lastName, phone: values.phone, street: values.street, unit: values.unit, zip: values.zip };
-  }
-
   /**
    * Stops the fill, before it changes anything, in a form that is not a new
    * address: one that already holds another address (AliExpress's edit form
    * for a saved one), or one whose "Set as default shipping address" is
    * ticked. Filling either put the customer's address over one of the
-   * merchant's saved addresses, possibly their default, as soon as they
-   * pressed Confirm. `requireBox` is set once the whole US form is showing,
-   * where the measured form has the box; before "Enter manually" it may not be
+   * merchant's saved addresses, possibly their default, as soon as it was
+   * saved. `requireBox` is set once the whole US form is showing, where the
+   * measured form has the box; before "Enter manually" it may not be
    * rendered yet.
    */
   function formRefusesFill(form, values, status, requireBox) {
@@ -928,29 +1447,9 @@
     return false;
   }
 
-  /**
-   * Whether the fill may go on to its next step. A step waits seconds for
-   * AliExpress, and meanwhile the merchant can press Cancel or the page can
-   * move on; the fill used to keep typing the customer's address into the form
-   * after the checkout holding it had been cancelled.
-   */
-  async function fillMayContinue(job, status) {
-    const answer = await ask({ type: "checkout:get" });
-    const current = answer.ok ? answer.job : null;
-    if (!current || current.stage !== "confirm" || current.purchaseOrderId !== job.purchaseOrderId || current.itemIndex !== job.itemIndex) {
-      report(status, "This checkout was cancelled or has moved on, so the fill stopped.", "warn");
-      return false;
-    }
-    if (!core.isConfirmPage(location.href)) {
-      report(status, "The page changed, so the fill stopped.", "warn");
-      return false;
-    }
-    return true;
-  }
-
-  /** The open address form while it is still the measured US form, or null with the reason reported. */
+  /** The open Fusion form while it is still the measured US form, or null with the reason reported. */
   function measuredUsForm(status, when) {
-    const form = addressForm();
+    const form = fusionForm();
     if (!form) {
       report(status, "The address form closed, so the fill stopped. Open it again and press Fill address.", "err");
       return null;
@@ -966,65 +1465,51 @@
     return form;
   }
 
-  async function fillAddress(job, values, status) {
-    clearMarks();
-    if (!core.isConfirmPage(location.href)) {
-      report(status, "Fill address works on AliExpress's checkout page only.", "err");
-      return;
-    }
-    if (job.address.countryCode !== "US") {
-      // Only the US form has been measured; other countries render other
-      // fields (Vietnam: province, district, ward) in other positions.
-      report(status, `DropshipHub can fill only AliExpress's US address form, and this order ships to ${values.country}. Use the Copy buttons to enter the address.`, "warn");
-      return;
-    }
-    if (!(await fillMayContinue(job, status))) return;
-
-    let form = await openFormIfNeeded(status);
-    if (!form) return;
+  async function fillFusionForm(job, values, status, form) {
     // Before anything in an already open form is touched, "Enter manually"
     // and the country included.
-    if (formRefusesFill(form, values, status, false)) return;
+    if (formRefusesFill(form, values, status, false)) return outcome("failed", "The form is not a new address.");
     form = await enterManuallyIfNeeded(form, status);
-    if (!form) return;
+    if (!form) return outcome("failed", 'The street boxes did not appear after "Enter manually".');
 
     // Country first: changing it re-renders every other field.
     const countryCandidates = core.countryTitleCandidates(job.address.countryCode);
     const countrySelect = topSelects(form)[0];
     if (!countrySelect) {
       report(status, "The form has no Country/region list. Use the Copy buttons.", "warn");
-      return;
+      return outcome("failed", "The form has no Country/region list.");
     }
     if (!selectShows(countrySelect, countryCandidates)) {
-      if (!(await fillMayContinue(job, status))) return;
+      if (!(await fillMayContinue(job, status))) return outcome("failed", "The checkout moved on.");
       const chosen = await chooseInSelect(countrySelect, countryCandidates[0], (titles) => core.matchOption(titles, countryCandidates), 5000);
       if (chosen.error) {
-        report(status, chosen.error === "no-option" ? `"${countryCandidates[0]}" is not in the Country/region list. Choose it yourself, then press Fill address again.` : chosen.error, "warn");
-        return;
+        const reason = chosen.error === "no-option" ? `"${countryCandidates[0]}" is not in the Country/region list.` : chosen.error;
+        report(status, `${reason} Choose it yourself, then press Fill address again.`, "warn");
+        return outcome("failed", reason);
       }
       await waitFor(() => {
-        const current = addressForm();
+        const current = fusionForm();
         const select = current ? topSelects(current)[0] : null;
         return select && selectShows(select, countryCandidates);
       }, 3000);
       await sleep(500);
-      form = addressForm();
+      form = fusionForm();
       if (!form) {
         report(status, "The address form closed while the country changed. Open it again and press Fill address.", "err");
-        return;
+        return outcome("failed", "The address form closed while the country changed.");
       }
       form = await enterManuallyIfNeeded(form, status);
-      if (!form) return;
+      if (!form) return outcome("failed", 'The street boxes did not appear after "Enter manually".');
     }
 
     form = measuredUsForm(status, "before filling anything else");
-    if (!form) return;
+    if (!form) return outcome("failed", "The form is not the measured US form.");
     // Again on the whole form: the default box is rendered by now, and a
     // country change may have brought back a saved address's values.
-    if (formRefusesFill(form, values, status, true)) return;
+    if (formRefusesFill(form, values, status, true)) return outcome("failed", "The form is not a new address.");
 
     const flags = [];
-    if (!(await fillMayContinue(job, status))) return;
+    if (!(await fillMayContinue(job, status))) return outcome("failed", "The checkout moved on.");
     // The text boxes are typed while the form is exactly the measured one.
     // What "Other" in City adds to the form has not been measured, so typing
     // them after the drop-downs could find the form changed and type nothing.
@@ -1041,27 +1526,27 @@
     if (!values.phoneMatches) flags.push(typedInto.phone);
     if (values.moved || values.streetTooShort) flags.push(typedInto.street, typedInto.unit);
 
-    if (!(await fillMayContinue(job, status))) return;
+    if (!(await fillMayContinue(job, status))) return outcome("partial", "The checkout moved on.");
     const stateCandidates = core.stateTitleCandidates(job.address.province, job.address.provinceCode);
-    const stateSelect = topSelects(addressForm() ?? form)[2];
+    const stateSelect = topSelects(fusionForm() ?? form)[2];
     const state = stateCandidates.length && stateSelect
       ? await chooseInSelect(stateSelect, stateCandidates[0], (titles) => core.matchOption(titles, stateCandidates), 5000)
       : { error: "no-option" };
+    let cityOther = false;
     if (state.error) {
       flags.push(stateSelect);
       report(status, state.error === "no-option" ? `"${values.state || job.address.province || "the state"}" is not in the State list. Choose the state and city yourself.` : state.error, "warn");
     } else {
-      if (!(await fillMayContinue(job, status))) return;
-      const citySelect = topSelects(addressForm() ?? form)[3];
+      if (!(await fillMayContinue(job, status))) return outcome("partial", "The checkout moved on.");
+      const citySelect = topSelects(fusionForm() ?? form)[3];
       let cityOk = false;
-      let cityOther = false;
       if (citySelect && values.city) {
         // The city list loads for the chosen state; the exact title is waited for.
         const city = await chooseInSelect(citySelect, values.city, (titles) => core.matchOption(titles, [values.city]), 6000);
         if (!city.error) {
           cityOk = true;
         } else if (city.error === "no-option") {
-          if (!(await fillMayContinue(job, status))) return;
+          if (!(await fillMayContinue(job, status))) return outcome("partial", "The checkout moved on.");
           if (city.search) setInputValue(city.search, "Other");
           const other = await waitFor(() => optionsFor(citySelect, city.before).find((li) => core.chooseCityOption([optionTitle(li)], values.city)?.isOther), 3000);
           // guardedClick answers null when it clicked.
@@ -1083,7 +1568,7 @@
     // position, but only while the form still has the measured 8 boxes;
     // otherwise it counts as not showing the value.
     await sleep(400);
-    const current = addressForm();
+    const current = fusionForm();
     const nowShown = current && plainInputs(current).length === 8 ? plainInputs(current) : [];
     const positions = { firstName: 0, lastName: 1, phone: 3, street: 4, unit: 5, zip: 6 };
     const boxFor = (key) => (typedInto[key]?.isConnected ? typedInto[key] : nowShown[positions[key]] ?? null);
@@ -1094,13 +1579,14 @@
       report(status, `These boxes do not show what DropshipHub typed: ${wrong.map((key) => FIELD_LABELS[key]).join(", ")}. Enter them yourself with the Copy buttons.`, "warn");
     }
     for (const node of flags) mark(node, "#b98900");
-    finishFill(status, flags, !state.error && wrong.length === 0);
+    if (state.error || wrong.length > 0 || !current) return finishFusionByHand(status, flags);
+    return saveAddressForm({ design: "fusion", form: current, values, intended, countryCandidates, stateCandidates, cityOther, status });
   }
 
-  function finishFill(status, flags, filledAll) {
-    const form = addressForm();
-    const scope = form?.closest("[role='dialog'], .next-dialog") ?? form;
-    const confirm = scope ? [...scope.querySelectorAll("button")].find((b) => /^(confirm|xác nhận)$/i.test((b.textContent ?? "").trim())) : null;
+  /** A Fusion fill that could not be verified: the merchant checks and presses Confirm. */
+  function finishFusionByHand(status, flags) {
+    const form = fusionForm();
+    const confirm = fusionConfirmButton(form);
     if (confirm) {
       mark(confirm, "#2c6ecb");
       confirm.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -1116,11 +1602,114 @@
     } else if (box === "missing") {
       boxLine = 'DropshipHub could not read "Set as default shipping address". Make sure it is unticked before you press Confirm.';
     }
-    report(
-      status,
-      `${filledAll ? "Address filled." : "Address partly filled."} Check every field against the address above${flags.some(Boolean) ? ", especially the highlighted ones" : ""}, then press Confirm on AliExpress yourself. ${boxLine}`,
-      filledAll && !flags.some(Boolean) && box === "unticked" ? "ok" : "warn",
-    );
+    const reason = "Address partly filled.";
+    report(status, `${reason} Check every field against the address${flags.some(Boolean) ? ", especially the highlighted ones" : ""}, then press Confirm on AliExpress yourself. ${boxLine}`, "warn");
+    return outcome("partial", reason);
+  }
+
+  function fusionConfirmButton(form) {
+    const scope = form?.closest("[role='dialog'], .next-dialog") ?? form;
+    return scope ? [...scope.querySelectorAll("button")].find((b) => /^(confirm|xác nhận)$/i.test(collapse(b.textContent))) ?? null : null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Saving the address: the one verified exception to the click guard
+  // ---------------------------------------------------------------------------
+
+  function describeButton(node) {
+    return node ? { ...describeElement(node, false), disabled: node.disabled === true } : null;
+  }
+
+  /** What saveButtonRefusal judges, read from the comet form as it is now. */
+  function cometSaveSnapshot(form, values, intended, countryCandidates, stateCandidates, cityOther) {
+    const inputs = cometInputs(form);
+    const value = (index) => inputs[index]?.value ?? "";
+    const button = cometScope(form).querySelector("button.form-button-confirm");
+    return {
+      design: "comet",
+      boxes: core.COMET_TEXT_BOXES.map(value),
+      intended,
+      actual: Object.fromEntries(Object.entries(core.COMET_TYPED).map(([key, index]) => [key, value(index)])),
+      country: { shown: value(COMET.country), candidates: countryCandidates },
+      state: { shown: value(COMET.state), candidates: stateCandidates },
+      city: { shown: value(COMET.city), wanted: values.city, otherAccepted: cityOther },
+      defaultSwitch: cometSwitchState(form),
+      button: describeButton(button),
+      node: button,
+      boxNodes: core.COMET_TEXT_BOXES.map((index) => inputs[index]),
+    };
+  }
+
+  /** The same, for the Fusion form. */
+  function fusionSaveSnapshot(form, values, intended, countryCandidates, stateCandidates, cityOther) {
+    const inputs = plainInputs(form);
+    const selects = topSelects(form);
+    const positions = { firstName: 0, lastName: 1, phone: 3, street: 4, unit: 5, zip: 6 };
+    const box = readDefaultBox(defaultBoxNodes(form));
+    const button = fusionConfirmButton(form);
+    return {
+      design: "fusion",
+      boxes: inputs.map((input) => input.value),
+      intended,
+      actual: Object.fromEntries(Object.entries(positions).map(([key, index]) => [key, inputs[index]?.value ?? ""])),
+      country: { shown: selectText(selects[0]), candidates: countryCandidates },
+      state: { shown: selectText(selects[2]), candidates: stateCandidates },
+      city: { shown: selectText(selects[3]), wanted: values.city, otherAccepted: cityOther },
+      defaultSwitch: box === "unticked" ? "off" : box === "ticked" ? "on" : "missing",
+      button: describeButton(button),
+      node: button,
+      boxNodes: inputs,
+    };
+  }
+
+  /**
+   * Saves the add-new-address form: Save (comet) or Confirm (Fusion). This
+   * is the ONE place that clicks a commit control, and it does so only when
+   * core.saveButtonRefusal finds every box holding exactly what was typed (so
+   * the form is a new address, not a saved one being edited), State and City
+   * showing the customer's (or City "Other" with the merchant told), the
+   * country the United States, and "Set as default" off. Anything else
+   * highlights the form and asks the merchant to check and save themselves.
+   * After the click it waits for the drawer to close and the page's address
+   * block to show the customer's name and house number.
+   */
+  async function saveAddressForm({ design, form, values, intended, countryCandidates, stateCandidates, cityOther, status }) {
+    const snapshot = design === "comet"
+      ? cometSaveSnapshot(form, values, intended, countryCandidates, stateCandidates, cityOther)
+      : fusionSaveSnapshot(form, values, intended, countryCandidates, stateCandidates, cityOther);
+    const saveWord = design === "comet" ? "Save" : "Confirm";
+    const refusal = core.saveButtonRefusal(snapshot);
+    if (refusal) {
+      for (const node of snapshot.boxNodes) mark(node, "#b98900");
+      if (snapshot.node) mark(snapshot.node, "#2c6ecb");
+      const reason = `Not saved by DropshipHub: ${refusal}`;
+      report(status, `${reason} Check the highlighted boxes against the customer's address, then press ${saveWord} yourself.`, "warn");
+      return outcome("partial", reason);
+    }
+    report(status, "Every box reads back as intended. Saving the address…");
+    const button = snapshot.node;
+    for (const type of ["mousedown", "mouseup"]) {
+      button.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 }));
+    }
+    button.click();
+
+    const shown = await waitFor(() => {
+      if (addressFormOf(design)) return null;
+      const block = document.querySelector(".pl-address-item-container");
+      return block && core.addressBlockShows(block.textContent, values) ? block : null;
+    }, 10000);
+    if (shown) {
+      report(status, "Address set. Check the total, then press Pay now on AliExpress yourself.", "ok");
+      return outcome("set", "Address set.");
+    }
+    if (addressFormOf(design)) {
+      const reason = `AliExpress did not accept the address: the form is still open after ${saveWord}.`;
+      report(status, `${reason} Read AliExpress's message on the form, correct the box it names, then press ${saveWord} yourself.`, "warn");
+      return outcome("partial", reason);
+    }
+    const reason = "The form closed, but the page's address block does not show the customer's name and house number yet.";
+    report(status, `${reason} Check the address shown on the page before you pay; press Fill address again if it is not the customer's.`, "warn");
+    return outcome("partial", reason);
   }
 
   // ---------------------------------------------------------------------------
@@ -1142,6 +1731,8 @@
     } else if (job.stage === "confirm") {
       if (core.isConfirmPage(url)) renderConfirm(job);
       else renderRecordOnly(job);
+    } else if (job.stage === "paying") {
+      renderPaying(job);
     } else if (job.stage === "recorded") {
       renderRecorded(job);
     } else {

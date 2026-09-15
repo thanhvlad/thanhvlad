@@ -379,10 +379,297 @@ describe("money", () => {
     expect(core.compareTotals(expected, "US $9.20").kind).toBe("close");
     expect(core.compareTotals(expected, "US $15.00").kind).toBe("higher");
     expect(core.compareTotals(expected, "US $5.00").kind).toBe("lower");
-    expect(core.compareTotals(expected, "₫236.000")).toEqual({ kind: "other-currency", page: { amount: 236000, currency: "VND" } });
+    expect(core.compareTotals(expected, "₫236.000")).toEqual({ kind: "other-currency", page: { amount: 236000, currency: "VND" }, expectations: [expected] });
     expect(core.compareTotals(expected, "42").kind).toBe("other-currency");
     expect(core.compareTotals(expected, "")).toEqual({ kind: "unreadable", page: null });
     expect(core.compareTotals(null, "US $1").kind).toBe("no-expectation");
+    expect(core.compareTotals([], "US $1").kind).toBe("no-expectation");
+  });
+
+  it("compares the page's total with the estimate in the page's currency, and shows both when neither shares it", () => {
+    // The measured account: captured in VND, converted to the shop's USD, charged in USD.
+    const job = { currency: "VND", expectedTotal: "1724188", shopCurrency: "USD", shopExpectedTotal: "66.10", itemIndex: 0, items: [{ unitCost: "1724188", quantity: 1, currency: "VND" }] };
+    expect(core.expectedCosts(job)).toEqual([
+      { amount: 1724188, currency: "VND", scope: "order" },
+      { amount: 66.1, currency: "USD", scope: "order" },
+    ]);
+    expect(core.compareTotals(core.expectedCosts(job), "Total$93.62")).toMatchObject({ kind: "higher", page: { amount: 93.62, currency: "USD" }, expected: { currency: "USD" } });
+    expect(core.compareTotals(core.expectedCosts(job), "Total ₫1.724.188").kind).toBe("close");
+    const verdict = core.compareTotals(core.expectedCosts(job), "Total €50.00");
+    expect(verdict.kind).toBe("other-currency");
+    expect(verdict.expectations).toHaveLength(2);
+    // No shop estimate on record, and none with several items (each item is its own checkout).
+    expect(core.expectedCosts({ ...job, shopExpectedTotal: null })).toHaveLength(1);
+    expect(core.expectedCosts({ ...job, shopCurrency: "usd" })).toHaveLength(1);
+    expect(core.expectedCosts({ ...job, items: [job.items[0], { unitCost: "1", quantity: 1, currency: "VND" }] })).toEqual([{ amount: 1724188, currency: "VND", scope: "item" }]);
+  });
+
+  it("reads the confirm page's real total, with the subtotal only when the rows add up", () => {
+    const rows = [
+      { label: "Subtotal", text: "Subtotal $85.89" },
+      { label: "Promo codes", text: "Promo codes -$0.00" },
+      { label: "Shipping fee", text: "Shipping fee $2.99" },
+      { label: "Additional charges", text: "Additional charges $4.74" },
+    ];
+    expect(core.quoteFromPage({ totalText: "Total$93.62", rows })).toEqual({ currency: "USD", total: 93.62, subtotal: 85.89, shipping: 2.99, charges: 4.74 });
+    // A promo code: the subtotal no longer adds up and is left out, so the app takes goods = total - shipping - charges.
+    expect(core.quoteFromPage({ totalText: "Total$83.62", rows: [...rows, { label: "Promo codes", text: "-$10.00" }] })).toEqual({ currency: "USD", total: 83.62, shipping: 2.99, charges: 4.74 });
+    expect(core.quoteFromPage({ totalText: "Total ₫2.861.602", rows: [] })).toEqual({ currency: "VND", total: 2861602, shipping: 0, charges: 0 });
+    expect(core.quoteFromPage({ totalText: "Total 42", rows })).toBeNull();
+    expect(core.quoteFromPage({ totalText: "", rows })).toBeNull();
+    expect(core.quoteFromPage(null)).toBeNull();
+  });
+
+  it("sums the items' quotes for the purchase order and builds the app's body", () => {
+    const a = { currency: "USD", total: 93.62, subtotal: 85.89, shipping: 2.99, charges: 4.74, sent: true };
+    const b = { currency: "USD", total: 10, shipping: 1, charges: 0 };
+    expect(core.sumQuotes([a, null])).toEqual({ currency: "USD", total: 93.62, shipping: 2.99, charges: 4.74, subtotal: 85.89 });
+    expect(core.sumQuotes([a, b])).toEqual({ currency: "USD", total: 103.62, shipping: 3.99, charges: 4.74 });
+    expect(core.sumQuotes([a, { ...b, currency: "VND" }])).toBeNull();
+    expect(core.sumQuotes([null, null])).toBeNull();
+    expect(core.quoteBody(core.sumQuotes([a]))).toEqual({ currency: "USD", total: "93.62", subtotal: "85.89", shipping: "2.99", charges: "4.74", source: "confirm" });
+    expect(core.quoteBody(b)).toEqual({ currency: "USD", total: "10.00", shipping: "1.00", charges: "0.00", source: "confirm" });
+    expect(core.quoteBody(null)).toBeNull();
+    expect(core.validQuote({ currency: "USD", total: -1 })).toBe(false);
+    expect(core.validQuote({ currency: "usd", total: 1 })).toBe(false);
+    expect(core.validQuote({ currency: "USD", total: 1, shipping: NaN })).toBe(false);
+    expect(core.validQuote({ currency: "USD", total: 0 })).toBe(true);
+  });
+});
+
+describe("the comet address form (aliexpress.us, English)", () => {
+  const US = core.countryTitleCandidates("US");
+  const cometInputs = () => [
+    { type: "text", role: "", value: "United States" },
+    { type: "text", role: "", value: "" },
+    { type: "text", role: "", value: "" },
+    { type: "text", role: "", value: "+1" },
+    { type: "text", role: "", value: "" },
+    { type: "text", role: "combobox", value: "" },
+    { type: "text", role: "", value: "" },
+    { type: "text", role: "", value: "" },
+    { type: "text", role: "", value: "" },
+    { type: "text", role: "", value: "" },
+    { type: "text", role: "", value: "" },
+    { type: "text", role: "", value: "" },
+  ];
+
+  it("locates fields by the measured positions", () => {
+    expect(core.COMET_POSITIONS).toMatchObject({ country: 0, firstName: 1, lastName: 2, dialCode: 3, phone: 4, search: 5, street: 6, unit: 7, state: 8, city: 9, zip: 10, instructions: 11, count: 12 });
+    expect(core.COMET_TYPED).toEqual({ firstName: 1, lastName: 2, phone: 4, street: 6, unit: 7, zip: 10 });
+    expect(core.COMET_TEXT_BOXES).toEqual([1, 2, 4, 6, 7, 10, 11]);
+  });
+
+  it("accepts the measured twelve-box US form and stops for anything else", () => {
+    expect(core.cometFormStructure({ inputs: cometInputs() }, US)).toEqual({ ok: true, dialCode: "+1" });
+
+    expect(core.cometFormStructure({ inputs: cometInputs().slice(0, 6) }, US).reason).toMatch(/6 boxes, not the 12/);
+    const otherCountry = cometInputs();
+    otherCountry[0].value = "Vietnam";
+    expect(core.cometFormStructure({ inputs: otherCountry }, US)).toMatchObject({ ok: false, countryMismatch: true });
+    expect(core.cometFormStructure({ inputs: otherCountry }, US).reason).toMatch(/"Vietnam", not the United States/);
+    const otherDial = cometInputs();
+    otherDial[3].value = "+84";
+    expect(core.cometFormStructure({ inputs: otherDial }, US).reason).toMatch(/\+84/);
+    const noSearch = cometInputs();
+    noSearch[5].role = "";
+    expect(core.cometFormStructure({ inputs: noSearch }, US).ok).toBe(false);
+    const checkbox = cometInputs();
+    checkbox[11].type = "checkbox";
+    expect(core.cometFormStructure({ inputs: checkbox }, US).reason).toMatch(/Box 12 is not a text box/);
+    expect(core.cometFormStructure(null, US).ok).toBe(false);
+  });
+
+  it("chooses a state from the cascade list with its letter headers skipped, and a city or Other", () => {
+    const states = ["A", "Alabama", "Alaska", "T", "Tennessee", "Texas", "W", "Wyoming"];
+    expect(core.cascadeLabels(states)).toEqual(["Alabama", "Alaska", "Tennessee", "Texas", "Wyoming"]);
+    expect(core.chooseCascadeOption(states, core.stateTitleCandidates("Texas", "TX"))).toBe("Texas");
+    expect(core.chooseCascadeOption(states, ["T"])).toBeNull();
+    expect(core.chooseCascadeOption(states, ["Ontario"])).toBeNull();
+    const cities = ["Abbott", "Austin", "Zavalla", "Other"];
+    expect(core.chooseCascadeCity(cities, "austin")).toEqual({ label: "Austin", isOther: false });
+    expect(core.chooseCascadeCity(cities, "Nowhere Springs")).toEqual({ label: "Other", isOther: true });
+    expect(core.chooseCascadeCity(["Abbott"], "Nowhere Springs")).toBeNull();
+    expect(core.chooseCascadeCity(cities, "")).toEqual({ label: "Other", isOther: true });
+  });
+
+  it("recognises the customer's address in the page's block by last name and house number", () => {
+    const values = { firstName: "Test", lastName: "Customer", street: "12345 Northwest Evergreen Parkway" };
+    expect(core.streetKey(values.street)).toBe("12345 Northwest");
+    expect(core.addressBlockShows("Test Customer +1 512-555-0100 12345 Northwest Evergreen Parkway, Suite 400, Austin, Texas, 78701, United States Change", values)).toBe(true);
+    expect(core.addressBlockShows("Merchant Owner 1 Main St, Austin, Texas Change", values)).toBe(false);
+    expect(core.addressBlockShows("Test Customer 99 Elsewhere Rd", values)).toBe(false);
+    expect(core.addressBlockShows("", values)).toBe(false);
+    expect(core.addressBlockShows("Cher 1 Main St", { firstName: "Cher", lastName: "", street: "1 Main St" })).toBe(true);
+    expect(core.addressBlockShows("Test Customer 12345 Northwest", { lastName: "Customer", street: "" })).toBe(false);
+  });
+
+  describe("saveButtonRefusal - the one verified exception to the click guard", () => {
+    const intended = { firstName: "Test", lastName: "Customer", phone: "5125550100", street: "12345 Northwest Evergreen Parkway", unit: "Suite 400, Bldg B", zip: "78701" };
+    const good = () => ({
+      design: "comet",
+      boxes: ["Test", "Customer", "5125550100", "12345 Northwest Evergreen Parkway", "Suite 400, Bldg B", "78701", ""],
+      intended,
+      actual: { ...intended },
+      country: { shown: "United States", candidates: US },
+      state: { shown: "Texas", candidates: ["Texas"] },
+      city: { shown: "Austin", wanted: "Austin", otherAccepted: false },
+      defaultSwitch: "off",
+      button: { tag: "BUTTON", type: "button", text: "Save", classes: ["form-button-confirm", "comet-btn"], ancestorClasses: ["deliver-address-wrap", "comet-drawer-body"], inForm: false, disabled: false },
+    });
+
+    it("allows Save only when everything reads back as intended", () => {
+      expect(core.saveButtonRefusal(good())).toBeNull();
+      expect(core.saveButtonRefusal({ ...good(), city: { shown: "Other", wanted: "Nowhere Springs", otherAccepted: true } })).toBeNull();
+      expect(core.saveButtonRefusal({ ...good(), button: { ...good().button, text: "Lưu" } })).toBeNull();
+    });
+
+    it.each([
+      ["a value the extension did not type", { boxes: ["Test", "Customer", "5125550100", "1 Main St", "", "78701", ""] }, /did not type/],
+      ["a delivery instruction it did not type", { boxes: [...good().boxes.slice(0, 6), "Leave at door"] }, /did not type/],
+      ["a typed box that reads back differently", { actual: { ...intended, zip: "" } }, /zip/],
+      ["another country", { country: { shown: "Canada", candidates: US } }, /not the United States/],
+      ["another state", { state: { shown: "Alabama", candidates: ["Texas"] } }, /State/],
+      ["another city", { city: { shown: "Austintown", wanted: "Austin", otherAccepted: false } }, /City/],
+      ["City Other without the merchant told", { city: { shown: "Other", wanted: "Austin", otherAccepted: false } }, /City/],
+      ["the default switch on", { defaultSwitch: "on" }, /Set as default/],
+      ["the default switch missing", { defaultSwitch: "missing" }, /Set as default/],
+      ["no button", { button: null }, /not found/],
+      ["a submit button", { button: { ...good().button, type: "submit" } }, /submit/],
+      ["an untyped button inside a form", { button: { ...good().button, type: null, inForm: true } }, /submit/],
+      ["a disabled button", { button: { ...good().button, disabled: true } }, /disabled/],
+      ["a button that is not Save", { button: { ...good().button, text: "Confirm" } }, /not Save/],
+      ["Pay now", { button: { ...good().button, text: "Pay now" } }, /not Save/],
+      ["a button without the form's Save class", { button: { ...good().button, classes: ["comet-btn"] } }, /not the address form's Save/],
+      ["a Save inside the Place order box", { button: { ...good().button, ancestorClasses: ["pl-order-toal-container__btn-box"] } }, /Place order or payment/],
+      ["a Save inside a payment area", { button: { ...good().button, ancestorClasses: ["placeorder-page-payment-container"] } }, /Place order or payment/],
+      ["a design that was never measured", { design: "unknown" }, /design/],
+      ["nothing typed", { intended: {} }, /Nothing was typed/],
+    ])("refuses %s", (_name, overrides, pattern) => {
+      expect(core.saveButtonRefusal({ ...good(), ...overrides })).toMatch(pattern);
+    });
+
+    it("judges the Fusion form's Confirm the same way", () => {
+      const fusion = {
+        ...good(),
+        design: "fusion",
+        boxes: ["Test", "Customer", "+1", "5125550100", "12345 Northwest Evergreen Parkway", "Suite 400, Bldg B", "78701", ""],
+        button: { tag: "BUTTON", type: "button", text: "Confirm", classes: ["next-btn", "next-btn-primary"], ancestorClasses: ["next-dialog-footer"], inForm: false, disabled: false },
+      };
+      expect(core.saveButtonRefusal(fusion)).toBeNull();
+      expect(core.saveButtonRefusal({ ...fusion, button: { ...fusion.button, text: "Xác nhận" } })).toBeNull();
+      expect(core.saveButtonRefusal({ ...fusion, button: { ...fusion.button, text: "Save" } })).toMatch(/not Confirm/);
+      expect(core.saveButtonRefusal({ ...fusion, defaultSwitch: "on" })).toMatch(/Set as default/);
+      expect(core.saveButtonRefusal(null)).toMatch(/Nothing/);
+    });
+  });
+});
+
+describe("the automatic fill's bookkeeping", () => {
+  it("runs once per item, again only when a recorded set is no longer shown, never after a stop", () => {
+    const job = { stage: "confirm", itemIndex: 0, fill: null };
+    expect(core.shouldAutoFill(job, false)).toBe(true);
+    expect(core.shouldAutoFill(job, true)).toBe(false);
+    expect(core.shouldAutoFill({ ...job, fill: { itemIndex: 0, result: "set" } }, false)).toBe(true);
+    expect(core.shouldAutoFill({ ...job, fill: { itemIndex: 0, result: "partial", reason: "x" } }, false)).toBe(false);
+    expect(core.shouldAutoFill({ ...job, fill: { itemIndex: 0, result: "failed", reason: "x" } }, false)).toBe(false);
+    // A record for another item does not count.
+    expect(core.shouldAutoFill({ ...job, itemIndex: 1, fill: { itemIndex: 0, result: "failed" } }, false)).toBe(true);
+    expect(core.shouldAutoFill({ ...job, stage: "paying" }, false)).toBe(false);
+    expect(core.fillOutcomeFor({ itemIndex: 1, fill: { itemIndex: 0, result: "set" } })).toBeNull();
+    expect(core.fillOutcomeFor({ itemIndex: 0, fill: { itemIndex: 0, result: "set" } })).toEqual({ itemIndex: 0, result: "set" });
+  });
+});
+
+describe("the AliExpress orders list, order detail and tracking pages", () => {
+  it("recognises the pages", () => {
+    expect(core.isOrdersPage("https://www.aliexpress.us/p/order/index.html")).toBe(true);
+    expect(core.isOrdersPage("https://www.aliexpress.com/p/order/detail.html?orderId=8190000000000001")).toBe(true);
+    expect(core.isOrderDetailPage("https://www.aliexpress.com/p/order/detail.html?orderId=8190000000000001")).toBe(true);
+    expect(core.isOrderDetailPage("https://www.aliexpress.us/p/order/index.html")).toBe(false);
+    expect(core.isTrackingPage("https://www.aliexpress.com/p/tracking/index.html?tradeOrderId=8190000000000001")).toBe(true);
+    expect(core.isOrdersPage("https://evil.example/p/order/index.html")).toBe(false);
+    expect(core.isTrackingPage("https://www.aliexpress.com/p/order/index.html")).toBe(false);
+    expect(core.ordersPageUrl("https://www.aliexpress.us")).toBe("https://www.aliexpress.us/p/order/index.html");
+    expect(core.ordersPageUrl("https://evil.example")).toBeNull();
+    expect(core.ordersPageUrl("http://www.aliexpress.us")).toBeNull();
+  });
+
+  it("reads a status phrase as a whole word, even glued to the next element's text", () => {
+    expect(core.orderStatusFromText("Awaiting deliveryDate: Sep 15, 2026Ref. Number: 8190")).toBe("Awaiting delivery");
+    expect(core.orderStatusFromText("To payDate: Sep 15")).toBe("To pay");
+    expect(core.orderStatusFromText("Order unpaid")).toBe("");
+    expect(core.orderStatusFromText("Paid on: Sep 15")).toBe("Paid");
+    expect(core.orderStatusFromText("Completed")).toBe("Completed");
+    expect(core.orderStatusFromText("")).toBe("");
+    expect(core.orderStatusFromText(null)).toBe("");
+  });
+
+  it("parses an order card into ids, SKU text, status, total and date, and nothing else", () => {
+    const card = core.parseOrderCard({
+      detailsHref: "https://www.aliexpress.com/p/order/detail.html?orderId=8190000000000001&spm=x",
+      productHrefs: ["https://www.aliexpress.us/item/3256809840464144.html?x=1", "https://www.aliexpress.us/item/3256809840464144.html", "/item/1005006001.html"],
+      statusText: "",
+      skuText: "  Play blue light ",
+      cardText: "Awaiting deliveryDate: Sep 15, 2026Ref. Number: 8190000000000001 Details Smart glasses Play blue light x1 Total:$93.62Confirm receivedTrack status",
+    });
+    expect(card).toEqual({
+      orderId: "8190000000000001",
+      productIds: ["3256809840464144", "1005010026778896", "1005006001"],
+      skuText: "Play blue light",
+      status: "Awaiting delivery",
+      total: "$93.62",
+      date: "Sep 15, 2026",
+    });
+    // The card's own status element wins over the text scan.
+    expect(core.parseOrderCard({ detailsHref: "?orderId=8190000000000001", productHrefs: [], statusText: " To pay ", cardText: "" })).toMatchObject({ status: "To pay", total: "", date: "", productIds: [] });
+    expect(core.parseOrderCard({ detailsHref: "?orderId=123", productHrefs: [], cardText: "" })).toBeNull();
+    expect(core.parseOrderCard({ detailsHref: "", productHrefs: [], cardText: "" })).toBeNull();
+    expect(core.parseOrderCard(null)).toBeNull();
+    expect(core.orderIdFromHref("https://www.aliexpress.com/p/order/detail.html?orderId=8190000000000001")).toBe("8190000000000001");
+    expect(core.orderIdFromHref("?orderId=81900000000000019999999999")).toBeNull();
+    expect(core.productIdsFromHrefs(["/item/3256809840464144.html"])).toEqual(["3256809840464144", "1005010026778896"]);
+    expect(core.productIdsFromHrefs(["/item/abc.html", null])).toEqual([]);
+  });
+
+  it("parses the order detail page and the tracking page", () => {
+    expect(core.parseOrderDetail({ url: "https://www.aliexpress.com/p/order/detail.html?orderId=8190000000000001", refNumberText: "Ref. Number: 8190000000000001 Copy", statusText: " Awaiting delivery ", productHrefs: ["/item/1005006001.html"] })).toEqual({
+      orderId: "8190000000000001",
+      productIds: ["1005006001"],
+      skuText: "",
+      status: "Awaiting delivery",
+      total: "",
+      date: "",
+    });
+    expect(core.parseOrderDetail({ url: "https://www.aliexpress.com/p/order/detail.html", refNumberText: "Ref. Number: 8190000000000002 Copy", statusText: "Closed" })).toMatchObject({ orderId: "8190000000000002", status: "Closed" });
+    expect(core.parseOrderDetail({ url: "https://www.aliexpress.com/p/order/detail.html", refNumberText: "", statusText: "" })).toBeNull();
+
+    expect(core.parseTrackingPage({ url: "https://www.aliexpress.com/p/tracking/index.html?tradeOrderId=8190000000000001", carrierText: " AliExpress Selection Standard Fast for Special Goods ", mailNoText: " SWX000000000000000001 " })).toEqual({
+      tradeOrderId: "8190000000000001",
+      trackingNumber: "SWX000000000000000001",
+      carrier: "AliExpress Selection Standard Fast for Special Goods",
+    });
+    expect(core.parseTrackingPage({ url: "https://www.aliexpress.com/p/tracking/index.html?tradeOrderId=8190000000000001", carrierText: "", mailNoText: "no number yet" })).toBeNull();
+    expect(core.parseTrackingPage({ url: "https://www.aliexpress.com/p/tracking/index.html", carrierText: "", mailNoText: "SWX000000000000000001" })).toBeNull();
+    expect(core.parseTrackingPage(null)).toBeNull();
+  });
+
+  it("builds the sync body from well-formed orders only, capped at 100", () => {
+    const orders = Array.from({ length: 120 }, (_, i) => ({ orderId: String(8190000000000000 + i), productIds: ["1005006001", "x"], skuText: "Black", status: "To pay", total: "$1", date: "Sep 15" }));
+    const body = core.ordersSyncBody([...orders, { orderId: "123" }, null]);
+    expect(body.orders).toHaveLength(100);
+    expect(body.orders[0]).toEqual({ orderId: "8190000000000000", productIds: ["1005006001"], skuText: "Black", status: "To pay", total: "$1", date: "Sep 15" });
+    expect(core.ordersSyncBody([{ orderId: "123" }])).toBeNull();
+    expect(core.ordersSyncBody(null)).toBeNull();
+  });
+
+  it("describes each sync result in one line", () => {
+    expect(core.describeSyncResult({ orderId: "8190000000000001", result: "recorded", orderName: "#21047" })).toBe("#21047 recorded as AliExpress order 8190000000000001.");
+    expect(core.describeSyncResult({ orderId: "8190000000000001", result: "already", orderName: "#21047", closed: true })).toMatch(/closed on AliExpress/);
+    expect(core.describeSyncResult({ orderId: "8190000000000001", result: "advanced", orderName: "#21047", status: "SHIPPED" })).toBe("#21047 (AliExpress order 8190000000000001) is now shipped.");
+    expect(core.describeSyncResult({ orderId: "8190000000000001", result: "ambiguous", candidates: [{ orderName: "#1" }, { orderName: "#2" }] })).toMatch(/#1, #2/);
+    expect(core.describeSyncResult({ orderId: "8190000000000001", result: "unmatched" })).toBe("AliExpress order 8190000000000001: no DropshipHub order matched.");
+    expect(core.describeSyncResult({ orderId: "8190000000000001", error: "boom" })).toBe("AliExpress order 8190000000000001: boom.");
   });
 });
 
@@ -394,6 +681,14 @@ describe("clickRefusal - the one guard every programmatic click passes", () => {
     cityOption: { tag: "LI", role: "option", title: "Payson", text: "Payson", ancestorClasses: ["next-select-menu"] },
     otherOption: { tag: "LI", role: "option", title: "Other", text: "Other", ancestorClasses: ["next-select-menu", "display-flex"] },
     countryOption: { tag: "LI", role: "option", title: "United States", text: "United States", ancestorClasses: ["next-select-menu"] },
+    // The comet drawer and cascade modal (measured 2026-09-15).
+    changeLink: { tag: "A", classes: [], ancestorClasses: ["pl-address-item__arrrow", "pl-address-item-container"], text: "Change", inForm: false },
+    cometAddAddress: { tag: "BUTTON", type: "button", classes: ["comet-btn", "comet-btn-primary", "add-address"], ancestorClasses: ["comet-drawer-body", "comet-drawer", "pl-address-model-cls"], text: "Add new address", inForm: false },
+    cometEnterManually: { tag: "DIV", classes: ["text-button-container"], ancestorClasses: ["deliver-address-form", "mt-form", "deliver-address-wrap"], text: "Enter manually", inForm: false },
+    cometStateBox: { tag: "INPUT", type: "text", classes: ["one-textinput"], ancestorClasses: ["default-select-wrap", "mt-form-item", "deliver-address-form"], inForm: false },
+    cascadeState: { tag: "DIV", classes: ["group-item"], ancestorClasses: ["drawer-cascade-list", "drawer-list-wrap", "mt-drawer-modal", "mt-modal", "mt-modal--bottom"], text: "Texas" },
+    cascadeCityOther: { tag: "DIV", classes: ["group-item"], ancestorClasses: ["drawer-cascade-list", "mt-drawer-modal"], text: "Other" },
+    cascadeClose: { tag: "SPAN", classes: ["mt-icon-close"], ancestorClasses: ["drawer-cascade-header", "mt-drawer-modal"], text: "" },
   };
 
   it.each(Object.entries(allowed))("allows %s", (_name, descriptor) => {
@@ -424,6 +719,19 @@ describe("clickRefusal - the one guard every programmatic click passes", () => {
     payVi: { tag: "DIV", text: "Thanh toán" },
     ariaLabelled: { tag: "DIV", ariaLabel: "Place order" },
     containerOfForbidden: { tag: "DIV", classes: ["pl-block-container"], containsForbidden: true },
+    // The comet drawer and page (measured 2026-09-15).
+    payNowButton: { tag: "BUTTON", type: "button", classes: ["comet-btn", "comet-btn-primary", "place-order-primary-btn"], text: "Pay now" },
+    cometSave: { tag: "BUTTON", type: "button", classes: ["comet-btn", "form-button-confirm"], ancestorClasses: ["deliver-address-wrap"], text: "Save" },
+    cometSaveVi: { tag: "BUTTON", type: "button", classes: ["form-button-confirm"], text: "Lưu" },
+    defaultSwitch: { tag: "DIV", classes: ["mt-switch", "switcher"], ancestorClasses: ["deliver-address-wrap"], text: "" },
+    defaultSwitchKnob: { tag: "DIV", classes: ["mt-switch-knob"], ancestorClasses: ["mt-switch", "switcher"], text: "" },
+    addressRadioLabel: { tag: "LABEL", classes: ["comet-radio", "comet-radio-checked"], ancestorClasses: ["ae-address-item-wrapper", "cm-address-list"], text: "" },
+    addressRadioInput: { tag: "INPUT", type: "radio", classes: ["comet-radio-input"] },
+    addressEdit: { tag: "SPAN", classes: ["ae-address-item-edit-btn"], ancestorClasses: ["ae-address-item-wrapper"], text: "" },
+    addressDelete: { tag: "I", classes: ["comet-icon"], ancestorClasses: ["ae-address-item-delete-btn", "ae-address-item-wrapper"], text: "" },
+    paymentChange: { tag: "BUTTON", type: "button", classes: ["comet-btn-link", "chosen-channel--chosen-channel-change-btn"], ancestorClasses: ["placeorder-page-payment-container"], text: "Change" },
+    quantityPlus: { tag: "SPAN", classes: ["comet-input-number-handler"], ancestorClasses: ["comet-input-number"], text: "+" },
+    couponRow: { tag: "DIV", classes: ["pl-coupon-item"], text: "Apply" },
   };
 
   it.each(Object.entries(refused))("refuses %s", (_name, descriptor) => {

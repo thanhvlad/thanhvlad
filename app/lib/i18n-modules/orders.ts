@@ -79,6 +79,11 @@ export const en = {
   "orders.placement.listBannerTitle": "{n} supplier order(s) are waiting to be placed with the Chrome extension",
   "orders.placement.listBannerBody": "They are priced but not ordered. The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.",
   "orders.placement.setUpExtension": "Set up the extension",
+  "orders.placement.orderWithExtension": "Order on AliExpress with the extension",
+  "orders.placement.extensionOpening": "Opening the checkout on AliExpress…",
+  "orders.placement.extensionStarted": "The checkout opened in a new tab: the address is filled in for you, and you press Pay now there. The order number is recorded when you open your AliExpress orders.",
+  "orders.placement.extensionMissing": "The DropshipHub extension is not installed, or it has no access to this site. Open the extension's popup once and press Allow access, or set it up:",
+  "orders.placement.extensionError": "The extension could not start the checkout: {error}",
   "orders.placement.paymentsBannerTitle": "{n} more supplier order(s) must be placed with the Chrome extension before they can be paid",
   "orders.placement.paymentsBannerBody": "They are not in this queue because they do not exist at the supplier yet. The Chrome extension lists the orders waiting to be placed and opens each product on AliExpress. You place and pay for the order there, then record the AliExpress order number in the extension; tracking you add there is sent to Shopify.",
 
@@ -176,6 +181,11 @@ export const vi: Partial<Record<keyof typeof en, string>> = {
   "orders.placement.listBannerTitle": "{n} đơn nhà cung cấp đang chờ đặt qua tiện ích Chrome",
   "orders.placement.listBannerBody": "Các đơn này đã có giá nhưng chưa được đặt. Tiện ích Chrome liệt kê các đơn đang chờ đặt và mở từng sản phẩm trên AliExpress. Bạn tự đặt và thanh toán đơn ở đó, rồi ghi lại mã đơn AliExpress trong tiện ích; mã vận đơn bạn thêm ở đó sẽ được gửi sang Shopify.",
   "orders.placement.setUpExtension": "Cài tiện ích",
+  "orders.placement.orderWithExtension": "Đặt trên AliExpress bằng extension",
+  "orders.placement.extensionOpening": "Đang mở trang thanh toán trên AliExpress…",
+  "orders.placement.extensionStarted": "Trang thanh toán đã mở ở thẻ mới: địa chỉ được điền sẵn, bạn chỉ bấm Pay now ở đó. Mã đơn được ghi lại khi bạn mở danh sách đơn AliExpress.",
+  "orders.placement.extensionMissing": "Extension DropshipHub chưa được cài, hoặc chưa được cấp quyền truy cập trang này. Mở popup của extension một lần và bấm Allow access, hoặc cài đặt:",
+  "orders.placement.extensionError": "Extension không mở được trang thanh toán: {error}",
   "orders.placement.paymentsBannerTitle": "Còn {n} đơn nhà cung cấp phải đặt qua tiện ích Chrome trước khi thanh toán được",
   "orders.placement.paymentsBannerBody": "Các đơn này không nằm trong danh sách vì chưa hề tồn tại bên nhà cung cấp. Tiện ích Chrome liệt kê các đơn đang chờ đặt và mở từng sản phẩm trên AliExpress. Bạn tự đặt và thanh toán đơn ở đó, rồi ghi lại mã đơn AliExpress trong tiện ích; mã vận đơn bạn thêm ở đó sẽ được gửi sang Shopify.",
 

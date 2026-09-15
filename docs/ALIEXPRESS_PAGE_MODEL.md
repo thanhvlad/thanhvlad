@@ -157,8 +157,21 @@ The page has no order-note or "message to seller" field; the address form's
 Its init data is exposed as the function `window.__INIT_DATA_CALLBACK__`, not
 as a readable object.
 
-**The extension must never click Place order, and never click Confirm on the
-address form on the merchant's behalf.** Both commit the merchant's account.
+**The extension never clicks Pay now / Place order** (`button.place-order-primary-btn`,
+anything inside `.pl-order-toal-container__btn-box`): on the owner's account it
+charges a saved card at once. It also never touches payment methods (any
+ancestor class matching pay/payment/wallet/billing), coupons, the quantity
+stepper, the address list's edit and delete icons, radios, or the "Set as
+default" switch. **Save/Confirm on the add-new-address form is clicked only
+through the verified path** (`saveAddressForm` in `extension/checkout.js`,
+judged by `DropshipHubCheckout.saveButtonRefusal`): the form must be the
+add-new-address form (every text box empty or holding a value the extension
+typed), every typed box must read back exactly the intended value, State and
+City must show the intended values (or City "Other" with the merchant told),
+the country must show the United States and the default switch/box must be
+off. Otherwise nothing is saved: the boxes are highlighted and the merchant is
+asked to check and press Save themselves. Saving the customer's address into
+the merchant's AliExpress address book is what placing the order means.
 
 ## Checkout: the address form (US)
 
@@ -328,10 +341,19 @@ script must read only the carrier, the number and the order id.
 
 ## Not yet measured
 
-- The page shown after Place order, and whether its URL carries the new order
+- The page shown after Pay now, and whether its URL carries the new order
   id(s). The existing payment link helper assumes
   `www.aliexpress.com/p/order/detail.html?orderId=<id>`. Measuring it means
-  placing a real order.
+  placing a real order. The extension therefore observes the merchant's click
+  on Pay now (capture-phase listener, never prevented or made) and records the
+  order number from the orders list instead.
+- The orders list card's own status and SKU elements. The sync script reads
+  the card's `[class*="status"]` and `[class*="sku"]` elements when present
+  and otherwise takes the status phrase ("Awaiting delivery", "To pay", …),
+  "Total:" and "Date:" from the card's text, which was measured.
+- The value the comet form's Country/region select-as-input reports. The
+  documentation above says it shows "United States"; the fill reads
+  `inputs[0].value` and stops, asking the merchant to choose the country, when
+  it does not read as the United States.
 - Address forms for countries other than the US (Vietnam, for instance, uses
   province / district / ward).
-- The order list and order detail pages where tracking numbers appear.

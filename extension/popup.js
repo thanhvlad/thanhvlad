@@ -501,6 +501,10 @@ async function setUpOrders(config) {
         say(ordersStatus, "Access was not granted, so orders cannot be listed.", "err");
         return;
       }
+      // The order page's "Order on AliExpress with the extension" button
+      // needs the bridge script on the app's origin, which the worker can
+      // register only now that the origin is granted.
+      chrome.runtime.sendMessage({ type: "bridge:register" }).catch(() => undefined);
       say(ordersStatus, "Loading…");
       await loadOrders(config).catch((error) => say(ordersStatus, error.message, "err"));
     });
