@@ -501,6 +501,7 @@ describe("listAwaitingPlacement", () => {
             externalSkuAttr: "14:193#Black",
             unitCost: "3.50",
             currency: "USD",
+            carrierCode: "CAINIAO_FULFILLMENT_STD",
             carrierName: "AliExpress Standard Shipping",
             supplierVariant: { attributes: [{ name: "Color", value: "Black" }], supplierProduct: { url: "https://www.aliexpress.com/item/1005006001.html" } },
             orderLineItem: { variantTitle: "Black" },
@@ -513,7 +514,7 @@ describe("listAwaitingPlacement", () => {
 
     expect(mocks.prisma.purchaseOrder.findMany.mock.calls[0][0].where).toEqual({ order: { shopId: "shop1", canceledAt: null }, status: "AWAITING_PLACEMENT" });
     expect(order).toMatchObject({ id: "po1", orderName: "#1001", note: "No invoice please", createdAt: "2026-09-14T10:00:00.000Z" });
-    expect(order.shippingAddress).toMatchObject({ name: "Jane Doe", phone: "+15125550100", address1: "1 Main St", zip: "78701", countryCode: "US" });
+    expect(order.shippingAddress).toMatchObject({ name: "Jane Doe", firstName: "Jane", lastName: "Doe", phone: "+15125550100", address1: "1 Main St", zip: "78701", countryCode: "US" });
     expect(JSON.stringify(order)).not.toContain("jane@example.com");
     expect(order.items[0]).toEqual({
       title: "Wireless earbuds",
@@ -525,8 +526,44 @@ describe("listAwaitingPlacement", () => {
       skuAttr: "14:193#Black",
       unitCost: "3.50",
       currency: "USD",
+      carrierCode: "CAINIAO_FULFILLMENT_STD",
       carrierName: "AliExpress Standard Shipping",
     });
+  });
+
+  it("prefers Shopify's own first and last name, and the item's carrier over the purchase order's", async () => {
+    mocks.prisma.purchaseOrder.findMany.mockResolvedValue([
+      {
+        id: "po2",
+        platform: "ALIEXPRESS",
+        currency: "USD",
+        totalCost: "3.50",
+        supplierNote: null,
+        carrierCode: "CAINIAO_STANDARD",
+        createdAt: new Date("2026-09-14T10:00:00Z"),
+        order: { name: "#1002", shippingAddress: { ...address, name: "Mary Ann van Buren", firstName: "Mary Ann", lastName: "van Buren" } },
+        items: [
+          { title: "A", quantity: 1, externalProductId: "1", externalSkuId: "2", externalSkuAttr: null, unitCost: "1", currency: "USD", carrierCode: "CAINIAO_FULFILLMENT_STD", carrierName: null, supplierVariant: null, orderLineItem: null },
+          { title: "B", quantity: 1, externalProductId: "3", externalSkuId: "4", externalSkuAttr: null, unitCost: "1", currency: "USD", carrierCode: null, carrierName: null, supplierVariant: null, orderLineItem: null },
+        ],
+      },
+    ]);
+    const [order] = await fulfillment.listAwaitingPlacement(makeShop());
+    expect(order.shippingAddress).toMatchObject({ firstName: "Mary Ann", lastName: "van Buren" });
+    expect(order.items.map((i) => i.carrierCode)).toEqual(["CAINIAO_FULFILLMENT_STD", "CAINIAO_STANDARD"]);
+  });
+});
+
+describe("consigneeNames", () => {
+  it("splits a full name only when Shopify gave no first or last name", () => {
+    expect(fulfillment.consigneeNames({ name: "Jane Doe" })).toEqual({ firstName: "Jane", lastName: "Doe" });
+    expect(fulfillment.consigneeNames({ name: "  Mary  Ann   Smith " })).toEqual({ firstName: "Mary Ann", lastName: "Smith" });
+    expect(fulfillment.consigneeNames({ name: "Cher" })).toEqual({ firstName: "Cher", lastName: null });
+    expect(fulfillment.consigneeNames({ name: "" })).toEqual({ firstName: null, lastName: null });
+    expect(fulfillment.consigneeNames({})).toEqual({ firstName: null, lastName: null });
+    // One half present is Shopify's answer; guessing the other from `name` would duplicate it.
+    expect(fulfillment.consigneeNames({ name: "Jane Doe", lastName: "Doe" })).toEqual({ firstName: null, lastName: "Doe" });
+    expect(fulfillment.consigneeNames({ name: "X Y", firstName: " Jane ", lastName: "Doe" })).toEqual({ firstName: "Jane", lastName: "Doe" });
   });
 });
 

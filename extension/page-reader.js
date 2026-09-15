@@ -337,6 +337,56 @@
     return product;
   }
 
+  /* -------------------------------------------------------------------------
+   * The SKU list, for the checkout assist
+   *
+   * A checkout opens AliExpress's confirm page for the purchase order's SKU,
+   * and needs to know first that the SKU still exists and is in stock, and
+   * which product id this host uses (aliexpress.us adds 2^51 to it). The full
+   * read above also fetches the description over the network, which a
+   * checkout does not need, so this is a separate, synchronous request.
+   *
+   * The request carries nothing. The checkout job holds the customer's
+   * address, and nothing of it may ever be handed to this world, where the
+   * page's own scripts could read it.
+   * ----------------------------------------------------------------------- */
+
+  const SKU_REQUEST = "dropshiphub:read-skus";
+  const SKU_RESPONSE = "dropshiphub:skus";
+
+  function readSkus() {
+    if (!/aliexpress\./i.test(location.hostname)) return null;
+    const data = pageModel();
+    const productId = String(data?.GLOBAL_DATA?.globalData?.productInfo?.productId ?? "").trim();
+    if (!/^\d+$/.test(productId)) return null;
+    const paths = Array.isArray(data.SKU?.skuPaths) ? data.SKU.skuPaths : [];
+    const skus = [];
+    for (const row of paths) {
+      const skuId = String(row?.skuIdStr ?? row?.skuId ?? "").trim();
+      if (!skuId) continue;
+      // The measured model keeps stock in skuVal.availQuantity; older pages
+      // had skuStock on the row, which the capture above still reads.
+      const stock = Number.isFinite(row?.skuVal?.availQuantity) ? row.skuVal.availQuantity : Number.isFinite(row?.skuStock) ? row.skuStock : null;
+      skus.push({
+        skuId,
+        skuAttr: typeof row.skuAttr === "string" ? row.skuAttr : null,
+        availQuantity: stock,
+        salable: row.salable !== false,
+      });
+    }
+    return { productId, skus };
+  }
+
+  window.addEventListener(SKU_REQUEST, () => {
+    let payload = null;
+    try {
+      payload = readSkus();
+    } catch {
+      payload = null;
+    }
+    window.dispatchEvent(new CustomEvent(SKU_RESPONSE, { detail: payload ? JSON.stringify(payload) : "" }));
+  });
+
   window.addEventListener(REQUEST, () => {
     window.dispatchEvent(new CustomEvent(ACK));
     read()

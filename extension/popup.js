@@ -355,6 +355,36 @@ function renderTrackingForm(config, po) {
   return form;
 }
 
+/**
+ * The checkout assist needs every item linked to an AliExpress product and
+ * variant: it opens the checkout page for that exact SKU. An order with an
+ * unlinked item keeps the plain links and "Mark as placed" only.
+ */
+function canStartCheckout(order) {
+  const items = Array.isArray(order.items) ? order.items : [];
+  return (
+    order.platform === "ALIEXPRESS" &&
+    items.length > 0 &&
+    items.every((item) => /^\d+$/.test(String(item.externalProductId ?? "")) && /^\d+$/.test(String(item.externalSkuId ?? "")))
+  );
+}
+
+function renderStartCheckout(order) {
+  const start = el("button", { text: "Start checkout", type: "button" });
+  start.addEventListener("click", async () => {
+    start.disabled = true;
+    say(ordersResult, `Opening ${order.orderName} on AliExpress…`);
+    // The background worker keeps the checkout (address included) in session
+    // storage for the new tab only; the popup closes as that tab opens.
+    const answer = await chrome.runtime.sendMessage({ type: "checkout:start", order }).catch(() => null);
+    if (!answer?.ok) {
+      say(ordersResult, answer?.error ?? "The checkout could not start. Reload the extension and try again.", "err");
+      start.disabled = false;
+    }
+  });
+  return start;
+}
+
 /** A collapsed control under a list entry, so the list stays scannable. */
 function disclosure(summaryText, content) {
   const details = el("details");
@@ -394,7 +424,9 @@ function renderOrders(config, orders, awaitingTracking) {
       }
       items.append(row);
     }
-    li.append(items, disclosure("Mark as placed", renderPlaceForm(config, order)));
+    li.append(items);
+    if (canStartCheckout(order)) li.append(renderStartCheckout(order));
+    li.append(disclosure("Mark as placed", renderPlaceForm(config, order)));
     ordersList.append(li);
   }
 

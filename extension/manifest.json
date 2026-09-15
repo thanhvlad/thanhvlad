@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DropshipHub Product Capture",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Add AliExpress or CJ products to DropshipHub, open orders to place on AliExpress, and record their order numbers and tracking.",
   "permissions": [
     "activeTab",
@@ -19,6 +19,9 @@
     "http://localhost/*",
     "http://127.0.0.1/*"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_title": "Add to DropshipHub",
     "default_popup": "popup.html"
@@ -54,6 +57,17 @@
       ],
       "run_at": "document_idle",
       "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://*.aliexpress.com/*",
+        "https://*.aliexpress.us/*"
+      ],
+      "js": [
+        "checkout-core.js",
+        "checkout.js"
+      ],
+      "run_at": "document_idle"
     }
   ]
 }

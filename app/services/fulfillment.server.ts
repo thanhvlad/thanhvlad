@@ -1793,6 +1793,8 @@ export interface ExtensionOrder {
   totalCost: string;
   shippingAddress: {
     name: string;
+    firstName: string | null;
+    lastName: string | null;
     company: string | null;
     phone: string | null;
     address1: string | null;
@@ -1815,8 +1817,28 @@ export interface ExtensionOrder {
     skuAttr: string | null;
     unitCost: string;
     currency: string;
+    carrierCode: string | null;
     carrierName: string | null;
   }>;
+}
+
+/**
+ * First and last name for a supplier checkout. AliExpress's address form has
+ * two required boxes and no single "name" field, so the extension cannot fill
+ * it from `name` alone. Shopify's own split is used whenever it has one; a
+ * guess is made only for an address that carries nothing but a full name, and
+ * then the last word is the surname because that is how the name box on a
+ * Shopify checkout is usually typed. A one-word name stays a first name and
+ * the merchant supplies the rest.
+ */
+export function consigneeNames(address: ShippingAddress): { firstName: string | null; lastName: string | null } {
+  const first = address.firstName?.trim() || null;
+  const last = address.lastName?.trim() || null;
+  if (first || last) return { firstName: first, lastName: last };
+  const words = (address.name ?? "").trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return { firstName: null, lastName: null };
+  if (words.length === 1) return { firstName: words[0], lastName: null };
+  return { firstName: words.slice(0, -1).join(" "), lastName: words[words.length - 1] };
 }
 
 function variantLabel(attributes: unknown, fallback: string | null): string | null {
@@ -1869,6 +1891,7 @@ export async function listAwaitingPlacement(shop: ShopWithSettings): Promise<Ext
       totalCost: money(po.totalCost),
       shippingAddress: {
         name: address.name ?? [address.firstName, address.lastName].filter(Boolean).join(" "),
+        ...consigneeNames(address),
         company: address.company ?? null,
         phone: address.phone ?? null,
         address1: address.address1 ?? null,
@@ -1891,6 +1914,10 @@ export async function listAwaitingPlacement(shop: ShopWithSettings): Promise<Ext
         skuAttr: item.externalSkuAttr,
         unitCost: money(item.unitCost),
         currency: item.currency,
+        // The confirm page takes the carrier as its shippingCompany parameter.
+        // An item chosen before carriers were stored per item has only the
+        // purchase order's headline carrier, which is the same choice.
+        carrierCode: item.carrierCode ?? po.carrierCode ?? null,
         carrierName: item.carrierName,
       })),
     };

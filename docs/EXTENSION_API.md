@@ -118,10 +118,31 @@ from CORS, can read them.
 ### `GET /api/extension/orders`
 
 ```json
-{ "ok": true, "orders": [{ "id": "…", "orderName": "#1001", "shippingAddress": { "…": "…" }, "items": [ "…" ] }] }
+{
+  "ok": true,
+  "orders": [{
+    "id": "…", "orderName": "#1001", "platform": "ALIEXPRESS", "currency": "USD", "totalCost": "8.99",
+    "shippingAddress": {
+      "name": "Jane Doe", "firstName": "Jane", "lastName": "Doe", "company": null, "phone": "+15125550100",
+      "address1": "1 Main St", "address2": null, "city": "Austin", "province": "Texas", "provinceCode": "TX",
+      "zip": "78701", "country": "United States", "countryCode": "US", "taxNumber": null
+    },
+    "items": [{
+      "title": "Wireless earbuds", "variantLabel": "Color: Black", "quantity": 2,
+      "externalProductId": "1005006001", "productUrl": "https://www.aliexpress.com/item/1005006001.html",
+      "externalSkuId": "12000031", "skuAttr": "14:193#Black", "unitCost": "3.50", "currency": "USD",
+      "carrierCode": "CAINIAO_FULFILLMENT_STD", "carrierName": "AliExpress Standard Shipping"
+    }]
+  }],
+  "awaitingTracking": [ "…" ]
+}
 ```
 
-Purchase orders waiting to be placed (`AWAITING_PLACEMENT`).
+Purchase orders waiting to be placed (`AWAITING_PLACEMENT`). `firstName` and `lastName` are
+Shopify's own; only when the address has neither are they split from `name` (last word as the
+surname), because AliExpress's address form has two required name boxes. `carrierCode` is the
+item's chosen carrier, falling back to the purchase order's, and becomes the checkout page's
+`shippingCompany`. The customer's email is never included.
 
 ### `POST /api/extension/orders/:id/placed`
 
@@ -133,6 +154,11 @@ Records that the merchant placed the purchase order on AliExpress. `200 { ok: tr
 `200 { ok: true, alreadyRecorded: true }` when the same ids are sent again; `409` when
 the purchase order is already recorded with other ids.
 
+A purchase order is recorded once, with all its AliExpress order numbers: the endpoint does
+not add numbers to one already recorded. The checkout assist therefore collects one number per
+item and sends them together when the last item is recorded; sending the same list again after
+a lost response gets `alreadyRecorded`.
+
 ### `POST /api/extension/orders/:id/tracking`
 
 ```json
@@ -141,6 +167,43 @@ the purchase order is already recorded with other ids.
 
 Adds a tracking number through the same path as tracking typed on the order page, so
 the Shopify fulfilment and the customer notification follow the shop's own settings.
+
+### The checkout assist
+
+An order to place whose items are all linked to an AliExpress variant has **Start checkout**
+in the popup. Page facts it relies on are in `docs/ALIEXPRESS_PAGE_MODEL.md`.
+
+1. **Start checkout** opens a new tab on the first item's product page
+   (`www.aliexpress.com/item/<id>.html`). AliExpress may redirect to a regional host;
+   `aliexpress.us` uses the global id plus 2^51.
+2. On the product page the extension reads the page's own product id and SKU list, checks
+   that the item's SKU still exists and is in stock, and opens that host's
+   `/p/trade/confirm.html` for the SKU, quantity, the customer's country and the item's
+   carrier. A missing or sold-out SKU stops there with the reason in the panel.
+3. On the confirm page the DropshipHub panel (top right) shows the order, "Item i of n", a
+   check that the page's product, SKU, quantity and country match, DropshipHub's cost
+   estimate beside the page's total (a warning only: the page shows the account's display
+   currency), and every address field with a **Copy** button.
+4. **Fill address** fills AliExpress's US address form: it opens "Add new address" and
+   "Enter manually" if needed, chooses the country, fills first and last name, the mobile
+   number without +1, the street (at most 35 characters, the rest moved to "Apt, suite,
+   unit"), ZIP, State and City ("Other" when AliExpress does not list the city, highlighted
+   for you to check). It stops, and leaves the Copy buttons, for any other country or any form
+   that does not look like the measured US form. Nothing is filled until you press the button.
+5. **You** check the address and press Confirm, then place and pay for the order on
+   AliExpress. The extension never clicks Place order, Confirm, Pay, Buy now, any payment
+   choice or "Set as default shipping address": every click it makes goes through one guard
+   that refuses those controls.
+6. Enter the AliExpress order number in the panel. If the page you land on after placing
+   carries `orderId=` or `orderIds=` in its address, the panel suggests those numbers; it
+   never records them without your click. With more items, **Next item** opens the next
+   product in the same tab, and the numbers are sent to DropshipHub with the last item.
+
+The checkout job, including the customer's address, lives only in the extension's
+`chrome.storage.session` (memory only, cleared when the browser closes) and is removed when
+the purchase order is recorded, when you cancel, when the tab closes, or after four hours. It
+is never written to the console or handed to the page's scripts, and the only part of it that
+goes into a URL is the destination country, which AliExpress's own checkout address carries.
 
 ## Installing the extension
 
@@ -151,3 +214,7 @@ the Shopify fulfilment and the customer notification follow the shop's own setti
    (bottom left), or use the extension icon.
 4. After updating `page-reader.js` or `content.js`, press *Reload* on the extension card
    and reload the AliExpress tab, or captures keep using the old reader.
+5. **Version 1.5.0 adds the checkout assist** (`background.js`, `checkout-core.js`,
+   `checkout.js`). Press *Reload* on the extension card in `chrome://extensions` - Chrome
+   does not pick up a new background worker or content script otherwise - then reload any
+   open AliExpress tabs. No new permission is asked for.
