@@ -19,13 +19,14 @@ import {
  *   Authorization: Bearer <shop api token>
  *   { "orders": [{ "orderId": "8190000000000001", "productIds": ["3256809840464144", "1005010026778896"],
  *                  "skuText": "Play blue light", "status": "Awaiting delivery", "total": "$93.62", "date": "Sep 15, 2026" }] }
- *   → 200 { ok: true, results: [{ orderId, result: "recorded" | "already" | "advanced" | "ambiguous" | "unmatched", purchaseOrderId?, orderName?, status? }] }
+ *   → 200 { ok: true, results: [{ orderId, result: "recorded" | "already" | "advanced" | "partial" | "ambiguous" | "unmatched", purchaseOrderId?, orderName?, status? }] }
  *
  * A known AliExpress order advances its purchase order's status, never
  * backwards; an unknown one is matched to a purchase order waiting for the
- * extension by product (and SKU text) and recorded through the same path as
- * "Mark as placed". Safe to repeat. No CORS headers: only the extension's
- * own worker calls this.
+ * extension by product (and SKU text, the card's date and the extension's
+ * paying hints) and recorded through the same path as "Mark as placed" when
+ * exactly one single-item purchase order remains. Safe to repeat. No CORS
+ * headers: only the extension's own worker calls this.
  */
 
 function json(body: unknown, status = 200, headers: Record<string, string> = {}) {

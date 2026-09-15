@@ -288,7 +288,9 @@ Before "Enter manually" only inputs 0–5 exist. Below the fields: **"Set as
 default"** is a switch `div.mt-switch.switcher` (on = `mt-switch--checked`
 and knob `mt-switch-knob--large-checked`; off = neither; no `<input>`), and
 **`button.form-button-confirm`** (`type="button"`, text **"Save"**) saves the
-address to the account and selects it.
+address to the account and selects it. Whether the switch and Save sit inside
+`.deliver-address-wrap` or in the drawer's footer was not recorded; the
+extension looks for them in the whole `.comet-drawer`.
 
 Text inputs are React-controlled and accept the native value setter followed
 by `input` and `change` events; the value survives blur and shows
@@ -320,7 +322,13 @@ cards. Each carries the status ("Awaiting delivery"), "Date: …",
 `a[href*="/item/<id>.html"]` (regional ids; subtract 2^51 for the global id
 when above it), the SKU text ("Mix 10pcs"), "Total:$12.50" and the buttons
 "Confirm received" / "Track status" (or "Pay now" under To pay). This page is
-the source for automatic order-number and status sync.
+the source for automatic order-number and status sync. It lists the account's
+whole history, so the app records an unknown order on a waiting purchase order
+only when the card's date reads as a day on or after the purchase order's
+creation day, the order is not Closed, and exactly one single-item purchase
+order remains (see `docs/EXTENSION_API.md`, `POST /api/extension/orders/sync`).
+A card's status is read from its text before "Date:" (the measured position),
+unpaid phrases first, and a status the app cannot read counts as unpaid.
 
 The "Details" link opens `www.aliexpress.com/p/order/detail.html?orderId=<id>`
 (the .com host even from .us). It shows `.order-status` ("Awaiting
@@ -328,6 +336,10 @@ delivery"), `.service-progress-node-info` nodes ("Paid", "Refund" deadline),
 the customer's address in `.order-detail-info`, and an
 `.order-detail-order-info` block of `.info-row`s: "Ref. Number: <id> Copy",
 "Order placed on:", "Paid on:", "Shipment completed on:", "Payment method:".
+Its own item block has not been measured, and AliExpress detail pages carry
+recommendation strips with `/item/<id>.html` links too, so the sync script
+reads no product links from it: from this page the app only advances an order
+it already knows by number.
 Its logistics line ("Awaiting flight") links to
 `/p/tracking/index.html?tradeOrderId=<id>`, whose classes are hashed
 (`logistic-info-v2--<name>--<hash>`), so match on the name part:

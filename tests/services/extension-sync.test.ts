@@ -92,8 +92,10 @@ const waiting = {
   paidAt: null,
   shippedAt: null,
   placedAt: null,
+  paymentDueAt: null,
   raw: { placementMode: "extension" },
-  createdAt: new Date(),
+  // Fixed, so the date rule below is tested against a known day, not the clock.
+  createdAt: new Date("2026-09-14T10:00:00Z"),
   order: orderRef,
   items: [{ externalProductId: "1005010026778896", externalSkuAttr: "14:691#Play blue light;200007763:201441035", supplierVariant: { attributes: [{ name: "Color", value: "Play blue light" }] }, orderLineItem: { variantTitle: "Play blue light" } }],
 };
@@ -201,12 +203,25 @@ describe("recordSupplierQuote", () => {
     expect(mocks.prisma.purchaseOrder.update.mock.calls[0][0].data).toMatchObject({ shopCurrency: null, shopItemsCost: null, shopShippingCost: null, fxRate: null });
   });
 
-  it("changes nothing when the same total is sent again", async () => {
-    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ ...waiting, currency: "USD", itemsCost: "85.89", shippingCost: "7.73", totalCost: "93.62" });
+  it("changes nothing when the same total is sent again, but refreshes stale shop-currency amounts", async () => {
+    const quoted = { ...waiting, currency: "USD", itemsCost: "85.89", shippingCost: "7.73", totalCost: "93.62" };
+    // The shop-currency amounts still describe the old estimate (a rate learned since): they are rewritten.
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(quoted);
+    expect((await fulfillment.recordSupplierQuote(makeShop(), waiting.id, quote)).body.unchanged).toBeUndefined();
+    expect(mocks.prisma.purchaseOrder.update.mock.calls[0][0].data).toMatchObject({ shopCurrency: "USD", shopItemsCost: "85.89", shopShippingCost: "7.73" });
+
+    vi.clearAllMocks();
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ ...quoted, shopItemsCost: "85.89", shopShippingCost: "7.73" });
+    mocks.getKnownRate.mockResolvedValue(1);
     const answer = await fulfillment.recordSupplierQuote(makeShop(), waiting.id, quote);
     expect(answer).toMatchObject({ status: 200, body: { ok: true, unchanged: true } });
     expect(mocks.prisma.purchaseOrder.update).not.toHaveBeenCalled();
     expect(mocks.logActivity).not.toHaveBeenCalled();
+
+    // With no rate on record right now the converted amounts are neither compared nor cleared.
+    mocks.getKnownRate.mockResolvedValue(null);
+    expect((await fulfillment.recordSupplierQuote(makeShop(), waiting.id, quote)).body.unchanged).toBe(true);
+    expect(mocks.prisma.purchaseOrder.update).not.toHaveBeenCalled();
   });
 
   it("is refused once the purchase order is paid, shipped or cancelled", async () => {
@@ -245,12 +260,50 @@ describe("AliExpress status words", () => {
   });
 });
 
+describe("the card's date", () => {
+  it("reads the measured English form, ISO, the Vietnamese form and an unambiguous numeric form, and nothing else", () => {
+    const parse = fulfillment.parseAliExpressOrderDate;
+    expect(parse("Sep 15, 2026")).toBe("2026-09-15");
+    expect(parse("Date: Sep 15, 2026")).toBe("2026-09-15");
+    expect(parse("September 15 2026")).toBe("2026-09-15");
+    expect(parse("15 Sep 2026")).toBe("2026-09-15");
+    expect(parse("Sept. 3rd, 2026")).toBe("2026-09-03");
+    expect(parse("2026-09-15")).toBe("2026-09-15");
+    expect(parse("15 thg 9, 2026")).toBe("2026-09-15");
+    expect(parse("Ngày 15 tháng 9 năm 2026")).toBe("2026-09-15");
+    expect(parse("15/09/2026")).toBe("2026-09-15");
+    expect(parse("09/15/2026")).toBe("2026-09-15");
+    // Either order would do: not guessed.
+    expect(parse("09/08/2026")).toBeNull();
+    expect(parse("Feb 30, 2026")).toBeNull();
+    expect(parse("Sep 15")).toBeNull();
+    expect(parse("Awaiting delivery")).toBeNull();
+    expect(parse("")).toBeNull();
+    expect(parse(undefined)).toBeNull();
+  });
+
+  it("puts an instant on the shop's calendar day, UTC for an unknown zone", () => {
+    const at = new Date("2026-09-13T20:00:00Z");
+    expect(fulfillment.calendarDay(at, "Asia/Ho_Chi_Minh")).toBe("2026-09-14");
+    expect(fulfillment.calendarDay(at, "America/Los_Angeles")).toBe("2026-09-13");
+    expect(fulfillment.calendarDay(at, "UTC")).toBe("2026-09-13");
+    expect(fulfillment.calendarDay(at, "Mars/Olympus")).toBe("2026-09-13");
+    expect(fulfillment.calendarDay(at, undefined)).toBe("2026-09-13");
+  });
+});
+
 describe("the sync bodies", () => {
   it("accept order ids of 10 to 24 digits, digit product ids, and at most 100 orders", () => {
     const body = fulfillment.ExtensionSyncOrdersBody;
     const order = { orderId: "8190000000000001", productIds: ["3256809840464144", "1005010026778896"], skuText: "Play blue light", status: "Awaiting delivery", total: "$93.62", date: "Sep 15, 2026" };
     expect(body.safeParse({ orders: [order] }).success).toBe(true);
     expect(body.safeParse({ orders: [{ orderId: "8190000000000001" }] }).success).toBe(true);
+    // Paying hints: a purchase order id and an epoch time, nothing else, at most 20.
+    expect(body.safeParse({ orders: [order], hints: [{ purchaseOrderId: "po_waiting01", payingAt: 1789000000000 }] }).success).toBe(true);
+    expect(body.safeParse({ orders: [order], hints: [{ purchaseOrderId: "x", payingAt: 1 }] }).success).toBe(false);
+    expect(body.safeParse({ orders: [order], hints: [{ purchaseOrderId: "po_waiting01", payingAt: "now" }] }).success).toBe(false);
+    expect(body.safeParse({ orders: [order], hints: [{ purchaseOrderId: "po_waiting01", payingAt: 1, address: "x" }] }).success).toBe(false);
+    expect(body.safeParse({ orders: [order], hints: Array.from({ length: 21 }, () => ({ purchaseOrderId: "po_waiting01", payingAt: 1 })) }).success).toBe(false);
     expect(body.safeParse({ orders: [] }).success).toBe(false);
     expect(body.safeParse({ orders: [{ ...order, orderId: "123" }] }).success).toBe(false);
     expect(body.safeParse({ orders: [{ ...order, orderId: "8190000000000001x" }] }).success).toBe(false);
@@ -385,6 +438,124 @@ describe("syncOrdersFromExtension", () => {
     expect(result).toMatchObject({ result: "unmatched", error: expect.stringMatching(/cancelled in Shopify/) });
     expect(mocks.prisma.purchaseOrder.updateMany).not.toHaveBeenCalled();
   });
+
+  it("never records an unknown order that is closed or cancelled on AliExpress", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(null);
+    mocks.prisma.purchaseOrder.findMany.mockResolvedValue([waiting]);
+    for (const status of ["Closed", "Cancelled", "Đã hủy"]) {
+      const [result] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [{ ...card, status }] });
+      expect(result, status).toEqual({ orderId: card.orderId, result: "unmatched", closed: true });
+    }
+    // Not even looked up as a candidate.
+    expect(mocks.prisma.purchaseOrder.findMany).not.toHaveBeenCalled();
+    expect(mocks.prisma.purchaseOrder.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("never records an order dated before the day the purchase order was created, in the shop's timezone", async () => {
+    // The purchase order was created 2026-09-14 10:00 UTC; the list shows the account's whole history.
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(null);
+    mocks.prisma.purchaseOrder.findMany.mockResolvedValue([waiting]);
+    const [older] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [{ ...card, status: "Completed", date: "Sep 13, 2026" }] });
+    expect(older).toEqual({ orderId: card.orderId, result: "unmatched", reason: "older-than-orders", candidates: [{ purchaseOrderId: waiting.id, orderName: "#21047" }] });
+    expect(mocks.prisma.purchaseOrder.updateMany).not.toHaveBeenCalled();
+
+    // Created 2026-09-13 20:00 UTC, which is already Sep 14 in Ho Chi Minh City: a card dated Sep 13 is older there.
+    const evening = { ...waiting, createdAt: new Date("2026-09-13T20:00:00Z") };
+    mocks.prisma.purchaseOrder.findMany.mockResolvedValue([evening]);
+    const [vietnam] = await fulfillment.syncOrdersFromExtension(makeShop({ timezone: "Asia/Ho_Chi_Minh" }), { orders: [{ ...card, date: "Sep 13, 2026" }] });
+    expect(vietnam).toMatchObject({ result: "unmatched", reason: "older-than-orders" });
+    expect(mocks.prisma.purchaseOrder.updateMany).not.toHaveBeenCalled();
+
+    // The same day, or later, is recorded.
+    mocks.prisma.purchaseOrder.findFirst.mockReset();
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValueOnce(null).mockResolvedValueOnce({ ...evening }).mockResolvedValueOnce({ ...evening, status: "PAID", externalOrderId: card.orderId });
+    const [sameDay] = await fulfillment.syncOrdersFromExtension(makeShop({ timezone: "Asia/Ho_Chi_Minh" }), { orders: [{ ...card, date: "Sep 14, 2026" }] });
+    expect(sameDay).toMatchObject({ result: "recorded", purchaseOrderId: waiting.id });
+    expect(mocks.prisma.purchaseOrder.updateMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks the merchant instead of guessing when the card's date cannot be read", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(null);
+    mocks.prisma.purchaseOrder.findMany.mockResolvedValue([waiting]);
+    for (const date of ["", "yesterday", "09/08/2026"]) {
+      const [result] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [{ ...card, date }] });
+      expect(result, date).toEqual({ orderId: card.orderId, result: "ambiguous", reason: "date-unreadable", candidates: [{ purchaseOrderId: waiting.id, orderName: "#21047" }] });
+    }
+    expect(mocks.prisma.purchaseOrder.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("records an order whose status it cannot read as awaiting payment, with the 24-hour deadline", async () => {
+    mocks.prisma.purchaseOrder.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ ...waiting, order: { ...orderRef } })
+      .mockResolvedValueOnce({ ...waiting, status: "AWAITING_PAYMENT", externalOrderId: card.orderId });
+    mocks.prisma.purchaseOrder.findMany.mockResolvedValue([waiting]);
+    const [result] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [{ ...card, status: "Something new" }] });
+    expect(result).toMatchObject({ result: "recorded", status: "AWAITING_PAYMENT" });
+    const { data } = mocks.prisma.purchaseOrder.updateMany.mock.calls[0][0];
+    expect(data.status).toBe("AWAITING_PAYMENT");
+    expect(data.paymentDueAt).toBeInstanceOf(Date);
+    expect(data.paidAt).toBeUndefined();
+    expect(mocks.prisma.purchaseOrder.update).not.toHaveBeenCalled();
+  });
+
+  it("does not record a purchase order with several items: it answers partial with the products the order covers", async () => {
+    const twoItems = { ...waiting, items: [...waiting.items, { externalProductId: "1005006002", externalSkuAttr: null, supplierVariant: null, orderLineItem: null }] };
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(null);
+    mocks.prisma.purchaseOrder.findMany.mockResolvedValue([twoItems]);
+    const [result] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [card] });
+    expect(result).toEqual({ orderId: card.orderId, result: "partial", purchaseOrderId: waiting.id, orderName: "#21047", matchedProductIds: ["1005010026778896"], paid: true });
+    const [unpaid] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [{ ...card, status: "To pay" }] });
+    expect(unpaid).toMatchObject({ result: "partial", paid: false });
+    expect(mocks.prisma.purchaseOrder.updateMany).not.toHaveBeenCalled();
+    expect(mocks.prisma.purchaseOrder.update).not.toHaveBeenCalled();
+    expect(mocks.addOrderTags).not.toHaveBeenCalled();
+    expect(mocks.logActivity).not.toHaveBeenCalled();
+  });
+
+  it("prefers the purchase order whose checkout pressed Pay now that day, when several wait for the same variant", async () => {
+    const other = { ...waiting, id: "po_waiting02", order: { ...orderRef, id: "order2", name: "#21048" } };
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(null);
+    mocks.prisma.purchaseOrder.findMany.mockResolvedValue([waiting, other]);
+    const payingAt = Date.UTC(2026, 8, 15, 3, 0, 0);
+
+    // No hint, or a hint from another day: ambiguous.
+    const [plain] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [card] });
+    expect(plain).toMatchObject({ result: "ambiguous" });
+    const [stale] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [card], hints: [{ purchaseOrderId: "po_waiting02", payingAt: Date.UTC(2026, 8, 12) }] });
+    expect(stale).toMatchObject({ result: "ambiguous" });
+    // Both hinted: still ambiguous.
+    const [both] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [card], hints: [{ purchaseOrderId: waiting.id, payingAt }, { purchaseOrderId: "po_waiting02", payingAt }] });
+    expect(both).toMatchObject({ result: "ambiguous" });
+    expect(mocks.prisma.purchaseOrder.updateMany).not.toHaveBeenCalled();
+
+    mocks.prisma.purchaseOrder.findFirst.mockReset();
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValueOnce(null).mockResolvedValueOnce({ ...other }).mockResolvedValueOnce({ ...other, status: "PAID", externalOrderId: card.orderId });
+    const [hinted] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [card], hints: [{ purchaseOrderId: "po_waiting02", payingAt }] });
+    expect(hinted).toMatchObject({ result: "recorded", purchaseOrderId: "po_waiting02", orderName: "#21048" });
+    expect(mocks.prisma.purchaseOrder.updateMany.mock.calls[0][0].where.id).toBe("po_waiting02");
+  });
+
+  it("does not record when the card's SKU text names another variant than the one waiting", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(null);
+    mocks.prisma.purchaseOrder.findMany.mockResolvedValue([waiting]);
+    const [result] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [{ ...card, skuText: "Sunglasses CN" }] });
+    expect(result).toEqual({ orderId: card.orderId, result: "ambiguous", reason: "variant-differs", candidates: [{ purchaseOrderId: waiting.id, orderName: "#21047" }] });
+    expect(mocks.prisma.purchaseOrder.updateMany).not.toHaveBeenCalled();
+    // A hint does not override the SKU text either.
+    const [hinted] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [{ ...card, skuText: "Sunglasses CN" }], hints: [{ purchaseOrderId: waiting.id, payingAt: Date.UTC(2026, 8, 15) }] });
+    expect(hinted).toMatchObject({ result: "ambiguous", reason: "variant-differs" });
+  });
+
+  it("gives a placed purchase order first seen To pay its 24-hour deadline", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ ...waiting, status: "PLACED", externalOrderId: card.orderId, raw: { externalOrderIds: [card.orderId] } });
+    const [result] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [{ ...card, status: "To pay" }] });
+    expect(result).toMatchObject({ result: "advanced", status: "AWAITING_PAYMENT" });
+    const { data } = mocks.prisma.purchaseOrder.update.mock.calls[0][0];
+    expect(data.status).toBe("AWAITING_PAYMENT");
+    expect(data.paymentDueAt).toBeInstanceOf(Date);
+    expect(data.paymentDueAt.getTime() - Date.now()).toBeGreaterThan(23 * 3_600_000);
+  });
 });
 
 describe("syncTrackingFromExtension", () => {
@@ -411,5 +582,12 @@ describe("syncTrackingFromExtension", () => {
 
     mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(null);
     expect(await fulfillment.syncTrackingFromExtension(makeShop(), input)).toMatchObject({ status: 200, body: { ok: true, result: "unmatched" } });
+  });
+
+  it("adds nothing to a cancelled purchase order and says so, rather than asking for it to be placed first", async () => {
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue({ ...placed, status: "CANCELED" });
+    expect(await fulfillment.syncTrackingFromExtension(makeShop(), input)).toMatchObject({ status: 200, body: { ok: true, result: "cancelled", orderName: "#21047", number: input.trackingNumber } });
+    expect(mocks.prisma.trackingNumber.findFirst).not.toHaveBeenCalled();
+    expect(mocks.prisma.trackingNumber.upsert).not.toHaveBeenCalled();
   });
 });

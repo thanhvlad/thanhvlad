@@ -142,13 +142,19 @@
       .filter(Boolean);
   }
 
+  /**
+   * The detail page's order id and status only. Its product links are not
+   * read: the page's own item block has not been measured and its
+   * recommendation strips link products too, so the app could match one of
+   * those to a waiting purchase order. From here the app only advances an
+   * order it already knows by number.
+   */
   function readDetail() {
     const rows = [...document.querySelectorAll(".order-detail-order-info .info-row")].map((row) => row.textContent ?? "");
     return core.parseOrderDetail({
       url: location.href,
       refNumberText: rows.find((text) => /Ref\.?\s*Number/i.test(text)) ?? "",
       statusText: document.querySelector(".order-status")?.textContent ?? "",
-      productHrefs: hrefs(document, 'a[href*="/item/"]'),
     });
   }
 
@@ -175,8 +181,10 @@
     }
     const results = Array.isArray(answer.results) ? answer.results : [];
     if (results.length === 0) return;
-    const noted = results.filter((r) => r.result !== "unmatched");
-    const lines = noted.map((r) => [core.describeSyncResult(r), ["recorded", "advanced"].includes(r.result) ? "ok" : r.result === "ambiguous" ? "warn" : "muted"]);
+    // An unmatched order with a reason (closed, or dated before the order
+    // waiting for its product) is worth a line; the rest are counted.
+    const noted = results.filter((r) => r.result !== "unmatched" || r.closed || r.reason);
+    const lines = noted.map((r) => [core.describeSyncResult(r), ["recorded", "advanced", "partial"].includes(r.result) ? "ok" : r.result === "ambiguous" ? "warn" : "muted"]);
     const unmatched = results.length - noted.length;
     if (unmatched > 0) lines.push([`${unmatched} AliExpress order${unmatched === 1 ? "" : "s"} on this page: no DropshipHub order matched.`, "muted"]);
     show(lines, run);
@@ -194,6 +202,7 @@
     const name = answer.orderName ? `${answer.orderName}: ` : "";
     if (answer.result === "added") show([[`${name}tracking ${answer.number} recorded and sent to Shopify.`, "ok"]], run);
     else if (answer.result === "known") show([[`${name}tracking ${answer.number} was already recorded.`, "muted"]], run);
+    else if (answer.result === "cancelled") show([[`${name}is cancelled in DropshipHub, so tracking ${answer.number} was not added.`, "muted"]], run);
     else show([[`Tracking ${answer.number}: no DropshipHub order has AliExpress order ${tracking.tradeOrderId}.`, "muted"]], run);
   }
 

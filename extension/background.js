@@ -164,8 +164,9 @@ async function postPlaced(job, paid) {
 /**
  * Sends the confirm page's real total for the purchase order: the sum of the
  * quotes of every item quoted so far, since each item is its own AliExpress
- * checkout. Sent once per item per job; a lost answer is retried by the next
- * page load, and the endpoint answers the same total again with `unchanged`.
+ * checkout. Sent whenever an item's readable total differs from the one on
+ * record; a lost answer is retried by the next page load, and the endpoint
+ * answers the same total again with `unchanged`.
  */
 async function postQuote(job) {
   const body = core.quoteBody(core.sumQuotes(job.quotes));
@@ -185,7 +186,7 @@ async function postQuote(job) {
 // with the token, exactly as the popup does; the page names only the id.
 // ---------------------------------------------------------------------------
 
-async function registerAppBridge() {
+async function registerAppBridgeNow() {
   await chrome.scripting.unregisterContentScripts({ ids: [BRIDGE_SCRIPT_ID] }).catch(() => undefined);
   const settings = await appSettings();
   if (settings.error) return false;
@@ -200,6 +201,17 @@ async function registerAppBridge() {
   } catch {
     return false;
   }
+}
+
+/**
+ * One registration at a time. The worker's start, onInstalled and onStartup
+ * all ask for it at once, and two unregister/register pairs racing each other
+ * could end with "Duplicate script ID" swallowed and the bridge unregistered.
+ */
+let bridgeChain = Promise.resolve(false);
+function registerAppBridge() {
+  bridgeChain = bridgeChain.then(registerAppBridgeNow, registerAppBridgeNow).catch(() => false);
+  return bridgeChain;
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -288,15 +300,64 @@ async function dropRecordedJobs(results) {
   }
 }
 
+/** Every job in stage "paying": its purchase order and when Pay now was pressed, for the app to prefer among several waiting purchase orders. */
+async function payingHints() {
+  const everything = await chrome.storage.session.get(null);
+  return Object.entries(everything)
+    .filter(([key, job]) => key.startsWith(JOB_PREFIX) && job?.stage === "paying" && Number.isInteger(job.payingAt))
+    .map(([, job]) => ({ purchaseOrderId: job.purchaseOrderId, payingAt: job.payingAt }));
+}
+
+/**
+ * A `partial` result names a multi-item purchase order whose one item's
+ * AliExpress order the page shows. The number goes into that item's slot of
+ * the job checking it out (any tab), and the job moves to "recorded" so the
+ * merchant goes on to the next item. Once the last item has its number, the
+ * numbers are sent together through the placed endpoint, exactly as the
+ * panel's Send does, and the page's results say so; a send that fails leaves
+ * the job in "recorded" with the numbers, for the panel's Send to retry.
+ * Answers the results with those entries replaced.
+ */
+async function attachPartialResults(results) {
+  const list = Array.isArray(results) ? results.slice() : [];
+  const partial = list.filter((entry) => entry?.result === "partial" && core.isPurchaseOrderId(entry.purchaseOrderId));
+  if (partial.length === 0) return list;
+  const everything = await chrome.storage.session.get(null);
+  for (const [key, job] of Object.entries(everything)) {
+    if (!key.startsWith(JOB_PREFIX)) continue;
+    let current = job;
+    for (const entry of partial) {
+      const next = core.attachOrderToJob(current, entry);
+      if (next) current = next;
+    }
+    if (current === job) continue;
+    await writeJob(current);
+    if (!core.isLastItem(current)) continue;
+    // Paid only when every number on the job reads as paid on this page; one
+    // not on the page counts as unpaid, and the next sync advances it.
+    const ids = core.jobOrderIds(current);
+    const paid = ids.every((id) => partial.some((entry) => entry.orderId === id && entry.purchaseOrderId === current.purchaseOrderId && entry.paid === true));
+    const answer = await finish(current, paid);
+    if (!answer.ok) continue;
+    for (let i = 0; i < list.length; i += 1) {
+      const entry = list[i];
+      if (entry?.result === "partial" && entry.purchaseOrderId === current.purchaseOrderId) {
+        list[i] = { ...entry, result: "recorded", status: answer.status, externalOrderIds: answer.externalOrderIds };
+      }
+    }
+  }
+  return list;
+}
+
 async function handleTabMessage(message, sender) {
   const tabId = sender.tab.id;
   if (message.type === "sync:orders") {
-    const body = core.ordersSyncBody(message.orders);
+    const body = core.ordersSyncBody(message.orders, await payingHints());
     if (!body) return { ok: false, error: "No AliExpress orders to sync." };
     const call = await callApp("/api/extension/orders/sync", { method: "POST", body });
     if (call.error) return { ok: false, error: call.error };
     if (!call.ok) return { ok: false, error: core.explainRefusal(call.status, call.answer).replace(/^Not saved[:.]?\s*/, "") };
-    const results = Array.isArray(call.answer.results) ? call.answer.results : [];
+    const results = await attachPartialResults(Array.isArray(call.answer.results) ? call.answer.results : []);
     await dropRecordedJobs(results);
     return { ok: true, results };
   }
@@ -344,7 +405,11 @@ async function handleTabMessage(message, sender) {
       const quote = message.quote;
       if (!core.validQuote(quote)) return { ok: false, error: "The page's total could not be read." };
       const quotes = Array.isArray(job.quotes) ? job.quotes.slice() : job.items.map(() => null);
-      if (quotes[job.itemIndex]?.sent) return { ok: true, alreadySent: true };
+      // The same amounts again are not re-sent; different ones are, since the
+      // page's total changes once the customer's address (its state's tax and
+      // shipping) is set, and the endpoint takes a corrected total.
+      const previous = quotes[job.itemIndex];
+      if (previous?.sent && core.sameQuote(previous, quote)) return { ok: true, alreadySent: true };
       quotes[job.itemIndex] = { currency: quote.currency, total: quote.total, subtotal: quote.subtotal, shipping: quote.shipping, charges: quote.charges, sent: false };
       const answer = await postQuote({ ...job, quotes });
       if (answer.ok) quotes[job.itemIndex].sent = true;

@@ -200,8 +200,12 @@ describe("rule B: Save on the add-address form only through the verified path", 
     expect(functionSource(checkout, "cometEnterManually")).toContain('querySelectorAll("div.text-button-container")');
     expect(functionSource(checkout, "enterManuallyIfNeeded")).toContain(`guardedClick(link.closest("button, a, [role='button']") ?? link)`);
     const open = functionSource(checkout, "openFormIfNeeded");
-    expect(open).toContain('querySelector("span.pl-address-item__arrrow a, span.pl-address-item__arrrow")');
+    // The measured "Change" control is the <a> inside the span; a selector
+    // list would return the span, which precedes its own child in tree order.
+    expect(open).toContain('document.querySelector("span.pl-address-item__arrrow a") ?? document.querySelector("span.pl-address-item__arrrow")');
     expect(open).toContain('drawer.querySelector("button.add-address")');
+    // The switch and Save are looked for in the whole drawer, the widest measured container.
+    expect(functionSource(checkout, "cometScope")).toContain('form.closest(".comet-drawer") ?? form.closest(".deliver-address-wrap")');
   });
 
   it('says "left unticked" only after reading the box on the Fusion by-hand path', () => {
@@ -212,13 +216,35 @@ describe("rule B: Save on the add-address form only through the verified path", 
     expect(finish).toMatch(/if \(box === "ticked"\)/);
   });
 
-  it("stops the fill once the checkout is cancelled or the page moves on", () => {
+  it("stops the fill once the checkout is cancelled or the page moves on, right up to the Save click", () => {
     expect(count(functionSource(checkout, "fillFusionForm"), /if \(!\(await fillMayContinue\(job, status\)\)\) return/)).toBeGreaterThanOrEqual(5);
     expect(count(functionSource(checkout, "fillCometForm"), /if \(!\(await fillMayContinue\(job, status\)\)\) return/)).toBeGreaterThanOrEqual(2);
     expect(functionSource(checkout, "chooseInCascade")).toContain("if (!(await fillMayContinue(job, status)))");
-    const check = functionSource(checkout, "fillMayContinue");
-    expect(check).toContain('ask({ type: "checkout:get" })');
-    expect(check).toContain("current.purchaseOrderId !== job.purchaseOrderId");
+    // A checkout cancelled during the read-back sleep must not be committed:
+    // the check is the first thing saveAddressForm does, before the snapshot,
+    // and nothing waits between the snapshot and the click.
+    const save = functionSource(checkout, "saveAddressForm");
+    const check = save.indexOf('if (!(await fillMayContinue(job, status))) return outcome("partial"');
+    expect(check).toBeGreaterThan(-1);
+    expect(check).toBeLessThan(save.indexOf("cometSaveSnapshot("));
+    expect(save.slice(save.indexOf("const snapshot ="), save.indexOf(".click("))).not.toMatch(/await/);
+    expect(count(checkout, /return saveAddressForm\(\{ design: "(comet|fusion)", form: current, job, /)).toBe(2);
+    const may = functionSource(checkout, "fillMayContinue");
+    expect(may).toContain('ask({ type: "checkout:get" })');
+    expect(may).toContain("current.purchaseOrderId !== job.purchaseOrderId");
+  });
+
+  it("fills and quotes only the checkout page of the item itself", () => {
+    // A later navigation in the tab (Buy now on another product) must not get the customer's address or post its total.
+    const fill = functionSource(checkout, "fillAddress");
+    expect(fill.indexOf("if (!pageMatchesItem(job)) {")).toBeGreaterThan(-1);
+    expect(fill.indexOf("if (!pageMatchesItem(job)) {")).toBeLessThan(fill.indexOf("openFormIfNeeded("));
+    const auto = functionSource(checkout, "autoFill");
+    expect(auto.indexOf("if (!pageMatchesItem(job)) {")).toBeLessThan(auto.indexOf("await runFill("));
+    expect(functionSource(checkout, "pageMatchesItem")).toContain("core.confirmUrlMismatches(location.href, job.items[job.itemIndex], job.address.countryCode).length === 0");
+    const cost = functionSource(checkout, "costBlock");
+    expect(cost).toContain("if (verdict.page && gate.pageMatches() && gate.addressSet()) {");
+    expect(functionSource(checkout, "renderConfirm")).toContain("pageMatches: () => pageMatchesItem(job)");
   });
 });
 
@@ -240,6 +266,20 @@ describe("the automatic fill", () => {
     // The worker keeps the outcome per item and clears it when the item changes.
     expect(background).toMatch(/case "checkout:fill-result": \{[\s\S]*?fill: \{ itemIndex: job\.itemIndex, result/);
     expect(background).toMatch(/case "checkout:next": \{[\s\S]*?fill: null/);
+  });
+
+  it("sends the page's total only once the customer's address is set, and again when it changes", () => {
+    const cost = functionSource(checkout, "costBlock");
+    // Before the address is set the total carries the merchant's default address's tax and shipping.
+    expect(cost.indexOf("gate.addressSet()")).toBeLessThan(cost.indexOf("sendQuote("));
+    expect(cost).toContain("if (key && key !== lastQuoteKey) {");
+    expect(functionSource(checkout, "renderConfirm")).toContain("core.addressBlockShows(block.textContent, values)");
+    // The fill's "set" re-reads the total for a while.
+    const run = functionSource(checkout, "runFill");
+    expect(run).toContain('if (outcome.result === "set") afterSet?.();');
+    expect(functionSource(checkout, "autoFill")).toContain("afterSet?.();");
+    // The worker no longer locks the item after one send: a different total is posted, the same one is not.
+    expect(background).toMatch(/case "checkout:quote": \{[\s\S]*?if \(previous\?\.sent && core\.sameQuote\(previous, quote\)\) return \{ ok: true, alreadySent: true \};/);
   });
 });
 
@@ -289,6 +329,16 @@ describe("customer data stays inside the extension", () => {
     expect(drop).toContain('["recorded", "already", "advanced"].includes(entry.result)');
     expect(drop).toContain("await sweep(entry.purchaseOrderId)");
     expect(background).toMatch(/sync:orders"\) \{[\s\S]*?await dropRecordedJobs\(results\)/);
+    // A multi-item purchase order's "partial" result is noted in the job, never swept: the remaining items are still to buy.
+    expect(drop).not.toMatch(/partial/);
+    const attach = functionSource(background, "attachPartialResults", "");
+    expect(attach).toContain('entry?.result === "partial"');
+    expect(attach).toContain("core.attachOrderToJob(current, entry)");
+    // The last item's number finishes the purchase order through the same placed path as the panel's Send, paid only when every number reads as paid.
+    expect(attach).toContain("if (!core.isLastItem(current)) continue;");
+    expect(attach).toContain("const answer = await finish(current, paid);");
+    expect(attach).toContain("entry.paid === true");
+    expect(background).toMatch(/sync:orders"\) \{[\s\S]*?const results = await attachPartialResults\([\s\S]*?await dropRecordedJobs\(results\)/);
   });
 
   it("is cleared when the popup records the order, and when it expires without being read", () => {
@@ -332,8 +382,17 @@ describe("the orders-page sync reads order ids, product ids, SKU text, status, t
     for (const parser of ["core.parseOrderCard(", "core.parseOrderDetail(", "core.parseTrackingPage("]) expect(orders).toContain(parser);
     // Only these two messages leave the page, and the worker forwards only well-formed values.
     expect(orders.match(/ask\(\{ type: "([^"]+)"/g)).toEqual(['ask({ type: "sync:orders"', 'ask({ type: "sync:tracking"']);
-    expect(background).toMatch(/sync:orders"\) \{\s*const body = core\.ordersSyncBody\(message\.orders\)/);
+    // The paying hints carry a purchase order id and a time, read from the jobs in stage "paying", nothing of the customer.
+    expect(background).toMatch(/sync:orders"\) \{\s*const body = core\.ordersSyncBody\(message\.orders, await payingHints\(\)\)/);
+    const hints = functionSource(background, "payingHints", "");
+    expect(hints).toContain('job?.stage === "paying"');
+    expect(hints).toContain("({ purchaseOrderId: job.purchaseOrderId, payingAt: job.payingAt })");
+    expect(hints).not.toMatch(/address|items|phone/);
     expect(background).toMatch(/sync:tracking"\) \{\s*const tracking = core\.parseTrackingPage\(/);
+    // The detail page's product links are not read: its item block is unmeasured and its recommendation strips link products too.
+    const detail = functionSource(orders, "readDetail");
+    expect(detail).not.toMatch(/item|productHrefs|hrefs\(/);
+    expect(orders).toContain("hrefs(card, 'a[href*=\"/item/\"]')");
   });
 
   it("is registered for the order and tracking pages only, with the core first", () => {
@@ -347,10 +406,15 @@ describe("the orders-page sync reads order ids, product ids, SKU text, status, t
 describe("the app-page bridge", () => {
   it("is registered for the app's origin only once that permission is granted, never statically", () => {
     expect(manifest.content_scripts.some((entry: { js: string[] }) => entry.js.includes("app-bridge.js"))).toBe(false);
-    const register = functionSource(background, "registerAppBridge", "");
+    const register = functionSource(background, "registerAppBridgeNow", "");
     expect(register.indexOf("chrome.permissions.contains({ origins })")).toBeLessThan(register.indexOf("chrome.scripting.registerContentScripts("));
     expect(register).toContain("if (!granted) return false;");
     expect(register).toContain('js: ["app-bridge.js"], matches: origins');
+    // The start-up, onInstalled and onStartup calls are serialized, so two unregister/register pairs cannot race.
+    expect(functionSource(background, "registerAppBridge", "")).toContain("bridgeChain = bridgeChain.then(registerAppBridgeNow, registerAppBridgeNow)");
+    // Nothing calls the inner function directly: its only "()" is its declaration.
+    expect(background.match(/registerAppBridgeNow\(\)/g)).toEqual(["registerAppBridgeNow()"]);
+    expect(background).toMatch(/async function registerAppBridgeNow\(\)/);
     expect(background).toMatch(/chrome\.permissions\.onAdded\.addListener/);
     expect(popup).toContain('chrome.runtime.sendMessage({ type: "bridge:register" })');
   });

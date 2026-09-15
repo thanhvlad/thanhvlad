@@ -177,6 +177,10 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
           title: i.title,
           quantity: i.quantity,
           unitCost: i.unitCost.toString(),
+          // The item's own currency: after the checkout's quote the purchase
+          // order is in the account's currency while the item keeps the
+          // captured one, and a VND price shown as USD is a wrong number.
+          currency: i.currency,
           externalSkuId: i.externalSkuId,
           productUrl: supplierProductUrl(po.platform, i.externalProductId),
         })),
@@ -315,6 +319,8 @@ const EXTENSION_SOURCE = "dropshiphub-extension";
 const PAGE_SOURCE = "dropshiphub";
 /** How long the page waits for the extension's "ready" before saying it is not here. */
 const EXTENSION_WAIT_MS = 1500;
+/** How long the page waits for the checkout to start once the extension is here (its worker fetches the order from the app). */
+const EXTENSION_ANSWER_MS = 20000;
 
 type ExtensionState = { kind: "idle" | "waiting" | "started" | "missing" | "error"; error?: string };
 
@@ -354,6 +360,12 @@ function ExtensionOrderButton({ purchaseOrderId }: { purchaseOrderId: string }) 
     window.setTimeout(() => {
       if (!ready.current) setState((current) => (current.kind === "waiting" ? { kind: "missing" } : current));
     }, EXTENSION_WAIT_MS);
+    // "ready" came but neither "checkout:started" nor "checkout:error" did
+    // (the extension's worker stopped mid-fetch): the button must not stay
+    // loading until the page is reloaded.
+    window.setTimeout(() => {
+      setState((current) => (current.kind === "waiting" ? { kind: "error", error: t("orders.placement.extensionNoAnswer") } : current));
+    }, EXTENSION_ANSWER_MS);
   };
 
   return (
@@ -817,7 +829,7 @@ export default function OrderDetailPage() {
                                 )}
                               </Text>
                               <Text as="span" variant="bodySm" numeric>
-                                {formatMoney(i.unitCost, po.currency)}
+                                {formatMoney(i.unitCost, i.currency)}
                               </Text>
                             </InlineStack>
                           ))}

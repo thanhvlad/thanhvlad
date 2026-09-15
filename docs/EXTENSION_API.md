@@ -189,8 +189,11 @@ the Shopify fulfilment and the customer notification follow the shop's own setti
 ```
 
 What AliExpress's checkout page shows the purchase order costs, in the account's currency,
-sent by the checkout panel once per item per checkout (with several items, the running sum of
-the items quoted so far, since each item is its own AliExpress checkout). Accepted while the
+sent by the checkout panel once the page's address block shows the customer's address (before
+that the total carries the merchant's default address's shipping and tax, which follow the
+destination state) and again whenever the readable total changes; with several items, the
+running sum of the items quoted so far, since each item is its own AliExpress checkout. The
+extension keeps the last total sent per item and does not repeat it. Accepted while the
 purchase order is `AWAITING_PLACEMENT`, `AWAITING_PAYMENT` or `PLACED` (`409` otherwise).
 Sets `currency`, `itemsCost` = `subtotal` when given, else `total - shipping - charges` (never
 below 0), `shippingCost` = `shipping + charges`, `totalCost` = `total`; recomputes the
@@ -200,7 +203,8 @@ stores `raw.quote = { source, at }`; writes an `order.supplier_quote` activity l
 AliExpress shows 93.62 USD at checkout"); rolls the order's costs up and re-evaluates it. The
 panel sends the subtotal only when the page's rows add up to the total; with a promo code
 applied they do not, and the goods are then taken as the total less shipping and charges. The
-same total sent again answers `200 { ok: true, unchanged: true }` and writes nothing.
+same total sent again answers `200 { ok: true, unchanged: true }` and writes nothing, unless
+the shop-currency amounts on record are stale (a rate learned since), which it refreshes.
 Validation: a three-letter capital currency code, plain non-negative decimals, `source`
 must be `"confirm"`.
 
@@ -208,36 +212,65 @@ must be `"confirm"`.
 
 ```json
 { "orders": [{ "orderId": "8190000000000001", "productIds": ["3256809840464144", "1005010026778896"],
-               "skuText": "Play blue light", "status": "Awaiting delivery", "total": "$93.62", "date": "Sep 15, 2026" }] }
+               "skuText": "Play blue light", "status": "Awaiting delivery", "total": "$93.62", "date": "Sep 15, 2026" }],
+  "hints": [{ "purchaseOrderId": "…", "payingAt": 1789000000000 }] }
 ```
 
-The orders the merchant's AliExpress orders list shows (or the one order of a detail page),
-sent by `extension/orders.js`. For each order, in order:
+The orders the merchant's AliExpress orders list shows (or the one order of a detail page,
+which carries no `productIds`: its item block is unmeasured and its recommendation strips
+link products too), sent by `extension/orders.js`. `hints` names every checkout job whose
+merchant pressed Pay now, with the time of the click; it carries nothing of the customer. For
+each order, in order:
 
 - A purchase order of this shop already recorded with that AliExpress order id (the
   `externalOrderId` column or `raw.externalOrderIds`) has its status advanced from the
   AliExpress status, never backwards, with the existing rank rules: To pay / Awaiting payment
-  → `AWAITING_PAYMENT`; Awaiting shipment / Processing / Paid → `PAID`; Awaiting delivery /
-  Shipped → `SHIPPED`; Completed / Received → `DELIVERED`. Closed / Cancelled is reported
-  (`closed: true`) but never applied. Result `advanced`, or `already` when nothing changed.
+  → `AWAITING_PAYMENT` (with the 24-hour deadline when none is stored); Awaiting shipment /
+  Processing / Paid → `PAID`; Awaiting delivery / Shipped → `SHIPPED`; Completed / Received →
+  `DELIVERED`. Closed / Cancelled is reported (`closed: true`) but never applied. Result
+  `advanced`, or `already` when nothing changed.
+- An unknown order that is Closed / Cancelled on AliExpress is never recorded: result
+  `unmatched` with `closed: true`.
 - Otherwise the candidates are this shop's AliExpress purchase orders in
   `AWAITING_PLACEMENT` (placement mode extension) created within the last 14 days with an
   item whose `externalProductId` is one of `productIds` (both the regional id and the global
-  id, regional minus 2^51, are tried). Exactly one candidate, or exactly one whose item's
-  variant words (the skuAttr values, the supplier variant's attribute values) all appear in
-  `skuText`, is recorded through the same code path as `POST …/placed`
-  (`externalOrderIds = [orderId]`, `paid` unless the status is To pay), which sets the
-  payment link and deadline, tags the Shopify order and writes the log. An order first seen
-  already shipped moves on to `SHIPPED` at once. Result `recorded`.
-- Several candidates that cannot be told apart: result `ambiguous` with the candidates'
-  `purchaseOrderId` and `orderName`; nothing is recorded. None: `unmatched`.
+  id, regional minus 2^51, are tried). None: `unmatched`. The orders list shows the account's
+  whole history, so an unrecorded older order for the same product must never be taken for
+  the new one:
+  - the card's `date` must read as a calendar day ("Sep 15, 2026", "15 Sep 2026", ISO,
+    "15 thg 9, 2026", or a numeric date whose order is beyond doubt); otherwise result
+    `ambiguous` with `reason: "date-unreadable"` and the candidates, nothing recorded;
+  - candidates created after that day (in the shop's timezone) are dropped; when none is
+    left, result `unmatched` with `reason: "older-than-orders"` and the candidates;
+  - with several candidates left, the one whose item's variant words (the skuAttr values, the
+    supplier variant's attribute values) all appear in `skuText` is taken, else the one a
+    hint names whose Pay now was pressed on the card's day (or the day before); otherwise
+    result `ambiguous` with the candidates, nothing recorded;
+  - a candidate whose variant values are known and none of which the (non-empty) `skuText`
+    names is not recorded: result `ambiguous` with `reason: "variant-differs"`;
+  - a candidate with several items is not recorded either, since each item is its own
+    AliExpress checkout and the placed endpoint records a purchase order once with all its
+    numbers: result `partial` with `purchaseOrderId`, `orderName` and `matchedProductIds`
+    (the purchase order's product ids the card covers) and `paid`. The extension notes the
+    number on that item in its checkout job (any tab) and the job moves to "recorded"; once
+    the last item has its number the extension sends them together through `POST …/placed`
+    by itself (`paid` only when every number reads as paid on the page) and reports the
+    purchase order as recorded.
+  - The one single-item candidate left is recorded through the same code path as
+    `POST …/placed` (`externalOrderIds = [orderId]`, `paid` only when the status reads as paid
+    or later; an unreadable status counts as unpaid and keeps the 24-hour deadline), which
+    sets the payment link and deadline, tags the Shopify order and writes the log. An order
+    first seen already shipped moves on to `SHIPPED` at once. Result `recorded`.
 
 ```json
 { "ok": true, "results": [{ "orderId": "8190000000000001", "result": "recorded", "purchaseOrderId": "…", "orderName": "#1001", "status": "PAID" }] }
 ```
 
-Idempotent and safe to repeat. Validation: `orderId` 10–24 digits, `productIds` digits
-(at most 40), text fields capped, at most 100 orders per call, 30 calls per minute per shop.
+Idempotent and safe to repeat: the same list again records nothing twice, and a purchase
+order that was not recorded (ambiguous, partial, older, closed) can still be recorded by hand
+in the popup's "Mark as placed" or the checkout panel. Validation: `orderId` 10–24 digits,
+`productIds` digits (at most 40), text fields capped, at most 100 orders and 20 hints per
+call, 30 calls per minute per shop.
 
 ### `POST /api/extension/orders/sync-tracking`
 
@@ -248,7 +281,8 @@ Idempotent and safe to repeat. Validation: `orderId` 10–24 digits, `productIds
 Sent by `extension/orders.js` from an AliExpress tracking page. Finds the purchase order by
 the AliExpress order id and, unless it already has that tracking number, adds it through the
 same path as the popup's "Add tracking" and the order page. Answers
-`{ ok: true, result: "added" | "known" | "unmatched", orderName?, number? }`.
+`{ ok: true, result: "added" | "known" | "cancelled" | "unmatched", orderName?, number? }`;
+`cancelled` is a purchase order cancelled in DropshipHub, to which nothing is added.
 
 ### The checkout assist
 
@@ -267,15 +301,18 @@ order page in DropshipHub. Page facts it relies on are in `docs/ALIEXPRESS_PAGE_
    check that the page's product, SKU, quantity and country match, and DropshipHub's cost
    estimates (captured currency and shop currency) beside the page's total: a verdict against
    the estimate in the page's currency, or both amounts side by side when neither shares it.
-   Once the page's total is readable it is sent to the app (`…/quote`, above) and the panel
-   says so. The customer's address, with **Copy** buttons, sits in a collapsed block for the
-   rare case something has to be entered by hand.
+   Once the page's address block shows the customer's address and the total is readable, the
+   total is sent to the app (`…/quote`, above) and the panel says so; it is read again for a
+   while after the address is set and sent again when it changes. When the page's product,
+   SKU, quantity or destination does not match the item (a later navigation in the tab, say)
+   nothing is filled and nothing is sent. The customer's address, with **Copy** buttons, sits
+   in a collapsed block for the rare case something has to be entered by hand.
 4. **The address is filled by itself** as soon as the page's address block
    (`.pl-address-item-container`) exists. If the block already shows the customer's last name
    and house number the fill is skipped and the panel says the address is set. Otherwise the
-   extension opens the add-address form ("Add new address", or "Change" and then the
-   drawer's "Add new address"), presses "Enter manually" if needed, and detects which of the
-   two measured designs is on the page:
+   extension opens the add-address form ("Add new address", or "Change" - the `<a>` inside
+   `span.pl-address-item__arrrow` - and then the drawer's "Add new address"), presses "Enter
+   manually" if needed, and detects which of the two measured designs is on the page:
    - the **comet** form (`www.aliexpress.us` in English: `div.mt-form.deliver-address-form`,
      twelve inputs located by position, one "Select address" cascade modal for State and
      City) - the fill stops unless the Country/region box already shows the United States;
@@ -292,10 +329,13 @@ order page in DropshipHub. Page facts it relies on are in `docs/ALIEXPRESS_PAGE_
    yourself. After a save it waits for the drawer to close and the address block to show the
    customer's name and house number, then reports "Address set. Check the total, then press
    Pay now on AliExpress yourself." The outcome is recorded in the job, so a page reload does
-   not run a finished fill again; **Fill address again** retries. It stops, with the reason,
-   for any other country, any form that does not look like the measured forms, a form that
-   already holds another address, or a form whose default switch is on. It works with
-   AliExpress in English or Vietnamese only.
+   not run a finished fill again; a fill that stopped ("partial" or "failed") is not run
+   again by itself either, because you may be correcting the form by hand: after a reload the
+   panel shows why it stopped, and **Fill address again** retries. The checkout is checked
+   once more right before Save is clicked, so a checkout cancelled during the read-back is
+   not committed. It stops, with the reason, for any other country, any form that does not
+   look like the measured forms, a form that already holds another address, or a form whose
+   default switch is on. It works with AliExpress in English or Vietnamese only.
 5. **You** press Pay now. The extension never clicks Pay now / Place order, Buy now, any
    payment choice, coupon, the quantity stepper, the address list's radios, edit or delete
    icons, or "Set as default": every click it makes goes through one guard that refuses those
@@ -306,21 +346,30 @@ order page in DropshipHub. Page facts it relies on are in `docs/ALIEXPRESS_PAGE_
 6. The panel then says "Payment started on AliExpress. When it is done, open your AliExpress
    orders and DropshipHub records the order number by itself", with **Open my AliExpress
    orders**. On the orders list `extension/orders.js` reads every order card and sends it to
-   `…/sync` (above); a small panel (bottom right) reports "#1001 recorded as AliExpress order
-   8190…" or "no DropshipHub order matched", and the checkout job is dropped as soon as its
-   purchase order is recorded. On a tracking page the carrier and tracking number go to
-   `…/sync-tracking` and are added to the purchase order. Entering the order number by hand
-   stays available in a collapsed block of the panel, and in the popup's "Mark as placed".
-   With more items, **Next item** opens the next product in the same tab.
+   `…/sync` (above), with the paying hints of the open checkout jobs; a small panel (bottom
+   right) reports "#1001 recorded as AliExpress order 8190…", why an order was not recorded
+   (its date could not be read, it is dated before the order waiting for its product, it is
+   closed, its SKU text names another variant, or several orders wait for the same product -
+   record it in the popup then), or "no DropshipHub order matched". The checkout job is
+   dropped as soon as its purchase order is recorded. For a purchase order with several
+   items the sync answers `partial` and the number is noted on the item being checked out;
+   the panel shows it as recorded and **Next item** opens the next product in the same tab;
+   when the last item's number arrives the extension sends them all to the app by itself
+   and the orders page reports the purchase order as recorded. On a tracking page the carrier
+   and tracking number go to `…/sync-tracking` and are added to the purchase order. Entering
+   the order number by hand stays available in a collapsed block of the panel, and in the
+   popup's "Mark as placed".
 
 **What is read from which page, and nothing else:** the confirm page's address block text
 (to see whether the customer's address is set), address form boxes (to verify the fill),
 summary and total rows; the orders list's cards: AliExpress order ids, product ids, SKU
-text, status, totals and dates; an order detail page's "Ref. Number" row and status; a
-tracking page's order id (from its address), carrier and tracking number. The orders list,
-order detail and tracking pages also print the customer's address and a masked name; the
-extension never reads those, and only order ids, product ids, SKU text, status, totals,
-dates, carriers and tracking numbers are sent to the app from them.
+text, status, totals and dates; an order detail page's "Ref. Number" row and status (never
+its product links); a tracking page's order id (from its address), carrier and tracking
+number. The orders list, order detail and tracking pages also print the customer's address
+and a masked name; the extension never reads those, and only order ids, product ids, SKU
+text, status, totals, dates, carriers and tracking numbers are sent to the app from them,
+plus the paying hints (a purchase order id and the time Pay now was pressed, from the
+extension's own jobs).
 
 The checkout job, including the customer's address, lives only in the extension's
 `chrome.storage.session` (memory only, cleared when the browser closes) and is removed when

@@ -8,8 +8,9 @@
  * the purchase order's variant and opens the confirm page for it; on the
  * confirm page it fills the customer's address by itself as soon as the page
  * is ready, saves it to the merchant's AliExpress address book once every box
- * reads back as intended, sends the page's real total to the app, and shows
- * the order beside the page's total. The merchant presses Pay now. The click
+ * reads back as intended, sends the page's real total to the app once that
+ * address is set (and again when it changes), and shows the order beside the
+ * page's total. The merchant presses Pay now. The click
  * on Pay now is observed (never made) and the orders page then records the
  * AliExpress order number (orders.js).
  *
@@ -435,12 +436,22 @@
     return `DropshipHub expects ${amounts}${scope}.`;
   }
 
-  function costBlock(job) {
+  /**
+   * The page's total beside DropshipHub's estimate, and the real total for
+   * the app. The total is sent only while the page shows the customer's
+   * address and the page is this item's checkout: before the address is set
+   * the total carries the merchant's default address's shipping and tax
+   * (US sales tax follows the destination state). It is sent again whenever
+   * it changes (the worker and the app both ignore a repeat), and `again()`
+   * re-reads it for a while once the address has just been set.
+   */
+  function costBlock(job, gate) {
     const expectations = core.expectedCosts(job);
     const line = el("div");
     const detail = el("div", { className: "muted" });
     const quoteLine = el("div");
-    let quoted = false;
+    let lastQuoteKey = null;
+    let loop = 0;
     const render = () => {
       const pageText = readPageTotalText();
       const verdict = core.compareTotals(expectations, pageText);
@@ -451,38 +462,57 @@
       else if (verdict.kind === "other-currency") say(line, "AliExpress shows the total in a currency DropshipHub has no estimate in, so the two amounts are shown side by side.", "");
       else if (verdict.kind === "no-expectation" && verdict.page) say(line, "", "");
       else say(line, "Waiting for the page's total…", "");
-      if (verdict.page && !quoted) {
-        quoted = true;
-        sendQuote(job, pageText, quoteLine);
+      if (verdict.page && gate.pageMatches() && gate.addressSet()) {
+        const quote = core.quoteFromPage({ totalText: pageText, rows: readSummaryRows() });
+        const key = quote ? JSON.stringify(quote) : null;
+        if (key && key !== lastQuoteKey) {
+          lastQuoteKey = key;
+          sendQuote(quote, quoteLine);
+        }
+      } else if (verdict.page && !lastQuoteKey) {
+        say(quoteLine, gate.pageMatches() ? "The real price goes to DropshipHub once the customer's address is set on this page." : "The real price is not sent: this page does not match the order.", "");
       }
       // Done only once the page's total has been read. Stopping on any
       // verdict stopped at once for an order with no estimate, and the panel
       // then said "not readable yet" until the merchant pressed the button.
       return Boolean(verdict.page);
     };
-    render();
-    // The total renders after the page's own data arrives; look again for a while, then stop.
-    (async () => {
-      for (let i = 0; i < 20 && line.isConnected; i += 1) {
+    // The total renders after the page's own data arrives, and again after
+    // the address is set; look for a while, then stop. A newer watch ends an
+    // older one.
+    const watch = async (untilReadable) => {
+      const mine = ++loop;
+      for (let i = 0; i < 20 && line.isConnected && loop === mine; i += 1) {
         await sleep(750);
-        if (render()) break;
+        if (render() && untilReadable) break;
       }
-    })();
-    return el("div", { className: "stack" }, [line, detail, quoteLine, button("Check the total again", render, "act secondary")]);
+    };
+    render();
+    watch(true);
+    return {
+      node: el("div", { className: "stack" }, [line, detail, quoteLine, button("Check the total again", render, "act secondary")]),
+      again: () => {
+        render();
+        watch(false);
+      },
+    };
   }
 
   /**
-   * The page's real total goes to the app once per item per checkout: the
-   * captured price was in the product page's currency (VND on the measured
-   * account) and the checkout charges the account's (USD), so the estimate
-   * is not the price paid. The worker remembers what was sent in the job.
+   * The page's real total goes to the app: the captured price was in the
+   * product page's currency (VND on the measured account) and the checkout
+   * charges the account's (USD), so the estimate is not the price paid. The
+   * worker keeps the last total sent in the job and skips a repeat.
    */
-  async function sendQuote(job, totalText, target) {
-    const quote = core.quoteFromPage({ totalText, rows: readSummaryRows() });
-    if (!quote) return;
+  async function sendQuote(quote, target) {
     const answer = await ask({ type: "checkout:quote", quote });
-    if (answer.ok) say(target, answer.alreadySent ? "The real price was already sent to DropshipHub." : "The real price was sent to DropshipHub.", "ok");
+    if (answer.ok) say(target, answer.alreadySent || answer.unchanged ? "The real price is on record in DropshipHub." : "The real price was sent to DropshipHub.", "ok");
     else if (answer.error && answer.error !== RELOADED) say(target, `The real price was not sent to DropshipHub: ${answer.error}`, "warn");
+  }
+
+  /** Whether this confirm page is the checkout of the job's current item: its product, SKU, quantity and destination. */
+  function pageMatchesItem(job) {
+    return core.confirmUrlMismatches(location.href, job.items[job.itemIndex], job.address.countryCode).length === 0;
   }
 
   function urlChecks(job) {
@@ -669,13 +699,23 @@
     const checks = urlChecks(job);
     const address = addressBlock(job, values);
     const fillStatus = el("div", { className: "stack" });
-    const fill = button("Fill address again", () => runFill(job, values, fillStatus, fill), "act secondary");
+    // What the total's sender checks before every send: the page is this
+    // item's checkout, and its address block shows the customer's address.
+    const gate = {
+      pageMatches: () => pageMatchesItem(job),
+      addressSet: () => {
+        const block = document.querySelector(".pl-address-item-container");
+        return Boolean(block && core.addressBlockShows(block.textContent, values));
+      },
+    };
+    const cost = costBlock(job, gate);
+    const fill = button("Fill address again", () => runFill(job, values, fillStatus, fill, cost.again), "act secondary");
     const record = recordBlock(job);
 
     body.append(
       itemBlock(job),
       checks.node,
-      costBlock(job),
+      cost.node,
       el("div", { className: "stack" }, [el("div", { className: "muted", text: "Address" }), fillStatus, fill]),
       el("div", { className: "note", text: PAY_YOURSELF }),
       disclosure("Customer address (copy by hand)", address.node),
@@ -687,19 +727,33 @@
       record.suggest();
     };
     observePayClick();
-    autoFill(job, values, fillStatus, fill);
+    autoFill(job, values, fillStatus, fill, cost.again);
   }
 
   /**
    * The address fill, run by itself as soon as the confirm page is ready.
-   * Skipped when the page's address block already shows the customer's
-   * address, and when the job records a fill that stopped (the merchant may
-   * be correcting the form by hand, and "Fill address again" is there).
+   * Skipped when the page is not this item's checkout, when the page's
+   * address block already shows the customer's address, and when the job
+   * records a fill that stopped (the merchant may be correcting the form by
+   * hand, and "Fill address again" is there). `afterSet` re-reads the total
+   * once the address is set.
    */
-  async function autoFill(job, values, status, fillButton) {
+  async function autoFill(job, values, status, fillButton, afterSet) {
     const key = `${job.purchaseOrderId}:${job.itemIndex}`;
-    if (autoFillFor === key) return;
+    if (autoFillFor === key) {
+      // The view was rebuilt in the same page (back from "paying", say): the
+      // outcome on record is shown rather than the fill run again.
+      const outcome = core.fillOutcomeFor(job);
+      if (outcome?.result === "set") report(status, "Address set. Check the total, then press Pay now on AliExpress yourself.", "ok");
+      else if (outcome) report(status, `The last fill stopped: ${outcome.reason} Check the form, or press Fill address again.`, "warn");
+      return;
+    }
     autoFillFor = key;
+    if (!pageMatchesItem(job)) {
+      report(status, "This checkout page does not match the order (see the check above), so the address was not filled and the total is not sent.", "warn");
+      status.append(button("Open this item's checkout again", () => ask({ type: "checkout:reopen-product" }), "act secondary"));
+      return;
+    }
     const view = panel.view;
     report(status, "Waiting for the page's address block…");
     const block = await waitFor(() => document.querySelector(".pl-address-item-container"), 20000);
@@ -714,6 +768,7 @@
       report(status, "The address on this page is the customer's. Check the total, then press Pay now on AliExpress yourself.", "ok");
       const outcome = core.fillOutcomeFor(job);
       if (!outcome || outcome.result !== "set") await ask({ type: "checkout:fill-result", result: "set", reason: "The page already showed the address." });
+      afterSet?.();
       return;
     }
     if (!core.shouldAutoFill(job, shown)) {
@@ -721,11 +776,11 @@
       report(status, `The last fill stopped: ${outcome?.reason ?? "see the form."} Check the form, or press Fill address again.`, "warn");
       return;
     }
-    await runFill(job, values, status, fillButton);
+    await runFill(job, values, status, fillButton, afterSet);
   }
 
   /** One fill, from the automatic run or the button, with its outcome recorded in the job. */
-  async function runFill(job, values, status, fillButton) {
+  async function runFill(job, values, status, fillButton, afterSet) {
     fillButton.disabled = true;
     status.textContent = "";
     let outcome = { result: "failed", reason: "The fill stopped unexpectedly." };
@@ -741,6 +796,8 @@
       if (fillButton.isConnected) fillButton.focus();
     }
     await ask({ type: "checkout:fill-result", result: outcome.result, reason: outcome.reason });
+    // The saved address changes the page's shipping and tax: the total is read again.
+    if (outcome.result === "set") afterSet?.();
   }
 
   /**
@@ -980,7 +1037,11 @@
         return null;
       }
     } else {
-      const change = document.querySelector("span.pl-address-item__arrrow a, span.pl-address-item__arrrow");
+      // The measured "Change" control is the <a> inside the span (no href, no
+      // classes). One selector list would return the span, which precedes its
+      // own child in tree order, and a click on the span never reaches the
+      // anchor's handler.
+      const change = document.querySelector("span.pl-address-item__arrrow a") ?? document.querySelector("span.pl-address-item__arrrow");
       if (!change) {
         report(status, 'Open the add-address form on this page ("Add new address", or "Change" and then "Add new address"), then press Fill address again.', "warn");
         return null;
@@ -1017,6 +1078,13 @@
       report(status, "Fill address works on AliExpress's checkout page only.", "err");
       return outcome("failed", "Not on the checkout page.");
     }
+    if (!pageMatchesItem(job)) {
+      // A later navigation in this tab (Buy now on another product, say)
+      // lands on a confirm page that is not this item's; the customer's
+      // address must not be saved into that checkout.
+      report(status, "This checkout page does not match the order (see the check above), so nothing was filled. Open this item's checkout again.", "err");
+      return outcome("failed", "The page does not match the item.");
+    }
     if (job.address.countryCode !== "US") {
       // Only the US form has been measured; other countries render other
       // fields (Vietnam: province, district, ward) in other positions.
@@ -1042,9 +1110,14 @@
     return [...form.querySelectorAll("input")];
   }
 
-  /** The drawer around the comet form, where "Set as default" and Save sit. */
+  /**
+   * The drawer around the comet form, where "Set as default" and Save sit.
+   * The drawer is the widest measured container: whether the switch and the
+   * Save button sit inside `.deliver-address-wrap` or in the drawer's footer
+   * has not been measured, and looking only in the wrap could miss them.
+   */
   function cometScope(form) {
-    return form.closest(".comet-drawer, .deliver-address-wrap") ?? form.parentElement ?? form;
+    return form.closest(".comet-drawer") ?? form.closest(".deliver-address-wrap") ?? form.parentElement ?? form;
   }
 
   /** The "Set as default" switch, for reading only: nothing here clicks or sets it. */
@@ -1276,7 +1349,7 @@
       return outcome("partial", reason);
     }
     for (const node of flags) mark(node, "#b98900");
-    return saveAddressForm({ design: "comet", form: current, values, intended, countryCandidates, stateCandidates, cityOther: cascade.cityOther === true, status });
+    return saveAddressForm({ design: "comet", form: current, job, values, intended, countryCandidates, stateCandidates, cityOther: cascade.cityOther === true, status });
   }
 
   // ---------------------------------------------------------------------------
@@ -1580,7 +1653,7 @@
     }
     for (const node of flags) mark(node, "#b98900");
     if (state.error || wrong.length > 0 || !current) return finishFusionByHand(status, flags);
-    return saveAddressForm({ design: "fusion", form: current, values, intended, countryCandidates, stateCandidates, cityOther, status });
+    return saveAddressForm({ design: "fusion", form: current, job, values, intended, countryCandidates, stateCandidates, cityOther, status });
   }
 
   /** A Fusion fill that could not be verified: the merchant checks and presses Confirm. */
@@ -1671,9 +1744,14 @@
    * country the United States, and "Set as default" off. Anything else
    * highlights the form and asks the merchant to check and save themselves.
    * After the click it waits for the drawer to close and the page's address
-   * block to show the customer's name and house number.
+   * block to show the customer's name and house number. The checkout is
+   * checked once more first: cancelled during the read-back, the address
+   * would otherwise still be committed to the merchant's address book. From
+   * the snapshot to the click nothing waits, so what was verified is what is
+   * saved.
    */
-  async function saveAddressForm({ design, form, values, intended, countryCandidates, stateCandidates, cityOther, status }) {
+  async function saveAddressForm({ design, form, job, values, intended, countryCandidates, stateCandidates, cityOther, status }) {
+    if (!(await fillMayContinue(job, status))) return outcome("partial", "The checkout moved on.");
     const snapshot = design === "comet"
       ? cometSaveSnapshot(form, values, intended, countryCandidates, stateCandidates, cityOther)
       : fusionSaveSnapshot(form, values, intended, countryCandidates, stateCandidates, cityOther);

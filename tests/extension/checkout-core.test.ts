@@ -605,6 +605,27 @@ describe("the AliExpress orders list, order detail and tracking pages", () => {
     expect(core.orderStatusFromText(null)).toBe("");
   });
 
+  it("reads the status where the card prints it, unpaid first, never from a product title or a longer word", () => {
+    // The measured card: status, then "Date:". A title after it must not read as a status.
+    expect(core.orderStatusFromText("To payDate: Sep 15, 2026Ref. Number: 8190 Food Processing Machine Total:$3")).toBe("To pay");
+    expect(core.orderStatusFromText("To pay Food Processing Machine Total:$3")).toBe("To pay");
+    expect(core.orderStatusFromText("Awaiting paymentDate: Sep 15 Completed Set Total:$3")).toBe("Awaiting payment");
+    // The lookahead is case-sensitive: a lowercase letter after the phrase is more of the same word.
+    expect(core.orderStatusFromText("To payment due")).toBe("");
+    expect(core.orderStatusFromText("Paidup")).toBe("");
+    expect(core.orderStatusFromText("Date: Sep 15 Processing")).toBe("Processing");
+    // The status element's phrase wins, then the card's, then the element's raw text.
+    expect(core.parseOrderCard({ detailsHref: "?orderId=8190000000000001", productHrefs: [], statusText: "To payTrack status", cardText: "Completed" })).toMatchObject({ status: "To pay" });
+    expect(core.parseOrderCard({ detailsHref: "?orderId=8190000000000001", productHrefs: [], statusText: "Awaiting flight", cardText: "To payDate: Sep 15" })).toMatchObject({ status: "To pay" });
+    expect(core.parseOrderCard({ detailsHref: "?orderId=8190000000000001", productHrefs: [], statusText: "Awaiting flight", cardText: "" })).toMatchObject({ status: "Awaiting flight" });
+  });
+
+  it("takes Total and Date as whole labels, so Subtotal and Update are not read", () => {
+    const text = "To payDate: Sep 15, 2026Ref. Number: 8190000000000001 Details Update: Sep 1 Subtotal:$85.89 Total:$93.62Pay now";
+    expect(core.parseOrderCard({ detailsHref: "?orderId=8190000000000001", productHrefs: [], statusText: "", cardText: text })).toMatchObject({ status: "To pay", total: "$93.62", date: "Sep 15, 2026" });
+    expect(core.parseOrderCard({ detailsHref: "?orderId=8190000000000001", productHrefs: [], statusText: "", cardText: "Update: Sep 1 Subtotal:$85.89" })).toMatchObject({ total: "", date: "" });
+  });
+
   it("parses an order card into ids, SKU text, status, total and date, and nothing else", () => {
     const card = core.parseOrderCard({
       detailsHref: "https://www.aliexpress.com/p/order/detail.html?orderId=8190000000000001&spm=x",
@@ -632,10 +653,11 @@ describe("the AliExpress orders list, order detail and tracking pages", () => {
     expect(core.productIdsFromHrefs(["/item/abc.html", null])).toEqual([]);
   });
 
-  it("parses the order detail page and the tracking page", () => {
+  it("parses the order detail page (never its product links) and the tracking page", () => {
+    // The detail page's item block is unmeasured and its recommendation strips link products too: no product ids from it, so the app only advances an order it knows.
     expect(core.parseOrderDetail({ url: "https://www.aliexpress.com/p/order/detail.html?orderId=8190000000000001", refNumberText: "Ref. Number: 8190000000000001 Copy", statusText: " Awaiting delivery ", productHrefs: ["/item/1005006001.html"] })).toEqual({
       orderId: "8190000000000001",
-      productIds: ["1005006001"],
+      productIds: [],
       skuText: "",
       status: "Awaiting delivery",
       total: "",
@@ -661,14 +683,56 @@ describe("the AliExpress orders list, order detail and tracking pages", () => {
     expect(body.orders[0]).toEqual({ orderId: "8190000000000000", productIds: ["1005006001"], skuText: "Black", status: "To pay", total: "$1", date: "Sep 15" });
     expect(core.ordersSyncBody([{ orderId: "123" }])).toBeNull();
     expect(core.ordersSyncBody(null)).toBeNull();
+    // Paying hints: a purchase order id and a time each, well-formed only, at most 20, and left out when there are none.
+    const hinted = core.ordersSyncBody(orders.slice(0, 1), [{ purchaseOrderId: "po_waiting01", payingAt: 1789000000000 }, { purchaseOrderId: "x", payingAt: 1 }, { purchaseOrderId: "po_waiting02", payingAt: "soon" }, null]);
+    expect(hinted.hints).toEqual([{ purchaseOrderId: "po_waiting01", payingAt: 1789000000000 }]);
+    expect(core.ordersSyncBody(orders.slice(0, 1), Array.from({ length: 30 }, (_, i) => ({ purchaseOrderId: `po_waiting${i}`, payingAt: i, address: "never" }))).hints).toHaveLength(20);
+    expect(core.ordersSyncBody(orders.slice(0, 1), [])).not.toHaveProperty("hints");
+  });
+
+  it("notes a multi-item purchase order's partial result on the job's current item only", () => {
+    const job = { purchaseOrderId: "po_waiting01", stage: "paying", itemIndex: 1, items: [{ externalProductId: "1005006001" }, { externalProductId: "1005010026778896" }], recordedOrderIds: [["8190000000000000"], []] };
+    const entry = { orderId: "8190000000000001", result: "partial", purchaseOrderId: "po_waiting01", matchedProductIds: ["1005010026778896"] };
+    expect(core.attachOrderToJob(job, entry)).toEqual({ ...job, stage: "recorded", recordedOrderIds: [["8190000000000000"], ["8190000000000001"]] });
+    // The regional form of the id matches the stored global one.
+    expect(core.attachOrderToJob(job, { ...entry, matchedProductIds: ["3256809840464144"] })).toMatchObject({ stage: "recorded" });
+    expect(core.attachOrderToJob({ ...job, stage: "confirm" }, entry)).toMatchObject({ stage: "recorded" });
+    // Not this job's purchase order, another item's product, a number already noted, a job not on its checkout, another result.
+    expect(core.attachOrderToJob(job, { ...entry, purchaseOrderId: "po_waiting02" })).toBeNull();
+    expect(core.attachOrderToJob(job, { ...entry, matchedProductIds: ["1005006001"] })).toBeNull();
+    expect(core.attachOrderToJob(job, { ...entry, orderId: "8190000000000000" })).toBeNull();
+    expect(core.attachOrderToJob({ ...job, stage: "product" }, entry)).toBeNull();
+    expect(core.attachOrderToJob({ ...job, stage: "recorded" }, entry)).toBeNull();
+    expect(core.attachOrderToJob(job, { ...entry, result: "recorded" })).toBeNull();
+    expect(core.attachOrderToJob(job, { ...entry, orderId: "12" })).toBeNull();
+    expect(core.attachOrderToJob(null, entry)).toBeNull();
+  });
+
+  it("tells the same confirm-page quote from a changed one", () => {
+    const a = { currency: "USD", total: 93.62, subtotal: 85.89, shipping: 2.99, charges: 4.74 };
+    expect(core.sameQuote(a, { ...a, sent: true })).toBe(true);
+    expect(core.sameQuote(a, { ...a, total: 93.621 })).toBe(true);
+    expect(core.sameQuote(a, { ...a, total: 95.12, charges: 6.24 })).toBe(false);
+    expect(core.sameQuote(a, { ...a, subtotal: undefined })).toBe(false);
+    expect(core.sameQuote(a, { ...a, currency: "VND" })).toBe(false);
+    expect(core.sameQuote(a, null)).toBe(false);
+    // The purchase order's quote is rebuilt from the item's latest total, so the app gets the post-fill figure.
+    const after = { ...a, total: 95.12, charges: 6.24 };
+    expect(core.quoteBody(core.sumQuotes([after]))).toEqual({ currency: "USD", total: "95.12", subtotal: "85.89", shipping: "2.99", charges: "6.24", source: "confirm" });
   });
 
   it("describes each sync result in one line", () => {
     expect(core.describeSyncResult({ orderId: "8190000000000001", result: "recorded", orderName: "#21047" })).toBe("#21047 recorded as AliExpress order 8190000000000001.");
+    expect(core.describeSyncResult({ orderId: "8190000000000002", result: "recorded", orderName: "#21047", externalOrderIds: ["8190000000000001", "8190000000000002"] })).toBe("#21047 recorded as AliExpress orders 8190000000000001, 8190000000000002.");
     expect(core.describeSyncResult({ orderId: "8190000000000001", result: "already", orderName: "#21047", closed: true })).toMatch(/closed on AliExpress/);
     expect(core.describeSyncResult({ orderId: "8190000000000001", result: "advanced", orderName: "#21047", status: "SHIPPED" })).toBe("#21047 (AliExpress order 8190000000000001) is now shipped.");
+    expect(core.describeSyncResult({ orderId: "8190000000000001", result: "partial", orderName: "#21047" })).toMatch(/^#21047 has several items.*noted for its item in the checkout panel/);
     expect(core.describeSyncResult({ orderId: "8190000000000001", result: "ambiguous", candidates: [{ orderName: "#1" }, { orderName: "#2" }] })).toMatch(/#1, #2/);
+    expect(core.describeSyncResult({ orderId: "8190000000000001", result: "ambiguous", reason: "date-unreadable", candidates: [{ orderName: "#1" }] })).toMatch(/date could not be read.*older than #1/);
+    expect(core.describeSyncResult({ orderId: "8190000000000001", result: "ambiguous", reason: "variant-differs", candidates: [{ orderName: "#1" }] })).toMatch(/SKU text does not name the variant #1/);
     expect(core.describeSyncResult({ orderId: "8190000000000001", result: "unmatched" })).toBe("AliExpress order 8190000000000001: no DropshipHub order matched.");
+    expect(core.describeSyncResult({ orderId: "8190000000000001", result: "unmatched", closed: true })).toMatch(/closed on AliExpress, so it was not recorded/);
+    expect(core.describeSyncResult({ orderId: "8190000000000001", result: "unmatched", reason: "older-than-orders", candidates: [{ orderName: "#1" }] })).toMatch(/dated before #1 was created/);
     expect(core.describeSyncResult({ orderId: "8190000000000001", error: "boom" })).toBe("AliExpress order 8190000000000001: boom.");
   });
 });

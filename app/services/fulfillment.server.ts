@@ -1819,8 +1819,22 @@ const ExtensionSyncOrder = z
   })
   .strict();
 
+/**
+ * A checkout job whose merchant pressed Pay now: its purchase order is the
+ * likely match for an unknown AliExpress order dated that day. Only the
+ * purchase order's id and the time of the click travel; never the customer.
+ */
+const ExtensionSyncHint = z
+  .object({
+    purchaseOrderId: z.string().trim().regex(/^[A-Za-z0-9_-]{8,64}$/, "must be a purchase order id"),
+    payingAt: z.number().int().nonnegative(),
+  })
+  .strict();
+
 /** POST /api/extension/orders/sync */
-export const ExtensionSyncOrdersBody = z.object({ orders: z.array(ExtensionSyncOrder).min(1).max(100) }).strict();
+export const ExtensionSyncOrdersBody = z
+  .object({ orders: z.array(ExtensionSyncOrder).min(1).max(100), hints: z.array(ExtensionSyncHint).max(20).optional() })
+  .strict();
 
 /** POST /api/extension/orders/sync-tracking */
 export const ExtensionSyncTrackingBody = z
@@ -2259,10 +2273,21 @@ export async function recordSupplierQuote(shop: ShopWithSettings, purchaseOrderI
   const shipping = d(input.shipping ?? 0).plus(d(input.charges ?? 0));
   const goods = input.subtotal !== undefined ? d(input.subtotal) : total.minus(shipping);
   const itemsCost = goods.isNegative() ? d(0) : goods;
-  const unchanged = po.currency === input.currency && d(po.totalCost).equals(total) && d(po.itemsCost).equals(itemsCost) && d(po.shippingCost).equals(shipping);
+  const converted = await toShopCurrency(shop.currency, input.currency, itemsCost, shipping);
+  // The shop-currency amounts count too: the same total sent again after a
+  // rate became known refreshes them. With no rate on record right now they
+  // are left as they are rather than compared, so a missed lookup cannot
+  // clear amounts an earlier quote converted.
+  const shopSame =
+    !("shopCurrency" in converted) ||
+    (po.shopCurrency === converted.shopCurrency &&
+      po.shopItemsCost !== null &&
+      d(po.shopItemsCost).equals(converted.shopItemsCost) &&
+      po.shopShippingCost !== null &&
+      d(po.shopShippingCost).equals(converted.shopShippingCost));
+  const unchanged = po.currency === input.currency && d(po.totalCost).equals(total) && d(po.itemsCost).equals(itemsCost) && d(po.shippingCost).equals(shipping) && shopSame;
   if (unchanged) return { status: 200, body: { ok: true, unchanged: true, purchaseOrderId: po.id, currency: input.currency, totalCost: money(total) } };
 
-  const converted = await toShopCurrency(shop.currency, input.currency, itemsCost, shipping);
   await prisma.purchaseOrder.update({
     where: { id: po.id },
     data: {
@@ -2308,18 +2333,103 @@ export function aliExpressStatusToPurchaseOrderStatus(text: string | null | unde
 
 export interface ExtensionSyncResult {
   orderId: string;
-  result: "recorded" | "already" | "advanced" | "ambiguous" | "unmatched";
+  /**
+   * `partial`: the AliExpress order is one item of a purchase order with
+   * several items, each its own AliExpress checkout. Nothing is recorded
+   * here; the extension notes the number for that item in its checkout job
+   * and sends every item's number together through the placed endpoint.
+   */
+  result: "recorded" | "already" | "advanced" | "partial" | "ambiguous" | "unmatched";
   purchaseOrderId?: string;
   orderName?: string;
   status?: PurchaseOrderStatus;
-  /** The order is closed or cancelled on AliExpress; the purchase order was left as it is. */
+  /** The order is closed or cancelled on AliExpress; nothing was recorded or changed. */
   closed?: boolean;
+  /** Why an unknown order was not recorded on the candidate(s) named. */
+  reason?: "date-unreadable" | "variant-differs" | "older-than-orders";
   candidates?: Array<{ purchaseOrderId: string; orderName: string }>;
+  /** `partial`: the purchase order's product ids the AliExpress order covers, and whether the card reads as paid. */
+  matchedProductIds?: string[];
+  paid?: boolean;
   error?: string;
 }
 
 /** How far back a purchase order waiting for the extension is matched to an AliExpress order. */
 const SYNC_MATCH_WINDOW_MS = 14 * 24 * 3_600_000;
+const DAY_MS = 24 * 3_600_000;
+
+const MONTH_NAMES = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+
+function monthNumber(word: string): number | null {
+  const w = word.replace(/\.$/, "");
+  const index = MONTH_NAMES.findIndex((name) => name === w || name.slice(0, 3) === w || (w === "sept" && name === "september"));
+  return index >= 0 ? index + 1 : null;
+}
+
+function calendarDayOf(year: number, month: number, day: number): string | null {
+  if (year < 2000 || year > 2100 || month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
+  return date.toISOString().slice(0, 10);
+}
+
+/**
+ * The calendar day an AliExpress orders-list card prints ("Date: Sep 15,
+ * 2026"), as "YYYY-MM-DD", or null for text this app cannot read. Accepted:
+ * an English month name with the day and year in either order ("Sep 15,
+ * 2026", "15 Sep 2026", "September 15, 2026"), ISO "2026-09-15", the
+ * Vietnamese "15 thg 9, 2026" / "15 tháng 9 năm 2026", and a numeric date
+ * only when its order is beyond doubt ("15/09/2026"; "9/8/2026" is null).
+ * An unreadable date never records anything: the sync asks the merchant.
+ */
+export function parseAliExpressOrderDate(text: string | null | undefined): string | null {
+  const s = String(text ?? "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (!s) return null;
+  let m = /(?:^|[^a-z])([a-z]{3,9})\.? (\d{1,2})(?:st|nd|rd|th)?,? (\d{4})(?!\d)/.exec(s);
+  if (m) {
+    const month = monthNumber(m[1]);
+    if (month !== null) return calendarDayOf(Number(m[3]), month, Number(m[2]));
+  }
+  m = /(?:^|\D)(\d{1,2})(?:st|nd|rd|th)? ([a-z]{3,9})\.?,? (\d{4})(?!\d)/.exec(s);
+  if (m) {
+    const month = monthNumber(m[2]);
+    if (month !== null) return calendarDayOf(Number(m[3]), month, Number(m[1]));
+  }
+  m = /(?:^|\D)(\d{1,2}) (?:thg|thang) (\d{1,2}),? (?:nam )?(\d{4})(?!\d)/.exec(s);
+  if (m) return calendarDayOf(Number(m[3]), Number(m[2]), Number(m[1]));
+  m = /(?:^|\D)(\d{4})-(\d{2})-(\d{2})(?!\d)/.exec(s);
+  if (m) return calendarDayOf(Number(m[1]), Number(m[2]), Number(m[3]));
+  m = /(?:^|\D)(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})(?!\d)/.exec(s);
+  if (m) {
+    const first = Number(m[1]);
+    const second = Number(m[2]);
+    if (first > 12 && second <= 12) return calendarDayOf(Number(m[3]), second, first);
+    if (second > 12 && first <= 12) return calendarDayOf(Number(m[3]), first, second);
+  }
+  return null;
+}
+
+/** The calendar day of an instant in the shop's timezone, "YYYY-MM-DD"; UTC when the zone is unknown. */
+export function calendarDay(at: Date, timezone: string | null | undefined): string {
+  for (const zone of [timezone, "UTC"]) {
+    if (!zone) continue;
+    try {
+      return new Intl.DateTimeFormat("en-CA", { timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit" }).format(at);
+    } catch {
+      // An unknown zone name: fall through to UTC.
+    }
+  }
+  return at.toISOString().slice(0, 10);
+}
+
+function dayNumber(day: string): number {
+  return Date.UTC(Number(day.slice(0, 4)), Number(day.slice(5, 7)) - 1, Number(day.slice(8, 10)));
+}
 
 const REGIONAL_PRODUCT_OFFSET = 2n ** 51n;
 
@@ -2407,25 +2517,48 @@ async function placementCandidates(shopId: string, productIds: string[]): Promis
   });
 }
 
-/** Among several candidates, the one whose item's variant the card's SKU text names; null unless exactly one does. */
-function narrowBySkuText(candidates: SyncCandidate[], skuText: string | undefined): SyncCandidate | null {
+/**
+ * Whether the card's SKU text names one of the purchase order's variants:
+ * true, false, or null when there is nothing to compare (no SKU text, or no
+ * variant value on record). A variant value counts as named when every one
+ * of its words appears in the SKU text.
+ */
+function skuTextNames(po: SyncCandidate, skuText: string | undefined): boolean | null {
   const words = new Set(normalizedWords(skuText));
   if (words.size === 0) return null;
-  const matching = candidates.filter((po) =>
-    po.items.some((item) =>
-      itemVariantValues(item).some((value) => {
-        const wanted = normalizedWords(value);
-        return wanted.length > 0 && wanted.every((w) => words.has(w));
-      }),
-    ),
-  );
+  const values = po.items.flatMap((item) => itemVariantValues(item).map(normalizedWords)).filter((wanted) => wanted.length > 0);
+  if (values.length === 0) return null;
+  return values.some((wanted) => wanted.every((w) => words.has(w)));
+}
+
+/** Among several candidates, the one whose item's variant the card's SKU text names; null unless exactly one does. */
+function narrowBySkuText(candidates: SyncCandidate[], skuText: string | undefined): SyncCandidate | null {
+  const matching = candidates.filter((po) => skuTextNames(po, skuText) === true);
   return matching.length === 1 ? matching[0] : null;
+}
+
+/**
+ * Among several candidates, the one the extension's hint names: a checkout
+ * job whose merchant pressed Pay now on the day the card is dated (or the
+ * day before, for a payment finished after midnight). Null unless exactly
+ * one candidate is hinted that way, and never one the SKU text contradicts.
+ */
+function preferHinted(candidates: SyncCandidate[], hints: Array<{ purchaseOrderId: string; payingAt: number }>, orderDay: string, timezone: string, skuText: string | undefined): SyncCandidate | null {
+  const orderDayN = dayNumber(orderDay);
+  const hinted = candidates.filter((po) =>
+    hints.some((hint) => {
+      if (hint.purchaseOrderId !== po.id) return false;
+      const payingDayN = dayNumber(calendarDay(new Date(hint.payingAt), timezone));
+      return orderDayN >= payingDayN && orderDayN - payingDayN <= DAY_MS;
+    }),
+  );
+  return hinted.length === 1 && skuTextNames(hinted[0], skuText) !== false ? hinted[0] : null;
 }
 
 /** Folds an AliExpress status into a known purchase order, never backwards, and reports a closed order without applying it. */
 async function advanceFromAliExpress(
   shop: ShopWithSettings,
-  po: { id: string; status: PurchaseOrderStatus; paidAt: Date | null; shippedAt: Date | null; order: { id: string; name: string } },
+  po: { id: string; status: PurchaseOrderStatus; paidAt: Date | null; shippedAt: Date | null; paymentDueAt: Date | null; order: { id: string; name: string } },
   upstream: PurchaseOrderStatus | null,
   orderId: string,
   statusText: string | undefined,
@@ -2442,8 +2575,10 @@ async function advanceFromAliExpress(
       status: next,
       paidAt: ORDER_RANK[next] >= ORDER_RANK.PAID && !po.paidAt ? now : undefined,
       shippedAt: ORDER_RANK[next] >= ORDER_RANK.SHIPPED && !po.shippedAt ? now : undefined,
-      // Once AliExpress shows the order paid the 24-hour deadline no longer applies.
-      paymentDueAt: ORDER_RANK[next] >= ORDER_RANK.PAID ? null : undefined,
+      // Once AliExpress shows the order paid the 24-hour deadline no longer
+      // applies; one first seen still to pay gets it, so the payment queue
+      // shows when AliExpress will cancel it.
+      paymentDueAt: ORDER_RANK[next] >= ORDER_RANK.PAID ? null : next === "AWAITING_PAYMENT" && !po.paymentDueAt ? new Date(now.getTime() + DAY_MS) : undefined,
     },
   });
   await logActivity(shop.id, {
@@ -2462,20 +2597,61 @@ async function advanceFromAliExpress(
   return { ...base, result: "advanced", status: next };
 }
 
-async function syncOneOrder(shop: ShopWithSettings, order: z.infer<typeof ExtensionSyncOrder>): Promise<ExtensionSyncResult> {
+function describeCandidates(list: SyncCandidate[]): Array<{ purchaseOrderId: string; orderName: string }> {
+  return list.map((po) => ({ purchaseOrderId: po.id, orderName: po.order.name }));
+}
+
+/**
+ * One AliExpress order from the merchant's orders page. A known one advances
+ * its purchase order. An unknown one is recorded on a waiting purchase order
+ * only when that is beyond doubt: the order is not closed, it is dated on or
+ * after the day the purchase order was created (an AliExpress order cannot
+ * predate the purchase order it fulfils, and the list shows the account's
+ * whole history), exactly one waiting purchase order remains after the SKU
+ * text and the extension's paying hint are considered, and that one has a
+ * single item. Anything less is reported for the merchant to record, because
+ * a wrong record tags the Shopify order as placed and cannot be undone by a
+ * later sync.
+ */
+async function syncOneOrder(shop: ShopWithSettings, order: z.infer<typeof ExtensionSyncOrder>, hints: Array<{ purchaseOrderId: string; payingAt: number }>): Promise<ExtensionSyncResult> {
   const upstream = aliExpressStatusToPurchaseOrderStatus(order.status);
   const known = await findByExternalOrderId(shop.id, order.orderId);
   if (known) return advanceFromAliExpress(shop, known, upstream, order.orderId, order.status);
 
+  // Closed or cancelled on AliExpress: nothing was bought with it, so it is
+  // never recorded as the placement of anything.
+  if (upstream === "CANCELED") return { orderId: order.orderId, result: "unmatched", closed: true };
+
   const candidates = await placementCandidates(shop.id, order.productIds);
   if (candidates.length === 0) return { orderId: order.orderId, result: "unmatched" };
-  const chosen = candidates.length === 1 ? candidates[0] : narrowBySkuText(candidates, order.skuText);
-  if (!chosen) {
-    return { orderId: order.orderId, result: "ambiguous", candidates: candidates.map((po) => ({ purchaseOrderId: po.id, orderName: po.order.name })) };
+
+  const orderDay = parseAliExpressOrderDate(order.date);
+  if (!orderDay) {
+    // With no readable date the order may be older than the purchase order.
+    return { orderId: order.orderId, result: "ambiguous", reason: "date-unreadable", candidates: describeCandidates(candidates) };
+  }
+  const dated = candidates.filter((po) => orderDay >= calendarDay(po.createdAt, shop.timezone));
+  if (dated.length === 0) return { orderId: order.orderId, result: "unmatched", reason: "older-than-orders", candidates: describeCandidates(candidates) };
+
+  const chosen = dated.length === 1 ? dated[0] : (narrowBySkuText(dated, order.skuText) ?? preferHinted(dated, hints, orderDay, shop.timezone, order.skuText));
+  if (!chosen) return { orderId: order.orderId, result: "ambiguous", candidates: describeCandidates(dated) };
+  if (skuTextNames(chosen, order.skuText) === false) {
+    return { orderId: order.orderId, result: "ambiguous", reason: "variant-differs", candidates: describeCandidates([chosen]) };
+  }
+  // An unreadable status counts as unpaid: the 24-hour deadline is kept and
+  // the next sync can still advance it, while "paid" could never be taken back.
+  const paid = upstream !== null && ORDER_RANK[upstream] >= ORDER_RANK.PAID;
+  if (chosen.items.length > 1) {
+    // Each item is its own AliExpress checkout, and the placed endpoint
+    // records a purchase order once with every number: recording now would
+    // mark the whole purchase order placed after its first item, and the
+    // extension's job for the remaining items would be swept.
+    const forms = new Set(productIdForms(order.productIds));
+    const matchedProductIds = [...new Set(chosen.items.map((item) => item.externalProductId).filter((id): id is string => id !== null && forms.has(id)))];
+    return { orderId: order.orderId, result: "partial", purchaseOrderId: chosen.id, orderName: chosen.order.name, matchedProductIds, paid };
   }
   // The same path as the popup's "Mark as placed" and the checkout panel:
   // status, payment link and deadline, the placed tag, the cost roll-up.
-  const paid = upstream !== "AWAITING_PAYMENT";
   const answer = await markPlacedFromExtension(shop, chosen.id, { externalOrderIds: [order.orderId], paid }, { actor: "extension" });
   if (answer.status !== 200) return { orderId: order.orderId, result: "unmatched", error: String(answer.body.error ?? "not recorded") };
   const recorded: ExtensionSyncResult = {
@@ -2487,7 +2663,7 @@ async function syncOneOrder(shop: ShopWithSettings, order: z.infer<typeof Extens
   };
   // An order first seen already shipped (the list opened days later) moves on at once.
   const fresh = await findByExternalOrderId(shop.id, order.orderId);
-  if (fresh && upstream !== null && upstream !== "CANCELED" && ORDER_RANK[upstream] > ORDER_RANK[fresh.status]) {
+  if (fresh && upstream !== null && ORDER_RANK[upstream] > ORDER_RANK[fresh.status]) {
     const advanced = await advanceFromAliExpress(shop, fresh, upstream, order.orderId, order.status);
     return { ...recorded, status: advanced.status };
   }
@@ -2504,11 +2680,12 @@ async function syncOneOrder(shop: ShopWithSettings, order: z.infer<typeof Extens
 export async function syncOrdersFromExtension(shop: ShopWithSettings, input: z.infer<typeof ExtensionSyncOrdersBody>): Promise<ExtensionSyncResult[]> {
   const results: ExtensionSyncResult[] = [];
   const seen = new Set<string>();
+  const hints = input.hints ?? [];
   for (const order of input.orders) {
     if (seen.has(order.orderId)) continue;
     seen.add(order.orderId);
     try {
-      results.push(await syncOneOrder(shop, order));
+      results.push(await syncOneOrder(shop, order, hints));
     } catch (error) {
       logger.warn("Extension order sync failed for one order", { orderId: order.orderId, error });
       results.push({ orderId: order.orderId, result: "unmatched", error: errorMessage(error) });
@@ -2525,6 +2702,11 @@ export async function syncOrdersFromExtension(shop: ShopWithSettings, input: z.i
 export async function syncTrackingFromExtension(shop: ShopWithSettings, input: z.infer<typeof ExtensionSyncTrackingBody>): Promise<ExtensionAnswer> {
   const po = await findByExternalOrderId(shop.id, input.tradeOrderId);
   if (!po) return { status: 200, body: { ok: true, result: "unmatched", tradeOrderId: input.tradeOrderId } };
+  if (po.status === "CANCELED" || po.status === "FAILED") {
+    // Tracking for a cancelled purchase order is not added; "record it as
+    // placed first" would be the wrong advice for one the merchant cancelled.
+    return { status: 200, body: { ok: true, result: "cancelled", purchaseOrderId: po.id, orderName: po.order.name, number: input.trackingNumber } };
+  }
   const existing = await prisma.trackingNumber.findFirst({ where: { purchaseOrderId: po.id, number: input.trackingNumber }, select: { id: true } });
   if (existing) return { status: 200, body: { ok: true, result: "known", purchaseOrderId: po.id, orderName: po.order.name, number: input.trackingNumber } };
   const answer = await addTrackingFromExtension(shop, po.id, { number: input.trackingNumber, ...(input.carrier ? { carrier: input.carrier } : {}) });

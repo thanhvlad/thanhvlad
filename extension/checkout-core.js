@@ -1008,8 +1008,9 @@
         items,
         itemIndex: 0,
         recordedOrderIds: items.map(() => []),
-        // Per item: the confirm page's real total once read, with `sent`
-        // once the app has it, so it is posted once per item per job.
+        // Per item: the confirm page's real total as last read, with `sent`
+        // once the app has it; a changed total (the customer's address sets
+        // the tax and shipping) is posted again, the same one is not.
         quotes: items.map(() => null),
         // The last automatic fill's outcome for the current item, so a
         // reload does not run a finished fill again.
@@ -1054,12 +1055,18 @@
   const ALIEXPRESS_ORDER_ID = /^\d{10,24}$/;
   const TRACKING_NUMBER = /^[A-Za-z0-9-]{4,64}$/;
 
-  /** Status phrases the orders list uses, longest first so "Awaiting delivery" wins over "delivery". */
+  /**
+   * Status phrases the orders list uses. The unpaid ones come first: a card
+   * read as paid can never be taken back by a later sync, while one read as
+   * unpaid is advanced the next time. Then longest first, so "Awaiting
+   * delivery" wins over "delivery".
+   */
   const ORDER_STATUS_PHRASES = [
+    "To pay",
+    "Awaiting payment",
     "Awaiting confirmation",
     "Awaiting delivery",
     "Awaiting shipment",
-    "Awaiting payment",
     "Awaiting receipt",
     "Partially shipped",
     "In transit",
@@ -1071,19 +1078,30 @@
     "Received",
     "Refunded",
     "Shipped",
-    "To pay",
     "Closed",
     "Paid",
   ];
 
-  function orderStatusFromText(text) {
+  /**
+   * The part of a card's text that holds its status: the measured card prints
+   * the status first, then "Date: …", so nothing after "Date:" (or "Ref.
+   * Number") is a status. A product title such as "Food Processing Machine"
+   * sits after it and must not read as "Processing".
+   */
+  function statusScope(text) {
     const haystack = collapse(text);
+    const cut = haystack.search(/Date:|Ref\.?\s*Number|Ngày/);
+    return cut > 0 ? haystack.slice(0, cut) : haystack;
+  }
+
+  function orderStatusFromText(text) {
+    const haystack = statusScope(text);
     for (const phrase of ORDER_STATUS_PHRASES) {
-      // A whole phrase, not the inside of a longer word ("paid" in "unpaid").
-      // textContent glues neighbouring elements together ("Awaiting
-      // deliveryDate: …"), so a capital letter right after the phrase is a
-      // new word, not more of the same one.
-      const pattern = new RegExp(`(^|[^A-Za-z0-9])${phrase.replace(/\s+/g, "\\s+")}(?=$|[^A-Za-z0-9]|[A-Z])`, "i");
+      // A whole phrase with the capitals the list uses, not the inside of a
+      // longer word ("paid" in "unpaid", "To pay" in "To payment"). textContent
+      // glues neighbouring elements together ("Awaiting deliveryDate: …"), so a
+      // capital letter right after the phrase starts the next element's word.
+      const pattern = new RegExp(`(^|[^A-Za-z0-9])${phrase.replace(/\s+/g, "\\s+")}(?=$|[^A-Za-z0-9]|[A-Z])`);
       if (pattern.test(haystack)) return phrase;
     }
     return "";
@@ -1113,8 +1131,14 @@
     return [...ids];
   }
 
+  /**
+   * The text after "<label>:" on a card. The label is matched with its
+   * capital, so "Total" is never the end of "Subtotal" and "Date" never the
+   * end of "Update", while textContent's glued "…deliveryDate:" still counts:
+   * a capital after a lowercase letter is where the next element began.
+   */
   function textAfter(text, label, max) {
-    const pattern = new RegExp(`${label}:?\\s*(.{1,${max}}?)\\s*(?=Ref\\.?|Order|Details|Total|Date|Track|Confirm|Pay|View|$)`, "i");
+    const pattern = new RegExp(`(?:^|[^A-Z])${label}:?\\s*(.{1,${max}}?)\\s*(?=Ref\\.?|Order|Details|Total|Date|Track|Confirm|Pay|View|$)`);
     const match = pattern.exec(String(text ?? "").replace(/\s+/g, " "));
     return match ? collapse(match[1]) : "";
   }
@@ -1123,13 +1147,17 @@
    * One `.order-item` card of the orders list, from what the content script
    * read off it: the Details link, the product links, the card's own status
    * element text (may be empty) and the card's whole text. Nothing else on the
-   * card is looked at, and a card without an order id is nothing.
+   * card is looked at, and a card without an order id is nothing. The status
+   * is a known phrase in the card's status element, else a known phrase where
+   * the measured card prints it (before "Date:"), else the status element's
+   * own text, since that element's class has not been measured.
    */
   function parseOrderCard(input) {
     const orderId = orderIdFromHref(input?.detailsHref);
     if (!orderId) return null;
     const cardText = String(input?.cardText ?? "");
-    const status = collapse(input?.statusText).slice(0, 60) || orderStatusFromText(cardText);
+    const statusText = collapse(input?.statusText);
+    const status = (orderStatusFromText(statusText) || orderStatusFromText(cardText) || statusText).slice(0, 60);
     const totalText = textAfter(cardText, "Total", 40);
     const totalMoney = parseMoneyText(totalText);
     const total = totalMoney ? collapse(/^([^\d]{0,8}\d[\d.,' ]*\d?)/.exec(totalText)?.[1] ?? totalText).slice(0, 40) : "";
@@ -1143,7 +1171,14 @@
     };
   }
 
-  /** The one order on /p/order/detail.html: its id from the URL or the "Ref. Number" row, and `.order-status`. */
+  /**
+   * The one order on /p/order/detail.html: its id from the URL or the "Ref.
+   * Number" row, and `.order-status`. No product ids: the page's own item
+   * block has not been measured, and its recommendation strips carry product
+   * links too, so ids read from it could match a waiting purchase order for a
+   * product this order never contained. Without ids the app can only advance
+   * an order it already knows by number, never record one from this page.
+   */
   function parseOrderDetail(input) {
     const url = parseUrl(input?.url);
     const fromUrl = url ? url.searchParams.get("orderId") : null;
@@ -1153,7 +1188,7 @@
     const statusText = collapse(input?.statusText);
     return {
       orderId,
-      productIds: productIdsFromHrefs(input?.productHrefs),
+      productIds: [],
       skuText: "",
       status: (orderStatusFromText(statusText) || statusText).slice(0, 60),
       total: "",
@@ -1171,8 +1206,13 @@
     return { tradeOrderId, trackingNumber, carrier: collapse(input?.carrierText).slice(0, 80) };
   }
 
-  /** The body POST /api/extension/orders/sync takes: only well-formed orders, at most 100. */
-  function ordersSyncBody(orders) {
+  /**
+   * The body POST /api/extension/orders/sync takes: only well-formed orders,
+   * at most 100, plus the paying hints ({ purchaseOrderId, payingAt } of every
+   * checkout job whose merchant pressed Pay now), at most 20. A hint carries
+   * nothing of the customer.
+   */
+  function ordersSyncBody(orders, hints) {
     const list = (Array.isArray(orders) ? orders : [])
       .filter((o) => o && ALIEXPRESS_ORDER_ID.test(String(o.orderId ?? "")))
       .slice(0, 100)
@@ -1184,23 +1224,71 @@
         total: shortText(o.total, 40) ?? "",
         date: shortText(o.date, 40) ?? "",
       }));
-    return list.length > 0 ? { orders: list } : null;
+    if (list.length === 0) return null;
+    const body = { orders: list };
+    const hintList = (Array.isArray(hints) ? hints : [])
+      .filter((h) => h && isPurchaseOrderId(h.purchaseOrderId) && Number.isInteger(h.payingAt) && h.payingAt >= 0)
+      .slice(0, 20)
+      .map((h) => ({ purchaseOrderId: h.purchaseOrderId, payingAt: h.payingAt }));
+    if (hintList.length > 0) body.hints = hintList;
+    return body;
+  }
+
+  /**
+   * A `partial` sync result for the job's purchase order: the orders page
+   * found the AliExpress order for the item being checked out (its product is
+   * one the order covers). The number goes into that item's slot and the job
+   * moves to "recorded", as if the merchant had typed it, so "Next item" or
+   * "Send" follows. Null when the result is not for this job's current item,
+   * or the number is already noted.
+   */
+  function attachOrderToJob(job, entry) {
+    if (!job || !entry || entry.result !== "partial" || job.purchaseOrderId !== entry.purchaseOrderId) return null;
+    if (job.stage !== "confirm" && job.stage !== "paying") return null;
+    const orderId = String(entry.orderId ?? "");
+    if (!ALIEXPRESS_ORDER_ID.test(orderId) || jobOrderIds(job).includes(orderId)) return null;
+    const item = Array.isArray(job.items) ? job.items[job.itemIndex] : null;
+    const covered = Array.isArray(entry.matchedProductIds) ? entry.matchedProductIds : [];
+    if (!item || !covered.some((id) => sameProduct(id, item.externalProductId))) return null;
+    const recordedOrderIds = job.items.map((_, index) => (index === job.itemIndex ? [orderId] : (job.recordedOrderIds?.[index] ?? [])));
+    return { ...job, recordedOrderIds, stage: "recorded" };
+  }
+
+  /** Whether two quotes of the confirm page are the same amounts, so the app is not sent the same total twice. */
+  function sameQuote(a, b) {
+    if (!validQuote(a) || !validQuote(b)) return false;
+    if (a.currency !== b.currency) return false;
+    return ["total", "subtotal", "shipping", "charges"].every((key) => {
+      const left = nonNegative(a[key]) ? round2(a[key]) : null;
+      const right = nonNegative(b[key]) ? round2(b[key]) : null;
+      return left === right;
+    });
   }
 
   /** One line per synced order, for the small panel on the orders page. */
   function describeSyncResult(entry) {
     const id = String(entry?.orderId ?? "");
     const name = entry?.orderName ? String(entry.orderName) : "";
+    const names = (Array.isArray(entry?.candidates) ? entry.candidates : []).map((c) => c?.orderName).filter(Boolean).join(", ");
     switch (entry?.result) {
-      case "recorded":
-        return `${name} recorded as AliExpress order ${id}.`;
+      case "recorded": {
+        // A multi-item purchase order finished from its last item carries every number.
+        const ids = Array.isArray(entry.externalOrderIds) && entry.externalOrderIds.length > 1 ? entry.externalOrderIds.map(String) : [id];
+        return `${name} recorded as AliExpress order${ids.length > 1 ? "s" : ""} ${ids.join(", ")}.`;
+      }
       case "already":
         return `${name} is already recorded as AliExpress order ${id}${entry.closed ? " (closed on AliExpress; check it in DropshipHub)" : ""}.`;
       case "advanced":
         return `${name} (AliExpress order ${id}) is now ${String(entry.status ?? "").toLowerCase().replace(/_/g, " ")}.`;
+      case "partial":
+        return `${name} has several items, each its own AliExpress order. AliExpress order ${id} was noted for its item in the checkout panel; go on to the next item there, or record all its numbers in the extension's popup.`;
       case "ambiguous":
-        return `AliExpress order ${id} matches several DropshipHub orders (${(Array.isArray(entry.candidates) ? entry.candidates : []).map((c) => c?.orderName).filter(Boolean).join(", ")}). Record it in the extension's popup.`;
+        if (entry.reason === "date-unreadable") return `AliExpress order ${id} was not recorded: its date could not be read, so it may be older than ${names || "the DropshipHub order waiting"}. Record it in the extension's popup if it is that order.`;
+        if (entry.reason === "variant-differs") return `AliExpress order ${id} was not recorded: its SKU text does not name the variant ${names || "the DropshipHub order"} waits for. Record it in the extension's popup if it is that order.`;
+        return `AliExpress order ${id} matches several DropshipHub orders (${names}). Record it in the extension's popup.`;
       case "unmatched":
+        if (entry.closed) return `AliExpress order ${id} is closed on AliExpress, so it was not recorded.`;
+        if (entry.reason === "older-than-orders") return `AliExpress order ${id} is dated before ${names || "the DropshipHub order waiting for its product"} was created, so it was not recorded.`;
         return `AliExpress order ${id}: no DropshipHub order matched.`;
       default:
         return `AliExpress order ${id}: ${String(entry?.error ?? "not synced")}.`;
@@ -1288,6 +1376,7 @@
     quoteFromPage,
     validQuote,
     sumQuotes,
+    sameQuote,
     quoteBody,
     clickRefusal,
     buildJob,
@@ -1305,6 +1394,7 @@
     parseOrderDetail,
     parseTrackingPage,
     ordersSyncBody,
+    attachOrderToJob,
     describeSyncResult,
   });
 })(globalThis);
