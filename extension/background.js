@@ -265,7 +265,25 @@ async function fromAppPage(sender) {
   return origin !== null && origin === settings.base;
 }
 
-async function startCheckout(order) {
+/**
+ * The checkout's tab. With an opener (the app tab, on the order page's
+ * button) Chrome places the new tab next to it, in its window and tab group;
+ * Chrome refuses an opener it no longer knows or in another window, and the
+ * tab is then opened without one. The popup has no tab to open from.
+ */
+async function createCheckoutTab(opener) {
+  const options = { url: "about:blank", active: true };
+  if (opener && Number.isInteger(opener.tabId)) {
+    try {
+      return await chrome.tabs.create({ ...options, openerTabId: opener.tabId, ...(Number.isInteger(opener.windowId) ? { windowId: opener.windowId } : {}) });
+    } catch {
+      // Fall through: the checkout still opens, just not beside the app tab.
+    }
+  }
+  return chrome.tabs.create(options);
+}
+
+async function startCheckout(order, opener = null) {
   const built = core.buildJob(order, null, Date.now());
   if (built.error) return { ok: false, error: built.error };
   // Starting the same purchase order again replaces the older job, so two
@@ -274,22 +292,22 @@ async function startCheckout(order) {
   // An about:blank tab first, so the job is stored before any AliExpress page
   // in that tab can ask for it; opening the product directly would race the
   // write against the page's content script.
-  const tab = await chrome.tabs.create({ url: "about:blank", active: true });
+  const tab = await createCheckoutTab(opener);
   const job = { ...built.job, tabId: tab.id };
   await writeJob(job);
   await chrome.tabs.update(tab.id, { url: core.productPageUrl(job.items[0].externalProductId) });
   return { ok: true };
 }
 
-/** The app page named a purchase order; the order itself comes from the app with the token. */
-async function startCheckoutById(purchaseOrderId) {
+/** The app page named a purchase order; the order itself comes from the app with the token. The checkout opens beside that page's tab. */
+async function startCheckoutById(purchaseOrderId, opener) {
   if (!core.isPurchaseOrderId(purchaseOrderId)) return { ok: false, error: "No such order." };
   const call = await callApp("/api/extension/orders");
   if (call.error) return { ok: false, error: call.error };
   if (!call.ok) return { ok: false, error: core.explainRefusal(call.status, call.answer).replace(/^Not saved[:.]?\s*/, "") };
   const order = (Array.isArray(call.answer.orders) ? call.answer.orders : []).find((o) => o && o.id === purchaseOrderId);
   if (!order) return { ok: false, error: "This order is not waiting to be placed any more. Reload the page." };
-  return startCheckout(order);
+  return startCheckout(order, opener);
 }
 
 /** Jobs whose purchase order the orders page has just recorded are dropped, as on a record here. */
@@ -496,7 +514,7 @@ async function route(message, sender) {
   }
   if (message.type === "checkout:start-by-id") {
     if (!(await fromAppPage(sender))) return { ok: false, error: "Not allowed." };
-    return startCheckoutById(message.purchaseOrderId);
+    return startCheckoutById(message.purchaseOrderId, { tabId: sender.tab.id, windowId: sender.tab.windowId });
   }
   if (fromAliExpressTab(sender)) return handleTabMessage(message, sender);
   return { ok: false, error: "Not allowed." };

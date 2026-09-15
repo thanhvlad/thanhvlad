@@ -546,6 +546,21 @@
   }
 
   /**
+   * Whether the cascade modal has left the state level after a state was
+   * chosen: its steps (`.drawer-cascade-steps` text) name the chosen state,
+   * or the list no longer carries the state level's single-letter headers.
+   * Merely "the labels changed" is not enough: the state list re-rendering
+   * would read as the city list, and the customer's city would be looked for
+   * among states.
+   */
+  function cascadeMovedPastStates(labels, stepsText, stateLabel) {
+    const state = normalizeTitle(stateLabel);
+    if (state && normalizeTitle(stepsText).includes(state)) return true;
+    const list = (Array.isArray(labels) ? labels : []).map(collapse).filter(Boolean);
+    return list.length > 0 && !list.some((label) => label.length === 1);
+  }
+
+  /**
    * The city option: an exact match, else "Other", which AliExpress lists
    * last in every state. A city chosen as "Other" is flagged so the merchant
    * is told, and the save verification accepts it only with that flag.
@@ -599,7 +614,11 @@
    *   state:    { shown, candidates },
    *   city:     { shown, wanted, otherAccepted },
    *   defaultSwitch: "on" | "off" | "missing",
-   *   button:   { tag, type, text, classes, ancestorClasses, inForm, disabled } }
+   *   button:   { tag, type, text, classes, ancestorClasses, inForm, disabled, visible } }
+   *
+   * `visible` is whether the button has a box on the page (client rects); a
+   * button read as anything but visible is refused, since a hidden Save is
+   * not the one the drawer shows and its click was never verified.
    */
   function saveButtonRefusal(s) {
     if (!s || typeof s !== "object") return "Nothing to verify.";
@@ -624,6 +643,7 @@
     const type = String(b.type ?? "").toLowerCase();
     if (type === "submit" || (!type && b.inForm)) return "The Save button would submit a form.";
     if (b.disabled) return "The Save button is disabled.";
+    if (b.visible !== true) return "The Save button is not visible.";
     const text = collapse(b.text);
     if (!SAVE_WORDS[design].test(text)) return `The button reads "${text.slice(0, 40)}", not ${design === "comet" ? "Save" : "Confirm"}.`;
     const classes = Array.isArray(b.classes) ? b.classes.map(String) : [];
@@ -1364,6 +1384,7 @@
     cometFormStructure,
     cascadeLabels,
     chooseCascadeOption,
+    cascadeMovedPastStates,
     chooseCascadeCity,
     streetKey,
     addressBlockShows,

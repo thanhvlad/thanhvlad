@@ -2531,9 +2531,17 @@ function skuTextNames(po: SyncCandidate, skuText: string | undefined): boolean |
   return values.some((wanted) => wanted.every((w) => words.has(w)));
 }
 
-/** Among several candidates, the one whose item's variant the card's SKU text names; null unless exactly one does. */
+/**
+ * Among several candidates, the one whose item's variant the card's SKU text
+ * names: null unless exactly one is explicitly named and every other one is
+ * explicitly not. A candidate with nothing to compare (no variant value on
+ * record) is neither: it may well be the order the card belongs to, so it is
+ * never treated as non-matching to let another candidate win.
+ */
 function narrowBySkuText(candidates: SyncCandidate[], skuText: string | undefined): SyncCandidate | null {
-  const matching = candidates.filter((po) => skuTextNames(po, skuText) === true);
+  const verdicts = candidates.map((po) => skuTextNames(po, skuText));
+  if (verdicts.some((verdict) => verdict === null)) return null;
+  const matching = candidates.filter((_, index) => verdicts[index] === true);
   return matching.length === 1 ? matching[0] : null;
 }
 

@@ -418,6 +418,33 @@ describe("syncOrdersFromExtension", () => {
     expect(mocks.prisma.purchaseOrder.updateMany).not.toHaveBeenCalled();
   });
 
+  it("does not narrow to the variant the SKU text names while another candidate has no variant on record", async () => {
+    // A purchase order with nothing to compare (no skuAttr, no supplier
+    // variant, no variant title) may be the card's order as well: it is never
+    // read as non-matching so that the other candidate wins.
+    const blank = { ...waiting, id: "po_waiting03", order: { ...orderRef, id: "order3", name: "#21049" }, items: [{ externalProductId: "1005010026778896", externalSkuAttr: null, supplierVariant: null, orderLineItem: null }] };
+    mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(null);
+    mocks.prisma.purchaseOrder.findMany.mockResolvedValue([waiting, blank]);
+    const [ambiguous] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [card] });
+    expect(ambiguous).toEqual({ orderId: card.orderId, result: "ambiguous", candidates: [{ purchaseOrderId: waiting.id, orderName: "#21047" }, { purchaseOrderId: "po_waiting03", orderName: "#21049" }] });
+    // Nor the other way round: the blank one is not taken because the named one is not.
+    const [reversed] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [{ ...card, skuText: "Sunglasses CN" }] });
+    expect(reversed).toMatchObject({ result: "ambiguous", candidates: [{ purchaseOrderId: waiting.id }, { purchaseOrderId: "po_waiting03" }] });
+    expect(mocks.prisma.purchaseOrder.updateMany).not.toHaveBeenCalled();
+
+    // Every other candidate explicitly names another variant: the one the text names is recorded.
+    const other = { ...waiting, id: "po_waiting02", order: { ...orderRef, id: "order2", name: "#21048" }, items: [{ externalProductId: "1005010026778896", externalSkuAttr: "14:173#Sunglasses;200007763:201441035", supplierVariant: null, orderLineItem: null }] };
+    mocks.prisma.purchaseOrder.findFirst.mockReset();
+    mocks.prisma.purchaseOrder.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ ...waiting, order: { ...orderRef } })
+      .mockResolvedValueOnce({ ...waiting, status: "PAID", externalOrderId: card.orderId, raw: { externalOrderIds: [card.orderId] } });
+    mocks.prisma.purchaseOrder.findMany.mockResolvedValue([waiting, other]);
+    const [narrowed] = await fulfillment.syncOrdersFromExtension(makeShop(), { orders: [card] });
+    expect(narrowed).toMatchObject({ result: "recorded", purchaseOrderId: waiting.id, orderName: "#21047" });
+    expect(mocks.prisma.purchaseOrder.updateMany.mock.calls[0][0].where.id).toBe(waiting.id);
+  });
+
   it("reports unmatched orders, leaves API-placed purchase orders alone, and de-duplicates the list", async () => {
     mocks.prisma.purchaseOrder.findFirst.mockResolvedValue(null);
     mocks.prisma.purchaseOrder.findMany.mockResolvedValue([{ ...waiting, raw: { placementMode: "api" } }]);

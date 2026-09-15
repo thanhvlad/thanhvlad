@@ -493,6 +493,26 @@ describe("the comet address form (aliexpress.us, English)", () => {
     expect(core.chooseCascadeCity(cities, "")).toEqual({ label: "Other", isOther: true });
   });
 
+  it("takes the modal as moved to the cities only when its steps name the state or the letter headers are gone", () => {
+    const states = ["A", "Alabama", "Alaska", "T", "Tennessee", "Texas", "W", "Wyoming"];
+    const cities = ["Abbott", "Austin", "Zavalla", "Other"];
+    expect(core.cascadeMovedPastStates(cities, "Select address Texas Select city", "Texas")).toBe(true);
+    expect(core.cascadeMovedPastStates(cities, "", "Texas")).toBe(true);
+    expect(core.cascadeMovedPastStates(states, "Texas > Select city", "Texas")).toBe(true);
+    expect(core.cascadeMovedPastStates(states, "  texas  ", "Texas")).toBe(true);
+    // The state list re-rendered, or scrolled: still the state list, however its labels changed.
+    expect(core.cascadeMovedPastStates(states, "Select state", "Texas")).toBe(false);
+    expect(core.cascadeMovedPastStates(["T", "Tennessee", "Texas"], "Select state", "Texas")).toBe(false);
+    // The rule's edge: a list with no single-letter label at all is past the state level.
+    expect(core.cascadeMovedPastStates(core.cascadeLabels(states), "Select state", "Texas")).toBe(true);
+    expect(core.cascadeMovedPastStates([], "Select state", "Texas")).toBe(false);
+    expect(core.cascadeMovedPastStates(null, "", "Texas")).toBe(false);
+    // Another state's cities named in the steps do not count for this one; the headers do.
+    expect(core.cascadeMovedPastStates(states, "Alabama > Select city", "Texas")).toBe(false);
+    expect(core.cascadeMovedPastStates(cities, "Alabama > Select city", "Texas")).toBe(true);
+    expect(core.cascadeMovedPastStates(states, "Texas", "")).toBe(false);
+  });
+
   it("recognises the customer's address in the page's block by last name and house number", () => {
     const values = { firstName: "Test", lastName: "Customer", street: "12345 Northwest Evergreen Parkway" };
     expect(core.streetKey(values.street)).toBe("12345 Northwest");
@@ -515,7 +535,7 @@ describe("the comet address form (aliexpress.us, English)", () => {
       state: { shown: "Texas", candidates: ["Texas"] },
       city: { shown: "Austin", wanted: "Austin", otherAccepted: false },
       defaultSwitch: "off",
-      button: { tag: "BUTTON", type: "button", text: "Save", classes: ["form-button-confirm", "comet-btn"], ancestorClasses: ["deliver-address-wrap", "comet-drawer-body"], inForm: false, disabled: false },
+      button: { tag: "BUTTON", type: "button", text: "Save", classes: ["form-button-confirm", "comet-btn"], ancestorClasses: ["deliver-address-wrap", "comet-drawer-body"], inForm: false, disabled: false, visible: true },
     });
 
     it("allows Save only when everything reads back as intended", () => {
@@ -538,6 +558,10 @@ describe("the comet address form (aliexpress.us, English)", () => {
       ["a submit button", { button: { ...good().button, type: "submit" } }, /submit/],
       ["an untyped button inside a form", { button: { ...good().button, type: null, inForm: true } }, /submit/],
       ["a disabled button", { button: { ...good().button, disabled: true } }, /disabled/],
+      // A hidden Save is not the one the drawer shows; one not read as visible counts as hidden.
+      ["a hidden button", { button: { ...good().button, visible: false } }, /not visible/],
+      ["a button whose visibility was not read", { button: { ...good().button, visible: undefined } }, /not visible/],
+      ["a button read as visible by a string", { button: { ...good().button, visible: "true" } }, /not visible/],
       ["a button that is not Save", { button: { ...good().button, text: "Confirm" } }, /not Save/],
       ["Pay now", { button: { ...good().button, text: "Pay now" } }, /not Save/],
       ["a button without the form's Save class", { button: { ...good().button, classes: ["comet-btn"] } }, /not the address form's Save/],
@@ -554,11 +578,12 @@ describe("the comet address form (aliexpress.us, English)", () => {
         ...good(),
         design: "fusion",
         boxes: ["Test", "Customer", "+1", "5125550100", "12345 Northwest Evergreen Parkway", "Suite 400, Bldg B", "78701", ""],
-        button: { tag: "BUTTON", type: "button", text: "Confirm", classes: ["next-btn", "next-btn-primary"], ancestorClasses: ["next-dialog-footer"], inForm: false, disabled: false },
+        button: { tag: "BUTTON", type: "button", text: "Confirm", classes: ["next-btn", "next-btn-primary"], ancestorClasses: ["next-dialog-footer"], inForm: false, disabled: false, visible: true },
       };
       expect(core.saveButtonRefusal(fusion)).toBeNull();
       expect(core.saveButtonRefusal({ ...fusion, button: { ...fusion.button, text: "Xác nhận" } })).toBeNull();
       expect(core.saveButtonRefusal({ ...fusion, button: { ...fusion.button, text: "Save" } })).toMatch(/not Confirm/);
+      expect(core.saveButtonRefusal({ ...fusion, button: { ...fusion.button, visible: false } })).toMatch(/not visible/);
       expect(core.saveButtonRefusal({ ...fusion, defaultSwitch: "on" })).toMatch(/Set as default/);
       expect(core.saveButtonRefusal(null)).toMatch(/Nothing/);
     });

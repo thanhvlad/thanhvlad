@@ -98,10 +98,11 @@ describe("rule A: clicks go through the guard, and the forbidden controls are ne
   });
 
   it("reads the default switch and never clicks or sets it", () => {
-    // ".mt-switch" appears twice: in the forbidden list and in the read-only lookup.
-    expect(count(checkout, /mt-switch/)).toBe(2);
+    // ".mt-switch" appears three times: in the forbidden list, and in the
+    // read-only lookup's measured selector and its fallback.
+    expect(count(checkout, /mt-switch/)).toBe(3);
     const reader = functionSource(checkout, "cometSwitch");
-    expect(reader).toContain('querySelector(".mt-switch")');
+    expect(reader).toContain('querySelector(".mt-switch.switcher") ?? scope.querySelector(".mt-switch")');
     expect(functionSource(checkout, "cometSwitchState")).not.toMatch(/click|dispatchEvent|classList\.(add|remove|toggle)/);
     const assignments = checkout.match(/\w+\.checked\s*=(?!=)[^;]*/g) ?? [];
     expect(assignments.length).toBeGreaterThan(0);
@@ -114,6 +115,10 @@ describe("rule A: clicks go through the guard, and the forbidden controls are ne
     expect(observer).toContain('event.target.closest("button.place-order-primary-btn")');
     expect(observer).toContain("if (!event.isTrusted");
     expect(observer).toMatch(/document\.addEventListener\(\s*"click",[\s\S]*?true,\s*\);/);
+    // A Pay now on another product's confirm page in the same tab is not this item being paid for.
+    expect(observer).toContain("if (!payObserverJob || !pageMatchesItem(payObserverJob)) return;");
+    expect(observer.indexOf("pageMatchesItem(payObserverJob)")).toBeLessThan(observer.indexOf('ask({ type: "checkout:paying" })'));
+    expect(functionSource(checkout, "renderConfirm")).toContain("observePayClick(job);");
     for (const source of [checkout, orders, bridge, core, background]) {
       expect(source).not.toMatch(/preventDefault|stopPropagation|stopImmediatePropagation|returnValue\s*=/);
     }
@@ -140,6 +145,9 @@ describe("rule A: clicks go through the guard, and the forbidden controls are ne
     expect(cascade).toContain('querySelector(".drawer-cascade-steps")');
     expect(cascade).toContain("core.chooseCascadeOption(");
     expect(cascade).toContain("core.chooseCascadeCity(");
+    // The city list is taken only once the modal has left the state level: the steps name the state, or the letter headers are gone.
+    expect(cascade).toContain("core.cascadeMovedPastStates(labels, steps, stateLabel)");
+    expect(cascade).not.toMatch(/JSON\.stringify\(labels\)/);
     expect(functionSource(checkout, "closeCascade")).toContain("span.mt-icon-close");
   });
 });
@@ -163,9 +171,27 @@ describe("rule B: Save on the add-address form only through the verified path", 
 
   it("verifies, in core, the boxes, State, City, the country, the switch and the button itself", () => {
     const verify = core.slice(core.indexOf("function saveButtonRefusal("), core.indexOf("// Money"));
-    for (const check of ["foreignFormValues(s.boxes", "mismatchedFields(intended, s.actual)", "s.country?.shown", "s.state?.shown", "s.city?.shown", 's.defaultSwitch !== "off"', "form-button-confirm", "PAYMENT_CLASS.test(c)"]) {
+    for (const check of ["foreignFormValues(s.boxes", "mismatchedFields(intended, s.actual)", "s.country?.shown", "s.state?.shown", "s.city?.shown", 's.defaultSwitch !== "off"', "form-button-confirm", "PAYMENT_CLASS.test(c)", 'if (b.visible !== true) return "The Save button is not visible."']) {
       expect(verify, check).toContain(check);
     }
+  });
+
+  it("types only into a form that is shown, and saves only a Save button that is shown", () => {
+    // A drawer that hides its form rather than removing it: a hidden form is
+    // nothing to type into, and after Save it does not count as still open.
+    const visible = functionSource(checkout, "isVisible");
+    expect(visible).toContain("node.getClientRects().length > 0");
+    expect(functionSource(checkout, "cometForm")).toContain("!(node instanceof HTMLFormElement) && isVisible(node)");
+    expect(functionSource(checkout, "fusionForm")).toContain('querySelectorAll("form.deliver-address-form")].find(isVisible)');
+    expect(functionSource(checkout, "addressFormOf")).toContain('design === "comet" ? cometForm() : fusionForm()');
+    expect(count(checkout, /document\.querySelector(All)?\("(form)?\.deliver-address-form"\)/)).toBe(2);
+    // Both snapshots describe the button through describeButton, which reads its visibility.
+    expect(functionSource(checkout, "describeButton")).toContain("visible: isVisible(node)");
+    expect(count(checkout, /button: describeButton\(button\)/)).toBe(2);
+    // The post-Save wait: the form gone (removed or hidden), then the block showing the customer.
+    const save = functionSource(checkout, "saveAddressForm");
+    expect(save).toContain("if (addressFormOf(design)) return null;");
+    expect(save.indexOf("if (addressFormOf(design)) return null;")).toBeLessThan(save.indexOf("core.addressBlockShows(block.textContent, values)"));
   });
 
   it("reads the form's values and the switch before it types or chooses anything, on both designs", () => {
@@ -257,6 +283,8 @@ describe("the automatic fill", () => {
     expect(count(checkout, /(await|=>) runFill\(job, values, /)).toBe(2);
     const auto = functionSource(checkout, "autoFill");
     expect(auto).toContain('document.querySelector(".pl-address-item-container")');
+    // An account with no saved address shows only "Add new address"; the fill waits for either.
+    expect(auto).toContain('document.querySelector(".pl-address-item-container") ?? document.querySelector(".pl-address-item__new-btn-wrap")');
     expect(auto.indexOf("core.addressBlockShows(block.textContent, values)")).toBeLessThan(auto.indexOf("await runFill("));
     expect(auto.indexOf("core.shouldAutoFill(job, shown)")).toBeLessThan(auto.indexOf("await runFill("));
     // Every panel button ignores clicks that are not the merchant's own.
@@ -428,6 +456,18 @@ describe("the app-page bridge", () => {
     const from = functionSource(background, "fromAppPage", "");
     expect(from).toContain("origin === settings.base");
     expect(functionSource(background, "startCheckoutById", "")).toContain("core.isPurchaseOrderId(purchaseOrderId)");
+  });
+
+  it("opens the checkout tab beside the app tab, and without an opener from the popup", () => {
+    // The app-bridge path hands the sender's tab as the opener; the popup path passes none.
+    expect(functionSource(background, "route", "")).toContain("startCheckoutById(message.purchaseOrderId, { tabId: sender.tab.id, windowId: sender.tab.windowId })");
+    expect(functionSource(background, "route", "")).toMatch(/message\.type === "checkout:start" \? startCheckout\(message\.order\) :/);
+    const create = functionSource(background, "createCheckoutTab", "");
+    expect(create).toContain("openerTabId: opener.tabId");
+    // Chrome may refuse the opener; the tab is then created without one, never not at all.
+    expect(create).toMatch(/try \{\s*return await chrome\.tabs\.create\(\{ \.\.\.options, openerTabId: opener\.tabId[\s\S]*?\} catch \{[\s\S]*?\}\s*\}\s*return chrome\.tabs\.create\(options\);/);
+    expect(count(background, /chrome\.tabs\.create\(/)).toBe(2);
+    expect(functionSource(background, "startCheckout", "")).toContain("const tab = await createCheckoutTab(opener);");
   });
 });
 

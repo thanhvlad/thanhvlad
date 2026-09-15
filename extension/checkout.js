@@ -52,6 +52,7 @@
   // the outcome recorded in the job instead (core.shouldAutoFill).
   let autoFillFor = null;
   let payObserverInstalled = false;
+  let payObserverJob = null;
 
   const RELOADED = "The extension was reloaded or updated. Reload this page.";
 
@@ -726,7 +727,7 @@
       checks.render();
       record.suggest();
     };
-    observePayClick();
+    observePayClick(job);
     autoFill(job, values, fillStatus, fill, cost.again);
   }
 
@@ -756,14 +757,18 @@
     }
     const view = panel.view;
     report(status, "Waiting for the page's address block…");
-    const block = await waitFor(() => document.querySelector(".pl-address-item-container"), 20000);
+    // An account with a saved address shows the block; one with none may show
+    // only "Add new address" (.pl-address-item__new-btn-wrap). Either means
+    // the page is ready for the fill.
+    const ready = await waitFor(() => document.querySelector(".pl-address-item-container") ?? document.querySelector(".pl-address-item__new-btn-wrap"), 20000);
     if (panel?.view !== view) return;
     status.textContent = "";
-    if (!block) {
+    if (!ready) {
       report(status, "The page's address block has not appeared. Once it has, press Fill address again.", "warn");
       return;
     }
-    const shown = core.addressBlockShows(block.textContent, values);
+    const block = document.querySelector(".pl-address-item-container");
+    const shown = Boolean(block && core.addressBlockShows(block.textContent, values));
     if (shown) {
       report(status, "The address on this page is the customer's. Check the total, then press Pay now on AliExpress yourself.", "ok");
       const outcome = core.fillOutcomeFor(job);
@@ -803,9 +808,15 @@
   /**
    * Observes the merchant's own click on Pay now, so the job moves to
    * "paying" and the orders page can record the order number afterwards. It
-   * only listens: it never prevents, delays or makes that click.
+   * only listens: it never prevents, delays or makes that click. The job is
+   * moved only when the page is this item's checkout: a Pay now on another
+   * product's confirm page in the same tab (a later Buy now, say) is not this
+   * item being paid for, and the orders page would then take that order for
+   * it. The listener is installed once per page; `payObserverJob` is the job
+   * the confirm view was last rendered with.
    */
-  function observePayClick() {
+  function observePayClick(job) {
+    payObserverJob = job;
     if (payObserverInstalled) return;
     payObserverInstalled = true;
     document.addEventListener(
@@ -813,6 +824,7 @@
       (event) => {
         if (!event.isTrusted || !(event.target instanceof Element)) return;
         if (!event.target.closest("button.place-order-primary-btn")) return;
+        if (!payObserverJob || !pageMatchesItem(payObserverJob)) return;
         ask({ type: "checkout:paying" }).then((answer) => {
           if (answer.ok) refresh(true);
         });
@@ -944,15 +956,20 @@
     marked.clear();
   }
 
-  /** The Fusion design's form: a real <form> built from next-* components. */
+  /**
+   * The address form on the page, only while it is shown. A drawer that hides
+   * its form (no client rects) rather than removing it still holds the boxes:
+   * a hidden form is nothing to type into, and after Save it is not "still
+   * open".
+   */
   function fusionForm() {
-    return document.querySelector("form.deliver-address-form");
+    // The Fusion design's form: a real <form> built from next-* components.
+    return [...document.querySelectorAll("form.deliver-address-form")].find(isVisible) ?? null;
   }
 
-  /** The comet design's form: a div.mt-form inside the address drawer; there is no <form>. */
   function cometForm() {
-    const node = document.querySelector(".deliver-address-form");
-    return node && !(node instanceof HTMLFormElement) ? node : null;
+    // The comet design's form: a div.mt-form inside the address drawer; there is no <form>.
+    return [...document.querySelectorAll(".deliver-address-form")].find((node) => !(node instanceof HTMLFormElement) && isVisible(node)) ?? null;
   }
 
   /** Whichever address form is open, with its design, or null. */
@@ -1120,9 +1137,16 @@
     return form.closest(".comet-drawer") ?? form.closest(".deliver-address-wrap") ?? form.parentElement ?? form;
   }
 
-  /** The "Set as default" switch, for reading only: nothing here clicks or sets it. */
+  /**
+   * The "Set as default" switch, for reading only: nothing here clicks or sets
+   * it. The measured switch carries the `switcher` class beside the switch
+   * class; the bare switch class is the fallback, so another switch
+   * AliExpress adds to the drawer cannot be read in its place while the
+   * measured one is there.
+   */
   function cometSwitch(form) {
-    return cometScope(form).querySelector(".mt-switch");
+    const scope = cometScope(form);
+    return scope.querySelector(".mt-switch.switcher") ?? scope.querySelector(".mt-switch");
   }
 
   function cometSwitchState(form) {
@@ -1238,14 +1262,18 @@
       closeCascade();
       return { error: `DropshipHub did not choose the state: ${refusedState}` };
     }
+    // The modal has moved to the city level only when its steps name the
+    // chosen state, or the state list's letter headers are gone. "The labels
+    // changed" was not enough: the state list re-rendering (a header
+    // collapsing, an item scrolled in) read as the city list, and the
+    // customer's city was then looked for among states.
     const cityLabels = await waitFor(() => {
       const current = visibleCascadeModal();
       if (!current) return null;
       const labels = cascadeItems(current).labels;
       if (labels.length === 0) return null;
       const steps = collapse(current.querySelector(".drawer-cascade-steps")?.textContent);
-      const moved = core.normalizeTitle(steps).includes(core.normalizeTitle(stateLabel)) || JSON.stringify(labels) !== JSON.stringify(stateLabels);
-      return moved ? labels : null;
+      return core.cascadeMovedPastStates(labels, steps, stateLabel) ? labels : null;
     }, 8000);
     if (!cityLabels) {
       closeCascade();
@@ -1689,8 +1717,9 @@
   // Saving the address: the one verified exception to the click guard
   // ---------------------------------------------------------------------------
 
+  /** The Save/Confirm control as saveButtonRefusal judges it: a button that is hidden is refused like a missing one. */
   function describeButton(node) {
-    return node ? { ...describeElement(node, false), disabled: node.disabled === true } : null;
+    return node ? { ...describeElement(node, false), disabled: node.disabled === true, visible: isVisible(node) } : null;
   }
 
   /** What saveButtonRefusal judges, read from the comet form as it is now. */
