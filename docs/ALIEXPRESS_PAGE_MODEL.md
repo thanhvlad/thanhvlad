@@ -195,6 +195,120 @@ value is chosen by opening the select, typing to filter, and clicking the
 rendered outside the form. Text inputs are React-controlled: set them with the
 native value setter and dispatch `input` and `change`.
 
+## Checkout on `www.aliexpress.us` in English: the "comet" design (measured 2026-09-15)
+
+The owner's account is US-routed. Opened from that account in English, the
+confirm page and its address forms are **not** the Fusion (`next-*`) design
+documented above: the page-level selectors (`pl-*`) are the same, but the
+address drawer, its form and its drop-downs are a different component set
+("comet"/"mt-form"). The extension has to detect which one is on the page.
+
+Facts that apply to both designs:
+
+- Opening `/p/trade/confirm.html?objectId=…` directly in a fresh tab fails
+  with "Query product info failed, query param orderLine DTO is empty". It
+  works once the product page (`/item/<id>.html`) has loaded in that tab
+  first, which is the order the extension already uses.
+- The page's currency follows the account's site setting: this account
+  showed **USD** (`Total$93.62`), while the price the extension captured from
+  the Vietnamese product page was in VND. The same SKU was $85.89 here against
+  1,724,188 VND (about $66) in the capture, so a VND estimate cannot be
+  compared with this page, and the captured price is not the price paid.
+- With a card saved on the account, `button.place-order-primary-btn` reads
+  **"Pay now" and charges the card at once**. There is no separate
+  "place, then pay" step. It sits in `.pl-order-toal-container__btn-box`.
+- Payment method block: `.placeorder-page-payment-container`, whose "Change"
+  is `button.comet-btn-link.chosen-channel--chosen-channel-change-btn`. Every
+  class on that path contains `payment`, so the click guard refuses it.
+- Summary rows `.pl-summary__item-pc`: Subtotal, Promo codes, Shipping fee,
+  Additional charges (tax); total row `.pl-order-toal-container__item`.
+
+### Address block with a saved address
+
+`.pl-address-item-container` shows the selected saved address (name, phone,
+street, city) and a **"Change"** link: `span.pl-address-item__arrrow > a`
+(sic "arrrow"; the `<a>` has no href and no classes). With no saved address
+the block shows only `.pl-address-item__new-btn-wrap` "Add new address"
+instead (measured earlier). The extension must handle both.
+
+"Change" opens a right-hand drawer `.comet-drawer.comet-drawer-right.pl-address-model-cls`
+(`.comet-drawer-content > .comet-drawer-header.pl-modal-header-cls + .comet-drawer-body`)
+titled "Shipping address": `.cm-address-list` of `.ae-address-item-wrapper`
+items, each with a `label.comet-radio` (+ `comet-radio-checked`,
+`input.comet-radio-input[type=radio]`), a "Default" tag, an edit pencil
+`.ae-address-item-edit-btn` and a delete `.ae-address-item-delete-btn`, and
+at the bottom **`button.add-address`** (`comet-btn comet-btn-primary`,
+`type="button"`, text "Add new address").
+
+### The add-address drawer form
+
+The same drawer switches to "Add new address" (header
+`.comet-drawer-title`, a back arrow `.c-left-btn > .comet-icon-arrowleft`
+that returns to the list; **Escape does not close it**). There is **no
+`<form>` element**: the form is `div.mt-form.deliver-address-form` inside
+`.deliver-address-wrap`, so `form.deliver-address-form` matches nothing.
+Every field is `input.one-textinput[type=text]` inside a `.mt-form-item`
+whose wrapper class says what it is: `.default-input-wrap` (text),
+`.default-select-wrap` (a select rendered as an input plus an `.icon-arrow`),
+`.search-input-wrap` (the address search, `input.autocomplete-input[role=combobox]`).
+Inputs carry no `name`, `id` or `placeholder`; the label is floating text
+inside the item ("First name*"). Locate fields by their index among the
+form's inputs:
+
+| Index | Field | Kind | Notes |
+|---|---|---|---|
+| 0 | Country/region | select | shows "United States" |
+| 1 | First name* | text | |
+| 2 | Last name* | text | |
+| 3 | Country code | text, prefilled `+1` | |
+| 4 | Mobile number* | text | national number |
+| 5 | Search by address | combobox | leave alone |
+| — | "Enter manually" | `div.text-button-container` (not a button) | reveals 6–11 |
+| 6 | Street* | text | help text "Please enter an address with 5-35 characters including building number" |
+| 7 | Apt, suite, unit, etc (optional） | text | full-width `）` in the label |
+| 8 | State/Province* | select (cascade modal) | |
+| 9 | City* | select (cascade modal) | |
+| 10 | ZIP | text | label "E.g., 20001 or 20001-0000" |
+| 11 | Delivery Instructions | text | optional |
+
+Before "Enter manually" only inputs 0–5 exist. Below the fields: **"Set as
+default"** is a switch `div.mt-switch.switcher` (on = `mt-switch--checked`
+and knob `mt-switch-knob--large-checked`; off = neither; no `<input>`), and
+**`button.form-button-confirm`** (`type="button"`, text **"Save"**) saves the
+address to the account and selects it.
+
+Text inputs are React-controlled and accept the native value setter followed
+by `input` and `change` events; the value survives blur and shows
+`form-item-state-success` on the item.
+
+### State and City: one cascade modal
+
+Clicking the State (or City) input opens a bottom sheet
+`.mt-drawer-modal.mt-modal.mt-modal--bottom` titled "Select address"
+(`.drawer-cascade-header` with `span.mt-icon-close`; steps in
+`.drawer-cascade-steps` / `.mt-step-item`). It has a search box
+("Search by ZIP code, street, or address") that runs an address search and
+hides the list while it has text: **do not type in it.** The list is
+`.drawer-list-wrap > .drawer-cascade-list > div.group-item > span.item-label`;
+at the state level it holds 71 items (letter headers plus the states,
+"Alabama" first, "Wyoming" last). A `mousedown`, `mouseup` and `click()` on a
+state's `div.group-item` moves the same modal to "Select city" (Texas: 2,369
+cities, alphabetical, **"Other" last**, "Austin" present); the same on a city
+closes the modal and fills **both** the State and City inputs. The State
+input stays empty until the city is chosen.
+
+### The orders list and order detail
+
+`/p/order/index.html` (tabs View all / To pay / Processing / Processed /
+Completed; `window.__INIT_DATA_CALLBACK__` present) lists `.order-item`
+cards. Each carries the status ("Awaiting delivery"), "Date: …",
+"Ref. Number: <order id>", a "Details" link
+`a[href*="/p/order/detail.html?orderId="]`, product links
+`a[href*="/item/<id>.html"]` (regional ids; subtract 2^51 for the global id
+when above it), the SKU text ("Mix 10pcs"), "Total:$12.50" and the buttons
+"Confirm received" / "Track status" (or "Pay now" under To pay). This page is
+the source for automatic order-number and status sync.
+
 ## Not yet measured
 
 - The page shown after Place order, and whether its URL carries the new order
