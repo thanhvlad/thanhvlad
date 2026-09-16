@@ -1,0 +1,11 @@
+# The app runs inside the Shopify admin; nothing behind /app or /auth is a page
+# anyone should find through a search engine. The public policy pages stay
+# crawlable because the App Store listing links to them.
+User-agent: *
+Disallow: /app
+Disallow: /auth
+Disallow: /api
+Disallow: /webhooks
+Allow: /privacy
+Allow: /terms
+Allow: /support

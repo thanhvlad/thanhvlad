@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { font: 14px/1.5 -apple-system, Segoe UI, Roboto, sans-serif; max-width: 480px; margin: 24px auto; color: #202223; }
+      label { display: block; margin: 12px 0 4px; font-weight: 600; }
+      input { width: 100%; padding: 8px; border: 1px solid #c9cccf; border-radius: 6px; }
+      button { margin-top: 16px; padding: 10px 16px; border: 0; border-radius: 8px; background: #008060; color: #fff; font-weight: 600; cursor: pointer; }
+      #saved { color: #008060; margin-left: 8px; }
+    </style>
+  </head>
+  <body>
+    <h2>DropshipHub extension</h2>
+    <p>Find both values under <strong>Settings → Advanced</strong> in the app.</p>
+    <label for="appUrl">App URL</label>
+    <input id="appUrl" placeholder="https://your-app.example.com" />
+    <label for="token">API token</label>
+    <input id="token" placeholder="dsh_…" />
+    <button id="save">Save</button><span id="saved"></span>
+    <script src="options.js"></script>
+  </body>
+</html>

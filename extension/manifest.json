@@ -1,0 +1,87 @@
+{
+  "manifest_version": 3,
+  "name": "DropshipHub Product Capture",
+  "version": "1.6.2",
+  "description": "Add AliExpress or CJ products to DropshipHub, place its orders on AliExpress with the address filled in, and sync their order numbers and tracking.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabGroups"
+  ],
+  "host_permissions": [
+    "https://*.aliexpress.com/*",
+    "https://*.aliexpress.us/*",
+    "https://cjdropshipping.com/*",
+    "https://*.cjdropshipping.com/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Add to DropshipHub",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "icons": {},
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.aliexpress.com/item/*",
+        "https://*.aliexpress.com/i/*",
+        "https://*.aliexpress.us/item/*",
+        "https://*.aliexpress.us/i/*",
+        "https://cjdropshipping.com/product/*",
+        "https://*.cjdropshipping.com/product/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://*.aliexpress.com/item/*",
+        "https://*.aliexpress.com/i/*",
+        "https://*.aliexpress.us/item/*",
+        "https://*.aliexpress.us/i/*",
+        "https://cjdropshipping.com/product/*",
+        "https://*.cjdropshipping.com/product/*"
+      ],
+      "js": [
+        "page-reader.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://*.aliexpress.com/*",
+        "https://*.aliexpress.us/*"
+      ],
+      "js": [
+        "checkout-core.js",
+        "checkout.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://*.aliexpress.com/p/order/*",
+        "https://*.aliexpress.us/p/order/*",
+        "https://*.aliexpress.com/p/tracking/*",
+        "https://*.aliexpress.us/p/tracking/*"
+      ],
+      "js": [
+        "checkout-core.js",
+        "orders.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

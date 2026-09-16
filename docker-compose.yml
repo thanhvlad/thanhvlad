@@ -1,0 +1,55 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dropship
+      POSTGRES_PASSWORD: dropship
+      POSTGRES_DB: dropship_hub
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dropship"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+
+  # Uncomment to run the app + worker in containers (build with `docker compose build`).
+  # web:
+  #   build: .
+  #   env_file: .env
+  #   environment:
+  #     DATABASE_URL: postgresql://dropship:dropship@postgres:5432/dropship_hub?schema=public
+  #     REDIS_URL: redis://redis:6379
+  #   ports:
+  #     - "3000:3000"
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_started
+  # worker:
+  #   build: .
+  #   command: ["npm", "run", "worker"]
+  #   env_file: .env
+  #   environment:
+  #     DATABASE_URL: postgresql://dropship:dropship@postgres:5432/dropship_hub?schema=public
+  #     REDIS_URL: redis://redis:6379
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_started
+
+volumes:
+  pgdata:
+  redisdata:

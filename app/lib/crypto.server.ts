@@ -12,14 +12,24 @@ function key(): Buffer | null {
 }
 
 /**
- * Encrypt a supplier token at rest. With no ENCRYPTION_KEY configured the value
- * is stored as-is so local development works, and a warning is surfaced by the
- * settings page rather than failing the write.
+ * Encrypt a supplier token at rest.
+ *
+ * Without ENCRYPTION_KEY the value is stored as-is so local development works
+ * with no setup. In production that is a refusal, not a warning: a supplier
+ * OAuth token in plaintext is a credential for the merchant's supplier account,
+ * and a silent fallback is exactly how it ends up shipped.
  */
 export function encryptSecret(plain: string | null | undefined): string | null {
   if (!plain) return null;
   const k = key();
-  if (!k) return plain;
+  if (!k) {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error(
+        "ENCRYPTION_KEY is not set. Supplier tokens would be stored in plaintext. Set it to 32 random bytes, base64 (openssl rand -base64 32).",
+      );
+    }
+    return plain;
+  }
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv(ALGO, k, iv);
   const enc = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);

@@ -1,0 +1,500 @@
+import Anthropic from "@anthropic-ai/sdk";
+import { jsonSchemaOutputFormat } from "@anthropic-ai/sdk/helpers/json-schema";
+import { WRITING_CONTRACT_VERSION, buildWritingContract, type StoreBrand } from "~/domain/copy/lumora-contract";
+import { env } from "~/lib/env.server";
+import { errorMessage } from "~/lib/errors";
+import { logger } from "~/lib/logger.server";
+
+/**
+ * Rewrite an imported supplier product into a finished landing page.
+ *
+ * This publishes to a live storefront with no human review, which changes what
+ * "good enough" means. Two consequences run through the whole file:
+ *
+ *   - The contract is long on purpose. It is not style advice, it is the
+ *     specification, measured off the store's own 80 shipped products. It is
+ *     sent as a cacheable system block so its length costs one cache miss per
+ *     model version rather than one per product.
+ *   - Nothing the model returns is trusted. `checkRewrite` re-derives the rules
+ *     that can be checked deterministically, and a page that fails is not
+ *     published - it is returned with its reasons so the merchant sees why.
+ *
+ * With no ANTHROPIC_API_KEY the feature is simply unavailable, matching how
+ * ai-mapping.server.ts already behaves.
+ *
+ * What leaves the app on each call - the supplier title, description, variant
+ * options, prices and stock, the supplier store name, the store's name and
+ * support address, up to two of its finished pages and up to eight image urls - goes
+ * to whatever ANTHROPIC_BASE_URL names. The merchant is told so before a
+ * rewrite is queued (the import list's confirmation), and an endpoint that is
+ * not Anthropic's own is logged at warn level and reported by `aiEndpointStatus`
+ * so the operator can see who else receives it.
+ */
+
+export interface RewriteInput {
+  supplierTitle: string;
+  supplierDescriptionHtml: string;
+  /** Image urls in supplier order. The model sees them, so it can judge them. */
+  images: string[];
+  optionNames: string[];
+  variants: Array<{ attributes: Array<{ name: string; value: string }>; price: string; stock: number }>;
+  currency: string;
+  storeName?: string | null;
+  /** Whose store the page is for: its name, support address and sign-off. */
+  brand: StoreBrand;
+  /** Two or three of the shop's own finished pages, as worked examples. */
+  examples?: Array<{ title: string; descriptionHtml: string }>;
+}
+
+export interface ImageVerdict {
+  index: number;
+  usable: boolean;
+  reason: string;
+}
+
+export interface RewriteResult {
+  title: string;
+  descriptionHtml: string;
+  tags: string[];
+  heroImageIndex: number;
+  imageVerdicts: ImageVerdict[];
+  /** False when the endpoint would not carry the images and they went unseen. */
+  imagesAssessed: boolean;
+  contractVersion: string;
+}
+
+const REWRITE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    title: {
+      type: "string",
+      description: "The finished product title, following the HEAD — TAIL rule in the contract exactly.",
+    },
+    descriptionHtml: {
+      type: "string",
+      description: "The complete body HTML for the product page, following the section skeleton in the contract.",
+    },
+    tags: {
+      type: "array",
+      items: { type: "string" },
+      description: "8 to 12 lowercase tags.",
+    },
+    heroImageIndex: {
+      type: "number",
+      description: "0-based index into the supplied images of the one that should lead the page.",
+    },
+    imageVerdicts: {
+      type: "array",
+      description: "One entry per supplied image, in order.",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          index: { type: "number", description: "0-based index of the image being judged." },
+          usable: { type: "boolean", description: "False when it carries supplier text, a watermark, a collage, or is too low quality to sell with." },
+          reason: { type: "string", description: "One short sentence a merchant would understand." },
+        },
+        required: ["index", "usable", "reason"],
+      },
+    },
+  },
+  required: ["title", "descriptionHtml", "tags", "heroImageIndex", "imageVerdicts"],
+} as const;
+
+export function aiLandingAvailable(): boolean {
+  const available = Boolean(process.env.ANTHROPIC_API_KEY);
+  if (available) warnAboutGatewayOnce();
+  return available;
+}
+
+export interface AiEndpointStatus {
+  configured: boolean;
+  /** Host the SDK sends requests to. */
+  host: string;
+  /** False when ANTHROPIC_BASE_URL points somewhere other than Anthropic. */
+  direct: boolean;
+}
+
+/**
+ * Where model calls actually go.
+ *
+ * The SDK reads ANTHROPIC_BASE_URL itself, silently. Production was pointed at
+ * a third-party gateway that way, which means merchant product data reaches an
+ * operator the privacy policy does not name, and nothing in the logs said so.
+ * This makes the endpoint a fact the operator can read (logs, health check)
+ * rather than one they have to remember.
+ */
+export function aiEndpointStatus(): AiEndpointStatus {
+  const raw = process.env.ANTHROPIC_BASE_URL?.trim();
+  let host = "api.anthropic.com";
+  if (raw) {
+    try {
+      host = new URL(raw).host.toLowerCase();
+    } catch {
+      host = raw;
+    }
+  }
+  const direct = host === "anthropic.com" || host.endsWith(".anthropic.com");
+  return { configured: Boolean(process.env.ANTHROPIC_API_KEY), host, direct };
+}
+
+let gatewayWarned = false;
+
+function warnAboutGatewayOnce() {
+  if (gatewayWarned) return;
+  gatewayWarned = true;
+  const status = aiEndpointStatus();
+  if (status.direct) return;
+  try {
+    logger.warn("AI rewrites are sent through a non-Anthropic endpoint", {
+      host: status.host,
+      note: "Merchant product text and image urls reach this operator; name it as a sub-processor or unset ANTHROPIC_BASE_URL.",
+    });
+  } catch {
+    // A log line is never worth failing a request or the boot over.
+  }
+}
+
+// Said once when the server loads this module, which the import list route
+// does at boot, so the operator sees it in the startup log rather than only
+// after the first merchant opens the page.
+if (process.env.ANTHROPIC_API_KEY) warnAboutGatewayOnce();
+
+/**
+ * Statuses that are answered before any model runs, from Anthropic or from a
+ * gateway in front of it: a request refused as shaped (400, 413, 422), refused
+ * for its credentials or its content (401, 403), sent to a model or route that
+ * does not exist (404), or turned away by a rate limit (429). No completion can
+ * exist behind any of them, so nobody was billed for one.
+ */
+const REFUSED_BEFORE_THE_MODEL = new Set([400, 401, 403, 404, 413, 422, 429]);
+
+/**
+ * Server faults that Anthropic's own API returns only when it did not produce
+ * the answer: 500 is an internal error and 529 is "overloaded", both raised
+ * instead of running the request.
+ */
+const ANTHROPIC_FAULTS_BEFORE_THE_MODEL = new Set([500, 529]);
+
+/**
+ * True when a failed rewrite cannot have produced a billable answer, so the
+ * merchant's allowance unit may be given back.
+ *
+ * The line is drawn at what can be known, not at what probably happened. Round
+ * one gave the unit back for every status, and production sends every call
+ * through a third-party gateway: a gateway that gives up on a long Opus
+ * generation answers 502, 504 or 524 after the model upstream has already run
+ * to the end and been paid for. Refunding those let a merchant retry the same
+ * long page indefinitely while the counter stayed at zero. So a 5xx counts
+ * unless it came from Anthropic directly and is one of the two it raises
+ * instead of running the request; through a gateway even a 500 or 529 may be
+ * the gateway's own wrapper around a finished, billed call.
+ *
+ * A dropped connection or a timeout carries no status and is counted for the
+ * same reason, and so is anything that came back after the model ran, such as
+ * an answer that would not parse.
+ */
+export function rewriteWasNotBilled(error: unknown, endpoint: Pick<AiEndpointStatus, "direct"> = aiEndpointStatus()): boolean {
+  if (!(error instanceof Anthropic.APIError) || typeof error.status !== "number") return false;
+  if (REFUSED_BEFORE_THE_MODEL.has(error.status)) return true;
+  return endpoint.direct && ANTHROPIC_FAULTS_BEFORE_THE_MODEL.has(error.status);
+}
+
+/**
+ * The client a rewrite is sent with.
+ *
+ * The SDK retries 408, 409, 429 and every 5xx twice by default. One allowance
+ * unit is reserved per product, and a retried 5xx through a gateway can be a
+ * second and third billed generation of the same page, so one unit could pay
+ * for three. With no automatic retries one unit is one request; a merchant
+ * whose rewrite hit a transient fault presses the button again, and a refused
+ * request has already been given back by `rewriteWasNotBilled`. The deliberate
+ * no-image retry in `rewriteLandingPage` follows only a 4xx refusal, which
+ * produced nothing to pay for.
+ */
+export function createRewriteClient(): Anthropic {
+  return new Anthropic({ maxRetries: 0 });
+}
+
+/** Vision needs a reachable http(s) url, and a long tail of images costs tokens
+ * for no judgement gain. Eight is past the point where a page uses them. */
+const MAX_VISION_IMAGES = 8;
+
+/**
+ * The output contract, stated in the prompt as well as in `output_config`.
+ *
+ * `output_config` is the right mechanism and the real API honours it. But this
+ * app can be pointed at an Anthropic-compatible gateway through
+ * ANTHROPIC_BASE_URL, and a gateway that drops the field answers in prose -
+ * which reached the merchant as "Failed to parse structured output". Stating the
+ * same contract in words costs a few hundred tokens and makes the call work
+ * against either kind of endpoint.
+ */
+const JSON_INSTRUCTION = [
+  "OUTPUT FORMAT - answer with a single JSON object and nothing else. No prose",
+  "before it, no code fence around it. These keys, exactly:",
+  "",
+  '  "title"           string  - the finished title, following the HEAD - TAIL rule.',
+  '  "descriptionHtml" string  - the complete body HTML.',
+  '  "tags"            array of 8 to 12 lowercase strings.',
+  '  "heroImageIndex"  number  - 0-based index of the image that should lead.',
+  '  "imageVerdicts"   array   - one {"index": number, "usable": boolean, "reason": string}',
+  "                              per image supplied, in order.",
+].join("\n");
+
+function tryParse(text: string): Record<string, unknown> | null {
+  try {
+    const value = JSON.parse(text);
+    return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pull the result object out of a response.
+ *
+ * The strict path is a whole-text JSON.parse, which is what a well-behaved
+ * endpoint returns. The salvage paths handle a model or gateway that wrapped the
+ * object in a code fence or a sentence: take the fenced block, else the first
+ * balanced brace span. Salvaging is worth doing because the alternative is
+ * discarding a page that is present and correct, over its packaging.
+ */
+export function extractResult(text: string): Record<string, unknown> | null {
+  const direct = tryParse(text.trim());
+  if (direct) return direct;
+
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenced) {
+    const parsed = tryParse(fenced[1].trim());
+    if (parsed) return parsed;
+  }
+
+  const start = text.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return tryParse(text.slice(start, i + 1));
+    }
+  }
+  return null;
+}
+
+/**
+ * True when retrying without the images could plausibly succeed.
+ *
+ * A 400, 413 or 422 is the endpoint refusing the request as shaped, and the
+ * images are by far the largest and least widely supported part of it. 403 is
+ * included because at least one gateway answers a request it will not carry
+ * with "Your request was blocked" rather than a shape error. Auth failures,
+ * rate limits and server faults are left alone - dropping the images would not
+ * change any of them.
+ */
+export function mightBeTheImages(error: unknown): boolean {
+  const status = (error as { status?: number } | null)?.status;
+  return status === 400 || status === 403 || status === 413 || status === 422;
+}
+
+interface ModelCall {
+  system: Array<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }>;
+  userText: string;
+  images: string[];
+  model: string;
+}
+
+/** Longest a rewrite waits out one rate limit before giving the product up. */
+const RATE_LIMIT_WAIT_CAP_MS = 30_000;
+
+/**
+ * How long a 429 asks to be left alone, from its retry-after header, capped.
+ * Exported for the test.
+ */
+export function rateLimitWaitMs(error: unknown): number | null {
+  if (!(error instanceof Anthropic.APIError) || error.status !== 429) return null;
+  const header = (error.headers as { get?: (name: string) => string | null } | undefined)?.get?.("retry-after");
+  const seconds = header ? Number(header) : NaN;
+  const ms = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : 5_000;
+  return Math.min(RATE_LIMIT_WAIT_CAP_MS, ms);
+}
+
+async function callModel(client: Anthropic, call: ModelCall) {
+  try {
+    return await callModelOnce(client, call);
+  } catch (error) {
+    const waitMs = rateLimitWaitMs(error);
+    if (waitMs === null) throw error;
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    return callModelOnce(client, call);
+  }
+}
+
+async function callModelOnce(client: Anthropic, call: ModelCall) {
+  const response = await client.messages.create({
+    model: call.model,
+    max_tokens: 16000,
+    system: call.system,
+    output_config: { format: jsonSchemaOutputFormat(REWRITE_SCHEMA), effort: "high" },
+    messages: [
+      {
+        role: "user",
+        content: [
+          ...call.images.map((url) => ({ type: "image" as const, source: { type: "url" as const, url } })),
+          { type: "text" as const, text: call.userText },
+        ],
+      },
+    ],
+  });
+
+  if (response.stop_reason === "refusal") {
+    throw new Error("The model declined to rewrite this product.");
+  }
+  const text = response.content
+    .filter((block): block is Anthropic.TextBlock => block.type === "text")
+    .map((block) => block.text)
+    .join("");
+  const parsed = extractResult(text);
+  if (!parsed) {
+    throw new Error(
+      `The endpoint returned no JSON object. It answered: ${text.slice(0, 200).replace(/\s+/g, " ") || "(nothing)"}`,
+    );
+  }
+  return { parsed, usage: response.usage };
+}
+
+/** Reject a shape that would otherwise crash on the way out. */
+function requireShape(parsed: Record<string, unknown>): void {
+  const missing = (["title", "descriptionHtml", "tags", "heroImageIndex"] as const).filter((key) => parsed[key] == null);
+  if (missing.length) throw new Error(`The model's answer is missing: ${missing.join(", ")}.`);
+  if (!Array.isArray(parsed.tags)) throw new Error("The model returned tags that are not a list.");
+}
+
+export async function rewriteLandingPage(input: RewriteInput): Promise<RewriteResult> {
+  if (!aiLandingAvailable()) throw new Error("ANTHROPIC_API_KEY is not configured.");
+  const client = createRewriteClient();
+
+  const visionImages = input.images.filter((u) => /^https?:\/\//i.test(u)).slice(0, MAX_VISION_IMAGES);
+
+  const facts = [
+    `SUPPLIER TITLE: ${input.supplierTitle}`,
+    input.storeName ? `SUPPLIER STORE: ${input.storeName}` : "",
+    // The contract's shipping panel is filled from configuration, and the app
+    // has none to give it. Saying so outright stops the model from reading a
+    // policy off the worked examples and promising it for this product.
+    `SHIPPING & RETURNS CONFIGURATION: none supplied - omit the shipping & returns panel (§2.10).`,
+    `CURRENCY: ${input.currency}`,
+    input.optionNames.length ? `OPTION AXES: ${input.optionNames.join(", ")}` : "OPTION AXES: none",
+    ``,
+    `VARIANTS (${input.variants.length}):`,
+    ...input.variants.slice(0, 40).map((v) => {
+      const attrs = v.attributes.map((a) => `${a.name}=${a.value}`).join(" / ") || "(single)";
+      return `- ${attrs} | price ${v.price} ${input.currency} | stock ${v.stock}`;
+    }),
+    ``,
+    `IMAGES: ${input.images.length} supplied.`,
+    ``,
+    `SUPPLIER DESCRIPTION (raw, this is the register you must eliminate):`,
+    input.supplierDescriptionHtml.slice(0, 12_000) || "(the supplier published none)",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const examples = (input.examples ?? []).slice(0, 3);
+  const exampleBlock = examples.length
+    ? [
+        ``,
+        `WORKED EXAMPLES - finished pages from this same store. Match their structure,`,
+        `their markup and their voice. Do not copy their subject matter or their claims.`,
+        ...examples.flatMap((e, i) => [``, `--- EXAMPLE ${i + 1} TITLE ---`, e.title, `--- EXAMPLE ${i + 1} BODY ---`, e.descriptionHtml.slice(0, 20_000)]),
+      ].join("\n")
+    : "";
+
+  // Two cache breakpoints, both stable. The contract only varies by store, and
+  // the worked examples are identical for every product in a batch. Leaving
+  // the examples in the user turn meant paying full price for the same ~10k
+  // tokens on every single product.
+  const system = [
+    { type: "text" as const, text: buildWritingContract(input.brand), cache_control: { type: "ephemeral" as const } },
+    ...(exampleBlock
+      ? [{ type: "text" as const, text: exampleBlock, cache_control: { type: "ephemeral" as const } }]
+      : []),
+  ];
+
+  const withImages = [
+    facts,
+    ``,
+    `The first ${visionImages.length} image(s) are attached above, in order, index 0 first. Judge each one.`,
+    ``,
+    JSON_INSTRUCTION,
+  ].join("\n");
+
+  const withoutImages = [
+    facts,
+    ``,
+    `The images could not be attached on this run. Their urls are below in order.`,
+    `Judge only what the url and the supplier data can tell you, and say so in each reason.`,
+    ...input.images.slice(0, MAX_VISION_IMAGES).map((u, i) => `  ${i}: ${u}`),
+    ``,
+    JSON_INSTRUCTION,
+  ].join("\n");
+
+  const model = env().AI_MAPPING_MODEL;
+  let imagesAssessed = visionImages.length > 0;
+  let result;
+  try {
+    result = await callModel(client, { system, userText: withImages, images: visionImages, model });
+  } catch (error) {
+    // A page written from the supplier text alone is worth far more to the
+    // merchant than a failed job, so an endpoint that will not carry the images
+    // costs the image verdicts rather than the whole rewrite. It is recorded,
+    // not hidden - the caller turns `imagesAssessed: false` into a warning the
+    // merchant can see.
+    if (!(visionImages.length > 0 && mightBeTheImages(error))) throw error;
+    logger.warn("Retrying the rewrite without images", { error: errorMessage(error) });
+    result = await callModel(client, { system, userText: withoutImages, images: [], model });
+    imagesAssessed = false;
+  }
+
+  const parsed = result.parsed;
+  requireShape(parsed);
+
+  const usage = result.usage;
+  logger.info("Landing page rewritten", {
+    supplierTitle: input.supplierTitle.slice(0, 80),
+    imagesAssessed,
+    endpoint: aiEndpointStatus().host,
+    inputTokens: usage?.input_tokens,
+    cacheRead: usage?.cache_read_input_tokens,
+    outputTokens: usage?.output_tokens,
+  });
+
+  const verdicts = Array.isArray(parsed.imageVerdicts) ? (parsed.imageVerdicts as ImageVerdict[]) : [];
+  return {
+    title: String(parsed.title),
+    descriptionHtml: String(parsed.descriptionHtml),
+    tags: (parsed.tags as unknown[]).map((t) => String(t)),
+    heroImageIndex: Number(parsed.heroImageIndex),
+    imageVerdicts: verdicts.filter((v) => v && typeof v === "object" && typeof v.index === "number"),
+    imagesAssessed,
+    contractVersion: WRITING_CONTRACT_VERSION,
+  };
+}
