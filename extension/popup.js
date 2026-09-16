@@ -480,6 +480,59 @@ async function refreshOrders(config, message, tone) {
   await loadOrders(config).catch((error) => say(ordersStatus, `${error.message}. Check the app URL in options.`, "err"));
 }
 
+/**
+ * The Shopify admin, which embeds the app as a cross-origin iframe. The order
+ * page's button lives in that iframe, and the extension's bridge does not
+ * reach it from the app's origin alone (measured): it also has to run in the
+ * admin's own top frame, which needs this origin granted.
+ */
+const ADMIN_MATCH = "https://admin.shopify.com/*";
+
+/** The bridge scripts are registered by the worker, which can do it only once the origins are granted. */
+function registerBridge() {
+  chrome.runtime.sendMessage({ type: "bridge:register" }).catch(() => undefined);
+}
+
+function permissionButton(text, origins, onGranted, onRefused) {
+  const allow = document.createElement("button");
+  allow.className = "secondary";
+  allow.textContent = text;
+  allow.addEventListener("click", async () => {
+    // Must run inside the click: Chrome only shows the prompt for a user gesture.
+    const ok = await chrome.permissions.request({ origins }).catch(() => false);
+    if (ok) {
+      registerBridge();
+      await onGranted();
+    } else {
+      onRefused();
+    }
+  });
+  return allow;
+}
+
+/**
+ * Offers the admin origin on its own, for a merchant who granted the app's
+ * origin before this version (or refused the pair): without it the order
+ * page's button cannot work inside the Shopify admin.
+ */
+async function offerAdminAccess() {
+  const granted = await chrome.permissions.contains({ origins: [ADMIN_MATCH] }).catch(() => false);
+  if (granted) return;
+  const note = document.createElement("small");
+  note.textContent = "Also allow this extension on admin.shopify.com, so the Order button works inside the Shopify admin. ";
+  const result = document.createElement("span");
+  const allow = permissionButton(
+    "Allow access in the Shopify admin",
+    [ADMIN_MATCH],
+    async () => {
+      say(result, "The Order button now works inside the Shopify admin. Reload the DropshipHub page there.", "ok");
+      allow.disabled = true;
+    },
+    () => say(result, "Access was not granted. The Order button works on the app's own page, but not inside the Shopify admin.", "err"),
+  );
+  ordersStatus.append(document.createElement("br"), note, allow, result);
+}
+
 async function setUpOrders(config) {
   if (config.error) {
     say(ordersStatus, config.error, "err");
@@ -490,28 +543,33 @@ async function setUpOrders(config) {
   if (!granted) {
     ordersStatus.textContent = "";
     const note = document.createElement("small");
-    note.textContent = `To list orders, allow this extension to read ${config.base}. You may need to open this popup again afterwards.`;
-    const allow = document.createElement("button");
-    allow.className = "secondary";
-    allow.textContent = "Allow access";
-    allow.addEventListener("click", async () => {
-      // Must run inside the click: Chrome only shows the prompt for a user gesture.
-      const ok = await chrome.permissions.request({ origins }).catch(() => false);
-      if (!ok) {
-        say(ordersStatus, "Access was not granted, so orders cannot be listed.", "err");
-        return;
-      }
-      // The order page's "Order on AliExpress with the extension" button
-      // needs the bridge script on the app's origin, which the worker can
-      // register only now that the origin is granted.
-      chrome.runtime.sendMessage({ type: "bridge:register" }).catch(() => undefined);
+    note.textContent = `To list orders, allow this extension to read ${config.base}, and admin.shopify.com so the Order button works inside the Shopify admin. You may need to open this popup again afterwards.`;
+    const result = document.createElement("div");
+    const load = async () => {
       say(ordersStatus, "Loading…");
       await loadOrders(config).catch((error) => say(ordersStatus, error.message, "err"));
+    };
+    // One button for both origins. Chrome asks for them together, so a
+    // merchant who refuses gets the app's origin offered on its own: the
+    // orders list and the checkout work without the admin origin, only the
+    // button inside the Shopify admin does not.
+    const allow = permissionButton("Allow access", [...origins, ADMIN_MATCH], load, () => {
+      result.textContent = "";
+      const refused = document.createElement("small");
+      refused.textContent = "Access was not granted, so orders cannot be listed. You can allow the app's own site alone instead:";
+      result.append(
+        refused,
+        permissionButton("Allow the app's site only", origins, load, () => say(ordersStatus, "Access was not granted, so orders cannot be listed.", "err")),
+      );
     });
-    ordersStatus.append(note, allow);
+    ordersStatus.append(note, allow, result);
     return;
   }
+  // The order page's "Order on AliExpress with the extension" button needs the
+  // bridge scripts, which the worker registers for whichever origins are granted.
+  registerBridge();
   await loadOrders(config).catch((error) => say(ordersStatus, `${error.message}. Check the app URL in options.`, "err"));
+  await offerAdminAccess();
 }
 
 (async () => {

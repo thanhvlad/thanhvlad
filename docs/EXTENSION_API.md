@@ -292,7 +292,10 @@ order page in DropshipHub. Page facts it relies on are in `docs/ALIEXPRESS_PAGE_
 
 1. **Start checkout** (or the order page's button) opens a new tab on the first item's product
    page (`www.aliexpress.com/item/<id>.html`). AliExpress may redirect to a regional host;
-   `aliexpress.us` uses the global id plus 2^51.
+   `aliexpress.us` uses the global id plus 2^51. Started from the order page, the checkout tab
+   opens beside that tab and is put in its tab group (`chrome.tabs.group`, the extension's
+   `tabGroups` permission): Chrome does not do that by itself from `openerTabId`, and the new
+   tab was hard to find next to the app's.
 2. On the product page the extension reads the page's own product id and SKU list, checks
    that the item's SKU still exists and is in stock, and opens that host's
    `/p/trade/confirm.html` for the SKU, quantity, the customer's country and the item's
@@ -306,13 +309,30 @@ order page in DropshipHub. Page facts it relies on are in `docs/ALIEXPRESS_PAGE_
    while after the address is set and sent again when it changes. When the page's product,
    SKU, quantity or destination does not match the item (a later navigation in the tab, say)
    nothing is filled and nothing is sent. The customer's address, with **Copy** buttons, sits
-   in a collapsed block for the rare case something has to be entered by hand.
-4. **The address is filled by itself** as soon as the page's address block
-   (`.pl-address-item-container`) exists. If the block already shows the customer's last name
-   and house number the fill is skipped and the panel says the address is set. Otherwise the
-   extension opens the add-address form ("Add new address", or "Change" - the `<a>` inside
-   `span.pl-address-item__arrrow` - and then the drawer's "Add new address"), presses "Enter
-   manually" if needed, and detects which of the two measured designs is on the page:
+   in a collapsed block for the rare case something has to be entered by hand. The panel
+   keeps watching the page while it is open, so it re-reads the total when the page's address
+   block changes and notices the page dying under it: when AliExpress answers with its own
+   error page ("Oops! Something went wrong. Please refresh the page and try again.", or
+   "Query product info failed…", or a page left with none of its `pl-*` markup after the
+   wait) the panel shows that instead of the confirm view and fills, quotes and saves
+   nothing. It reopens that item's checkout by itself once (product page first, which is what
+   AliExpress needs before a confirm page), and after that only when you press **Open this
+   item's checkout again**.
+4. **The address is filled by itself** once the confirm page is really rendered: an address
+   area (`.pl-address-item-container`, or `.pl-address-item__new-btn-wrap` on an account with
+   no saved address) **and** either the total row (`.pl-order-toal-container__item`) or the
+   page's Pay now button (`button.place-order-primary-btn`, read, never clicked). The panel
+   says the page is still loading meanwhile and waits up to 25 s, for the automatic fill and
+   for **Fill address again** alike; on the live account the fill started while the page was
+   still building and gave up on a drawer that opened a moment later. If the address block
+   already shows the customer's last name and house number the fill is skipped and the panel
+   says the address is set. Otherwise the extension opens the add-address form ("Add new
+   address", or "Change" - the `<a>` inside `span.pl-address-item__arrrow` - and then the
+   drawer's "Add new address"), presses "Enter manually" if needed, and detects which of the
+   two measured designs is on the page. Each of those steps is clicked once, waited for
+   (15 s for the drawer, 10 s for the form), then clicked and waited for once more before it
+   gives up; both attempts go through the same click guard, so a retry can reach nothing the
+   guard refuses:
    - the **comet** form (`www.aliexpress.us` in English: `div.mt-form.deliver-address-form`,
      twelve inputs located by position, one "Select address" cascade modal for State and
      City) - the fill stops unless the Country/region box already shows the United States;
@@ -395,6 +415,24 @@ crosses from the page; the bridge answers `{ source: "dropshiphub-extension", ty
 says the extension is not installed or has no access to the site, with a link to the
 settings page.
 
+**Inside the Shopify admin** the app is a cross-origin iframe of
+`https://admin.shopify.com`, and Chrome did not run the script registered for the app's
+origin in that frame (measured 1.6.0: the button said the extension had no access there,
+while the same bridge answered on the app's origin opened as a top-level page). Since 1.6.1
+the popup's **Allow access** asks for `https://admin.shopify.com/*` as well, plainly, "so
+the Order button works inside the Shopify admin"; a merchant who allows only the app's own
+site keeps everything else, just not that button inside the admin. With the admin origin
+granted the worker registers the same `app-bridge.js` in the admin's **top frame only**
+(`allFrames: false`), where it works as a relay: the app page also posts its message to
+`window.parent` (addressed to the admin's origin, taken from `document.referrer`, never
+`"*"`), the relay accepts it only from a frame whose origin is the configured app origin
+(`chrome.storage.sync`'s `appUrl`, the only setting it reads), answers back to that frame at
+that origin, and tells the worker which origin it accepted. The worker still refuses
+anything else: `checkout:start-by-id` is taken from a sender frame on the app's origin, or
+from the admin page when the origin it names is the stored app origin - never from "any
+sender". The page accepts answers from its own window or from its parent, with the same
+`source: "dropshiphub-extension"` check and the same 1.5 s / 20 s timeouts.
+
 The app URL must use `https://`; the extension refuses plain `http://` except for `localhost`
 and `127.0.0.1`, because the token travels with every request.
 
@@ -417,3 +455,13 @@ and `127.0.0.1`, because the token travels with every request.
    origin once you press **Allow access** in the popup; press it once more after updating
    if the button says the extension has no access). Press *Reload* on the extension card,
    then reload any open AliExpress tabs. No new permission is asked for.
+7. **Version 1.6.1** is the fix-up after the first live checkout: the fill waits for the
+   confirm page to be rendered (up to 25 s) before it opens anything, tries the address
+   drawer and its "Add new address" twice, shows AliExpress's own error page ("Oops!
+   Something went wrong…") for what it is and offers to open the item's checkout again
+   instead of a confirm panel over a dead page, keeps watching the page while it is open,
+   and makes the order page's button work inside the Shopify admin. It adds the
+   **`tabGroups`** permission - the only one - so the checkout tab joins the tab group of
+   the tab that started it; Chrome does not do that by itself from `openerTabId`. Press
+   *Reload* on the extension card, then open the popup once and press **Allow access**
+   again to grant `https://admin.shopify.com` for the order page's button.

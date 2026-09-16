@@ -100,6 +100,27 @@
     return Boolean(url && url.protocol === "https:" && isAliExpressHost(url.hostname) && url.pathname === "/p/trade/confirm.html");
   }
 
+  /**
+   * AliExpress's own error page where the checkout should be. Measured on the
+   * live account: minutes after the confirm page had rendered, its whole body
+   * became "Oops! Something went wrong. Please refresh the page and try
+   * again." and every `pl-*` element was gone, while the URL stayed the
+   * checkout's. A confirm page opened without its product page first answers
+   * "Query product info failed …" in the same way.
+   *
+   * `hasOrderMarkup` is whether any `pl-*` element of the order is on the
+   * page. It counts only once the page has had its time to render (the
+   * panel's page-ready wait), so a page that is merely slow is not called
+   * broken; pass `true` (or leave it out) before that.
+   */
+  const BROKEN_CONFIRM_TEXT = /oops!?\s*something went wrong|please refresh the page and try again|query product info failed/i;
+
+  function confirmPageBroken(input) {
+    const text = String(input?.bodyText ?? "");
+    if (BROKEN_CONFIRM_TEXT.test(text)) return true;
+    return input?.hasOrderMarkup === false;
+  }
+
   /** The orders list (/p/order/index.html) and an order's detail page (/p/order/detail.html). */
   function isOrdersPage(raw) {
     const url = parseUrl(raw);
@@ -1035,6 +1056,11 @@
         // The last automatic fill's outcome for the current item, so a
         // reload does not run a finished fill again.
         fill: null,
+        // Per item: whether the panel has already reopened this item's
+        // checkout by itself after AliExpress answered with its error page.
+        // It does that once, then leaves it to the merchant's button, so a
+        // page that keeps failing cannot put the tab in a reload loop.
+        reopened: items.map(() => false),
         payingAt: null,
         stage: "product",
         startedAt: now,
@@ -1358,6 +1384,7 @@
     isProductPage,
     productIdFromUrl,
     isConfirmPage,
+    confirmPageBroken,
     isOrdersPage,
     isOrderDetailPage,
     isTrackingPage,

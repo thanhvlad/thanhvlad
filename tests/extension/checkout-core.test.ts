@@ -113,6 +113,32 @@ describe("the confirm page URL", () => {
   });
 });
 
+describe("confirmPageBroken - AliExpress's error page where the checkout should be", () => {
+  it("reads the measured error page, in either wording", () => {
+    // Measured on the live account: the whole confirm page became this.
+    expect(core.confirmPageBroken({ bodyText: "Oops! Something went wrong. Please refresh the page and try again.", hasOrderMarkup: false })).toBe(true);
+    expect(core.confirmPageBroken({ bodyText: "Oops Something went wrong", hasOrderMarkup: true })).toBe(true);
+    expect(core.confirmPageBroken({ bodyText: "PLEASE REFRESH THE PAGE AND TRY AGAIN", hasOrderMarkup: true })).toBe(true);
+    // A confirm page opened without its product page first.
+    expect(core.confirmPageBroken({ bodyText: "Query product info failed, query param orderLine DTO is empty", hasOrderMarkup: true })).toBe(true);
+  });
+
+  it("calls a page with no order markup broken only once it has had its time to render", () => {
+    expect(core.confirmPageBroken({ bodyText: "", hasOrderMarkup: false })).toBe(true);
+    expect(core.confirmPageBroken({ bodyText: "", hasOrderMarkup: true })).toBe(false);
+    // Before the page-ready wait the caller passes nothing to judge on.
+    expect(core.confirmPageBroken({ bodyText: "" })).toBe(false);
+    expect(core.confirmPageBroken({})).toBe(false);
+    expect(core.confirmPageBroken(null)).toBe(false);
+  });
+
+  it("does not take the checkout's own words for an error", () => {
+    const page = "Shipping address Benita Benham Total $93.62 Pay now Something went wrong? Contact us";
+    expect(core.confirmPageBroken({ bodyText: page, hasOrderMarkup: true })).toBe(false);
+    expect(core.confirmPageBroken({ bodyText: "Refresh the page to see the latest price", hasOrderMarkup: true })).toBe(false);
+  });
+});
+
 describe("skuAvailability", () => {
   const skus = [
     { skuId: SKU_ID, skuAttr: SKU_ATTR, availQuantity: 5, salable: true },
@@ -898,6 +924,8 @@ describe("the checkout job", () => {
     expect(error).toBeUndefined();
     expect(job).toMatchObject({ tabId: 7, purchaseOrderId: "po_cm123456", orderName: "#1001", currency: "USD", expectedTotal: "8.99", itemIndex: 0, stage: "product", startedAt: 1_000 });
     expect(job.recordedOrderIds).toEqual([[], []]);
+    // No item's checkout has been reopened after an error page yet.
+    expect(job.reopened).toEqual([false, false]);
     expect(job.address).toMatchObject({ firstName: "Jane", lastName: "Doe", countryCode: "US", provinceCode: "TX" });
     expect(JSON.stringify(job)).not.toContain("jane@example.com");
     expect(job.items[0]).toMatchObject({ externalProductId: GLOBAL_ID, externalSkuId: SKU_ID, carrierCode: "CAINIAO_FULFILLMENT_STD", quantity: 2 });

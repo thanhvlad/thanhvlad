@@ -222,6 +222,18 @@ Facts that apply to both designs:
   with "Query product info failed, query param orderLine DTO is empty". It
   works once the product page (`/item/<id>.html`) has loaded in that tab
   first, which is the order the extension already uses.
+- **Measured again in the live test (2026-09-16, the owner's account):** the
+  confirm page renders in stages. On arrival `.pl-address-item-container` and
+  `.pl-order-toal-container__item` were both present but empty, and a click on
+  "Change" opened the address drawer **later than an 8 s wait** - a screenshot
+  taken after the fill had given up showed the drawer open with the saved
+  address and "Add new address". The page counts as rendered only with an
+  address area **and** either the total row or `button.place-order-primary-btn`.
+- The same page can die under the panel: minutes later
+  `document.body.innerText` began "Oops! Something went wrong. Please refresh
+  the page and try again." and **every `pl-*` element was gone**, with the URL
+  unchanged. There is nothing to fill, quote or read there; the item's checkout
+  has to be opened again from its product page.
 - The page's currency follows the account's site setting: this account
   showed **USD** (`Total$93.62`), while the price the extension captured from
   the Vietnamese product page was in VND. The same SKU was $85.89 here against

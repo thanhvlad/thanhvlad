@@ -325,6 +325,25 @@ const EXTENSION_ANSWER_MS = 20000;
 type ExtensionState = { kind: "idle" | "waiting" | "started" | "missing" | "error"; error?: string };
 
 /**
+ * The origin of the page this one is embedded in, from the referrer Shopify
+ * sets on the app's iframe. Embedded in the Shopify admin the app is a
+ * cross-origin iframe, so a message to its own window never reaches the
+ * extension's relay in the admin's top frame; it is posted to the parent as
+ * well, addressed to that origin and never to "*". Unknown referrer, no
+ * parent post: the message stays inside this page, as it always did.
+ */
+function embeddingOrigin(): string | null {
+  if (typeof window === "undefined" || window.parent === window) return null;
+  try {
+    const origin = new URL(document.referrer).origin;
+    if (!origin || origin === window.location.origin || !origin.startsWith("https://")) return null;
+    return origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * "Order on AliExpress with the extension": the DSers-style button. The page
  * posts the purchase order's id to its own window; the extension's bridge
  * script, present only once the merchant has allowed the extension on this
@@ -337,9 +356,21 @@ function ExtensionOrderButton({ purchaseOrderId }: { purchaseOrderId: string }) 
   const [state, setState] = useState<ExtensionState>({ kind: "idle" });
   const ready = useRef(false);
 
+  /** To this page's own window, and to the admin frame around it when there is one. */
+  const post = (message: { source: string; type: string; purchaseOrderId?: string }) => {
+    window.postMessage(message, window.location.origin);
+    const parent = embeddingOrigin();
+    if (parent) window.parent.postMessage(message, parent);
+  };
+
   useEffect(() => {
+    const parent = embeddingOrigin();
     const onMessage = (event: MessageEvent) => {
-      if (event.source !== window || event.origin !== window.location.origin) return;
+      // This page's own window, or the frame it is embedded in, whose relay
+      // answers from the admin's origin.
+      const fromSelf = event.source === window && event.origin === window.location.origin;
+      const fromParent = parent !== null && event.source === window.parent && event.origin === parent;
+      if (!fromSelf && !fromParent) return;
       const data = event.data as { source?: unknown; type?: unknown; purchaseOrderId?: unknown; error?: unknown } | null;
       if (!data || typeof data !== "object" || data.source !== EXTENSION_SOURCE) return;
       if (data.type === "ready") ready.current = true;
@@ -350,13 +381,14 @@ function ExtensionOrderButton({ purchaseOrderId }: { purchaseOrderId: string }) 
     window.addEventListener("message", onMessage);
     // The bridge announced itself when the page loaded, possibly before this
     // component existed; asking again costs nothing.
-    window.postMessage({ source: PAGE_SOURCE, type: "ping" }, window.location.origin);
+    post({ source: PAGE_SOURCE, type: "ping" });
     return () => window.removeEventListener("message", onMessage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [purchaseOrderId]);
 
   const start = () => {
     setState({ kind: "waiting" });
-    window.postMessage({ source: PAGE_SOURCE, type: "checkout:start", purchaseOrderId }, window.location.origin);
+    post({ source: PAGE_SOURCE, type: "checkout:start", purchaseOrderId });
     window.setTimeout(() => {
       if (!ready.current) setState((current) => (current.kind === "waiting" ? { kind: "missing" } : current));
     }, EXTENSION_WAIT_MS);

@@ -694,7 +694,143 @@
     return button("Open my AliExpress orders", () => ask({ type: "checkout:open-orders" }), "act secondary");
   }
 
+  // ---------------------------------------------------------------------------
+  // Is the confirm page really there? (the live test's two failures)
+  // ---------------------------------------------------------------------------
+
+  /** How long the panel waits for the confirm page to render before it gives up. */
+  const PAGE_READY_MS = 25000;
+
+  /**
+   * The confirm page as rendered: an address area plus either the total row
+   * or the page's own Pay now button (read here, never clicked). On the live
+   * account the fill started while the page was still building - the address
+   * container and the total row had no text - and it then gave up on a drawer
+   * that opened a moment later. Nothing is filled before this is true.
+   */
+  function confirmPageRendered() {
+    const address = withText(document.querySelector(".pl-address-item-container")) ?? withText(document.querySelector(".pl-address-item__new-btn-wrap"));
+    if (!address) return null;
+    const priced = withText(document.querySelector(".pl-order-toal-container__item")) ?? withText(document.querySelector("button.place-order-primary-btn"));
+    return priced ? address : null;
+  }
+
+  /**
+   * The element, but only once it holds text. Presence is not enough: in the
+   * live test the address container and the total row were both on the page
+   * and both empty while it was still building, and the panel said "Waiting
+   * for the page's total… not readable yet" at the very moment the fill ran.
+   */
+  function withText(node) {
+    return node && collapse(node.textContent).length > 0 ? node : null;
+  }
+
+  /** Whether the page carries any of the order's own markup. */
+  function hasOrderMarkup() {
+    return Boolean(document.querySelector('[class^="pl-"], [class*=" pl-"]'));
+  }
+
+  /**
+   * Whether AliExpress has put its error page where the checkout should be.
+   * Only the first characters of the page's text are looked at, only to match
+   * the error phrases in core.confirmPageBroken, and nothing of it is kept,
+   * shown or sent. `rendered` says whether the page has already had its time
+   * to render: before that, missing order markup means "still loading", not
+   * "broken".
+   */
+  function confirmPageIsBroken(rendered) {
+    return core.confirmPageBroken({
+      bodyText: collapse(String(document.body?.innerText ?? "").slice(0, 400)),
+      hasOrderMarkup: rendered ? hasOrderMarkup() : true,
+    });
+  }
+
+  /**
+   * Waits for the page to render before anything is filled. Answers false
+   * when it never did, so the caller can say so instead of typing into a page
+   * that is half there.
+   */
+  async function waitForConfirmPage(status) {
+    if (confirmPageRendered()) return true;
+    report(status, "The checkout page is still loading…");
+    return Boolean(await waitFor(confirmPageRendered, PAGE_READY_MS, 250));
+  }
+
+  /** The page's address block as text, to notice the merchant choosing another address. */
+  function addressBlockText() {
+    return collapse(document.querySelector(".pl-address-item-container")?.textContent ?? "");
+  }
+
+  /**
+   * AliExpress answered with its own error page instead of this item's
+   * checkout. Nothing is filled, quoted or saved on such a page: it carries
+   * no address block and no total, and the panel used to sit on it saying
+   * "Waiting for the page's total…". The item's checkout is opened again
+   * (product page first, so AliExpress builds the order line) by itself once
+   * per item, and after that only when the merchant presses the button.
+   */
+  async function renderBrokenPage(job) {
+    const body = freshBody();
+    const line = el("div");
+    say(line, "AliExpress answered with an error page instead of this item's checkout, so nothing was filled and no total was sent to DropshipHub.", "err");
+    const result = el("div");
+    const reopen = button("Open this item's checkout again", () => reopenThisItem(job, result), "act secondary");
+    body.append(
+      itemBlock(job),
+      line,
+      el("div", { className: "muted", text: "Opening the product page again and then the checkout usually fixes it; AliExpress refuses a checkout page opened on its own." }),
+      reopen,
+      result,
+      cancelButton(),
+    );
+    panel.onUrlChange = null;
+    const alreadyReopened = Array.isArray(job.reopened) && job.reopened[job.itemIndex] === true;
+    if (!alreadyReopened) await reopenThisItem(job, result, true);
+  }
+
+  async function reopenThisItem(job, target, automatic = false) {
+    say(target, automatic ? "Opening this item's checkout again…" : "Opening the product page…");
+    const answer = await ask({ type: "checkout:reopen-product", automatic });
+    if (!answer.ok) say(target, answer.error, "err");
+  }
+
+  /**
+   * The confirm view polls its own page: on the live account the checkout
+   * page turned into AliExpress's error page minutes after it had rendered,
+   * and the panel kept showing the confirm view on that dead page. It also
+   * re-reads the total when the page's address block changes, so a stale
+   * "Waiting for the page's total…" does not sit there either.
+   */
+  function watchConfirmPage(job, cost) {
+    const view = panel.view;
+    let seen = addressBlockText();
+    let rendered = Boolean(confirmPageRendered());
+    (async () => {
+      while (panel && panel.view === view) {
+        await sleep(2000);
+        if (!panel || panel.view !== view) return;
+        if (!core.isConfirmPage(location.href)) return;
+        if (!rendered) rendered = Boolean(confirmPageRendered());
+        if (confirmPageIsBroken(rendered)) {
+          renderConfirm(job);
+          return;
+        }
+        const now = addressBlockText();
+        if (now !== seen) {
+          seen = now;
+          cost.again();
+        }
+      }
+    })();
+  }
+
   function renderConfirm(job) {
+    // The error page carries none of the checkout: the panel says so and
+    // offers the way back, rather than the confirm view over nothing.
+    if (confirmPageIsBroken(Boolean(confirmPageRendered()))) {
+      renderBrokenPage(job);
+      return;
+    }
     const body = freshBody();
     const values = formValues(job);
     const checks = urlChecks(job);
@@ -728,6 +864,7 @@
       record.suggest();
     };
     observePayClick(job);
+    watchConfirmPage(job, cost);
     autoFill(job, values, fillStatus, fill, cost.again);
   }
 
@@ -756,15 +893,19 @@
       return;
     }
     const view = panel.view;
-    report(status, "Waiting for the page's address block…");
-    // An account with a saved address shows the block; one with none may show
-    // only "Add new address" (.pl-address-item__new-btn-wrap). Either means
-    // the page is ready for the fill.
-    const ready = await waitFor(() => document.querySelector(".pl-address-item-container") ?? document.querySelector(".pl-address-item__new-btn-wrap"), 20000);
+    // The page has to be rendered, not merely present: an account with a
+    // saved address shows the block, one with none only "Add new address"
+    // (.pl-address-item__new-btn-wrap), and the total or Pay now says the
+    // page's own data has arrived.
+    const ready = await waitForConfirmPage(status);
     if (panel?.view !== view) return;
     status.textContent = "";
+    if (confirmPageIsBroken(ready)) {
+      renderBrokenPage(job);
+      return;
+    }
     if (!ready) {
-      report(status, "The page's address block has not appeared. Once it has, press Fill address again.", "warn");
+      report(status, "The checkout page has not finished loading. Once it has, press Fill address again.", "warn");
       return;
     }
     const block = document.querySelector(".pl-address-item-container");
@@ -1037,56 +1178,99 @@
     return true;
   }
 
+  /** The address drawer, only while it is shown. */
+  function visibleAddressDrawer() {
+    return [...document.querySelectorAll(".comet-drawer.pl-address-model-cls")].find(isVisible) ?? null;
+  }
+
+  /**
+   * Clicks a control and waits for what it opens, once more if nothing
+   * opened. On the live account the address drawer was open in a screenshot
+   * taken after the fill had already given up on it: the click landed while
+   * the page was still busy, or the drawer rendered after the wait.
+   *
+   * Both attempts go through guardedClick, and a refusal ends it at once: the
+   * retry re-reads the control and asks the guard again, so it cannot click
+   * anything the first attempt was refused, and it never clicks anything the
+   * guard has not judged. Answers { found } / { refused } / { missing }.
+   */
+  async function clickAndWaitFor(findControl, probe, firstMs, secondMs) {
+    const control = findControl();
+    if (!control) return { missing: true };
+    const refused = guardedClick(control);
+    if (refused) return { refused };
+    const found = await waitFor(probe, firstMs);
+    if (found) return { found };
+    const again = findControl();
+    if (!again) return { missing: true };
+    const refusedAgain = guardedClick(again);
+    if (refusedAgain) return { refused: refusedAgain };
+    return { found: await waitFor(probe, secondMs) };
+  }
+
   /**
    * Opens the add-address form when none is open: "Add new address" when the
    * account has no saved address, else "Change" on the saved address and then
-   * the list's "Add new address" button. Returns { design, form } or null.
+   * the list's "Add new address" button. Every step is tried twice before it
+   * gives up. Returns { design, form } or null.
    */
   async function openFormIfNeeded(status) {
     const open = openAddressForm();
     if (open) return open;
     const wrap = document.querySelector(".pl-address-item__new-btn-wrap");
     if (wrap) {
-      const add = wrap.querySelector("button, [role='button'], a") ?? wrap;
-      const refused = guardedClick(add);
-      if (refused) {
-        report(status, `Click "Add new address" on the page yourself, then press Fill address again. (${refused})`, "warn");
+      // Looked up again for the second attempt: a React re-render replaces
+      // the node, and a detached one is nothing to click.
+      const findAddOnPage = () => {
+        const current = document.querySelector(".pl-address-item__new-btn-wrap");
+        return current ? current.querySelector("button, [role='button'], a") ?? current : null;
+      };
+      const opened = await clickAndWaitFor(findAddOnPage, openAddressForm, 10000, 10000);
+      if (opened.refused) {
+        report(status, `Click "Add new address" on the page yourself, then press Fill address again. (${opened.refused})`, "warn");
         return null;
       }
-    } else {
-      // The measured "Change" control is the <a> inside the span (no href, no
-      // classes). One selector list would return the span, which precedes its
-      // own child in tree order, and a click on the span never reaches the
-      // anchor's handler.
-      const change = document.querySelector("span.pl-address-item__arrrow a") ?? document.querySelector("span.pl-address-item__arrrow");
-      if (!change) {
-        report(status, 'Open the add-address form on this page ("Add new address", or "Change" and then "Add new address"), then press Fill address again.', "warn");
+      if (!opened.found) {
+        report(status, "The add-address form did not open. Open it yourself, then press Fill address again.", "err");
         return null;
       }
-      const refusedChange = guardedClick(change);
-      if (refusedChange) {
-        report(status, `Click "Change" beside the address yourself, then press Fill address again. (${refusedChange})`, "warn");
-        return null;
-      }
-      const drawer = await waitFor(() => [...document.querySelectorAll(".comet-drawer.pl-address-model-cls")].find(isVisible), 8000);
-      if (!drawer) {
-        report(status, "The address list did not open. Open it yourself, press Add new address, then press Fill address again.", "err");
-        return null;
-      }
-      const add = await waitFor(() => drawer.querySelector("button.add-address"), 5000);
-      if (!add) {
-        report(status, 'Could not find "Add new address" in the address list. Press it yourself, then press Fill address again.', "warn");
-        return null;
-      }
-      const refusedAdd = guardedClick(add);
-      if (refusedAdd) {
-        report(status, `Press "Add new address" in the list yourself, then press Fill address again. (${refusedAdd})`, "warn");
-        return null;
-      }
+      return opened.found;
     }
-    const form = await waitFor(openAddressForm, 8000);
-    if (!form) report(status, "The add-address form did not open. Open it yourself, then press Fill address again.", "err");
-    return form;
+    // The measured "Change" control is the <a> inside the span (no href, no
+    // classes). One selector list would return the span, which precedes its
+    // own child in tree order, and a click on the span never reaches the
+    // anchor's handler.
+    const findChange = () => document.querySelector("span.pl-address-item__arrrow a") ?? document.querySelector("span.pl-address-item__arrrow");
+    if (!findChange()) {
+      report(status, 'Open the add-address form on this page ("Add new address", or "Change" and then "Add new address"), then press Fill address again.', "warn");
+      return null;
+    }
+    const drawer = await clickAndWaitFor(findChange, visibleAddressDrawer, 15000, 10000);
+    if (drawer.refused) {
+      report(status, `Click "Change" beside the address yourself, then press Fill address again. (${drawer.refused})`, "warn");
+      return null;
+    }
+    if (!drawer.found) {
+      report(status, "The address list did not open. Open it yourself, press Add new address, then press Fill address again.", "err");
+      return null;
+    }
+    // The drawer is looked up again for every attempt: AliExpress replaces it
+    // when it switches between the list and the form.
+    const findAdd = () => visibleAddressDrawer()?.querySelector("button.add-address") ?? null;
+    if (!(await waitFor(findAdd, 10000))) {
+      report(status, 'Could not find "Add new address" in the address list. Press it yourself, then press Fill address again.', "warn");
+      return null;
+    }
+    const form = await clickAndWaitFor(findAdd, openAddressForm, 10000, 10000);
+    if (form.refused) {
+      report(status, `Press "Add new address" in the list yourself, then press Fill address again. (${form.refused})`, "warn");
+      return null;
+    }
+    if (!form.found) {
+      report(status, "The add-address form did not open. Open it yourself, then press Fill address again.", "err");
+      return null;
+    }
+    return form.found;
   }
 
   async function fillAddress(job, values, status) {
@@ -1107,6 +1291,20 @@
       // fields (Vietnam: province, district, ward) in other positions.
       const reason = `DropshipHub can fill only AliExpress's US address form, and this order ships to ${values.country}.`;
       report(status, `${reason} Use the Copy buttons to enter the address.`, "warn");
+      return outcome("failed", reason);
+    }
+    // "Fill address again" on a page that is still building would open
+    // nothing: the live test's fill gave up on a drawer that appeared a
+    // moment after its wait had run out.
+    const ready = await waitForConfirmPage(status);
+    if (confirmPageIsBroken(ready)) {
+      const reason = "AliExpress answered with an error page instead of this item's checkout.";
+      renderBrokenPage(job);
+      return outcome("failed", reason);
+    }
+    if (!ready) {
+      const reason = "The checkout page has not finished loading.";
+      report(status, `${reason} Wait until it has, or reload it, then press Fill address again.`, "err");
       return outcome("failed", reason);
     }
     if (!(await fillMayContinue(job, status))) return outcome("failed", "The checkout moved on.");

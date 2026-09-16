@@ -122,8 +122,11 @@ describe("rule A: clicks go through the guard, and the forbidden controls are ne
     for (const source of [checkout, orders, bridge, core, background]) {
       expect(source).not.toMatch(/preventDefault|stopPropagation|stopImmediatePropagation|returnValue\s*=/);
     }
-    // "place-order-primary-btn" is only ever read: in the forbidden list, the observer, and nowhere as a click target.
-    expect(count(checkout, /place-order-primary-btn/)).toBe(2);
+    // "place-order-primary-btn" is only ever read: in the forbidden list, the
+    // observer, the page-ready check, and nowhere as a click target.
+    expect(count(checkout, /place-order-primary-btn/)).toBe(3);
+    expect(functionSource(checkout, "confirmPageRendered")).toContain('document.querySelector("button.place-order-primary-btn")');
+    expect(functionSource(checkout, "confirmPageRendered")).not.toMatch(/click|guardedClick|dispatchEvent/);
   });
 
   it("never submits a form, presses a key or dispatches pointer events elsewhere", () => {
@@ -229,9 +232,32 @@ describe("rule B: Save on the add-address form only through the verified path", 
     // The measured "Change" control is the <a> inside the span; a selector
     // list would return the span, which precedes its own child in tree order.
     expect(open).toContain('document.querySelector("span.pl-address-item__arrrow a") ?? document.querySelector("span.pl-address-item__arrrow")');
-    expect(open).toContain('drawer.querySelector("button.add-address")');
+    expect(open).toContain('visibleAddressDrawer()?.querySelector("button.add-address")');
+    expect(functionSource(checkout, "visibleAddressDrawer")).toContain('querySelectorAll(".comet-drawer.pl-address-model-cls")].find(isVisible)');
     // The switch and Save are looked for in the whole drawer, the widest measured container.
     expect(functionSource(checkout, "cometScope")).toContain('form.closest(".comet-drawer") ?? form.closest(".deliver-address-wrap")');
+  });
+
+  it("retries a step that opened nothing only through the guard, and stops at the first refusal", () => {
+    // The live test's fill gave up on a drawer that was open a moment later,
+    // so each step is clicked once more; the retry must not become a way
+    // round the classifier.
+    const retry = functionSource(checkout, "clickAndWaitFor");
+    expect(count(retry, /guardedClick\(/g)).toBe(2);
+    expect(retry).not.toMatch(/\.click\(|dispatchEvent/);
+    expect(retry).toContain("const refused = guardedClick(control);");
+    expect(retry).toContain("if (refused) return { refused };");
+    expect(retry).toContain("const refusedAgain = guardedClick(again);");
+    expect(retry).toContain("if (refusedAgain) return { refused: refusedAgain };");
+    // The second attempt re-reads the control, so it is judged again as it is now.
+    expect(retry.indexOf("const again = findControl();")).toBeGreaterThan(retry.indexOf("const refused = guardedClick(control);"));
+    expect(retry.indexOf("if (refused) return { refused };")).toBeLessThan(retry.indexOf("const again = findControl();"));
+    // Opening the drawer, its "Add new address" and the page's own one all go through it.
+    const open = functionSource(checkout, "openFormIfNeeded");
+    expect(count(open, /clickAndWaitFor\(/g)).toBe(3);
+    expect(open).not.toMatch(/\.click\(|dispatchEvent|guardedClick\(/);
+    expect(open).toContain("clickAndWaitFor(findChange, visibleAddressDrawer, 15000, 10000)");
+    expect(open).toContain("clickAndWaitFor(findAdd, openAddressForm, 10000, 10000)");
   });
 
   it('says "left unticked" only after reading the box on the Fusion by-hand path', () => {
@@ -283,8 +309,15 @@ describe("the automatic fill", () => {
     expect(count(checkout, /(await|=>) runFill\(job, values, /)).toBe(2);
     const auto = functionSource(checkout, "autoFill");
     expect(auto).toContain('document.querySelector(".pl-address-item-container")');
-    // An account with no saved address shows only "Add new address"; the fill waits for either.
-    expect(auto).toContain('document.querySelector(".pl-address-item-container") ?? document.querySelector(".pl-address-item__new-btn-wrap")');
+    // An account with no saved address shows only "Add new address"; the page
+    // counts as rendered on either, plus the total or the Pay now button.
+    const rendered = functionSource(checkout, "confirmPageRendered");
+    for (const selector of [".pl-address-item-container", ".pl-address-item__new-btn-wrap", ".pl-order-toal-container__item", "button.place-order-primary-btn"]) {
+      expect(rendered, selector).toContain(`withText(document.querySelector("${selector}"))`);
+    }
+    // Present is not rendered: both were on the page and empty in the live test.
+    expect(functionSource(checkout, "withText")).toContain("collapse(node.textContent).length > 0");
+    expect(auto.indexOf("await waitForConfirmPage(status)")).toBeLessThan(auto.indexOf("await runFill("));
     expect(auto.indexOf("core.addressBlockShows(block.textContent, values)")).toBeLessThan(auto.indexOf("await runFill("));
     expect(auto.indexOf("core.shouldAutoFill(job, shown)")).toBeLessThan(auto.indexOf("await runFill("));
     // Every panel button ignores clicks that are not the merchant's own.
@@ -311,6 +344,55 @@ describe("the automatic fill", () => {
   });
 });
 
+describe("the page the fill runs on", () => {
+  it("waits for the confirm page to be rendered before the automatic fill and before the button's", () => {
+    const wait = functionSource(checkout, "waitForConfirmPage");
+    expect(checkout).toContain("const PAGE_READY_MS = 25000;");
+    expect(wait).toContain("waitFor(confirmPageRendered, PAGE_READY_MS, 250)");
+    // Both ways into the fill wait: the automatic run and "Fill address again".
+    const fill = functionSource(checkout, "fillAddress");
+    expect(fill.indexOf("await waitForConfirmPage(status)")).toBeGreaterThan(-1);
+    expect(fill.indexOf("await waitForConfirmPage(status)")).toBeLessThan(fill.indexOf("openFormIfNeeded("));
+    expect(fill).toContain("Wait until it has, or reload it, then press Fill address again.");
+    expect(functionSource(checkout, "autoFill")).toContain("const ready = await waitForConfirmPage(status);");
+  });
+
+  it("shows AliExpress's error page for what it is, and fills, quotes and saves nothing there", () => {
+    const broken = functionSource(checkout, "confirmPageIsBroken");
+    expect(broken).toContain("core.confirmPageBroken({");
+    // Missing order markup counts only once the page has had its time to render.
+    expect(broken).toContain("hasOrderMarkup: rendered ? hasOrderMarkup() : true");
+    const render = functionSource(checkout, "renderConfirm");
+    expect(render.indexOf("confirmPageIsBroken(")).toBeLessThan(render.indexOf("const body = freshBody();"));
+    expect(render).toContain("renderBrokenPage(job);");
+    const page = functionSource(checkout, "renderBrokenPage");
+    expect(page).not.toMatch(/runFill|fillAddress|sendQuote|saveAddressForm|costBlock|observePayClick/);
+    expect(page).toContain('button("Open this item\'s checkout again", () => reopenThisItem(job, result), "act secondary")');
+    // Automatic once per item, then only on the button.
+    expect(page).toContain("const alreadyReopened = Array.isArray(job.reopened) && job.reopened[job.itemIndex] === true;");
+    expect(page).toContain("if (!alreadyReopened) await reopenThisItem(job, result, true);");
+    expect(functionSource(checkout, "reopenThisItem")).toContain('ask({ type: "checkout:reopen-product", automatic })');
+    expect(background).toMatch(/case "checkout:reopen-product": \{[\s\S]*?message\.automatic === true/);
+    expect(background).toMatch(/case "checkout:reopen-product": \{[\s\S]*?writeJob\(\{ \.\.\.job, stage: "product", fill: null, reopened \}\)/);
+    expect(core).toMatch(/reopened: items\.map\(\(\) => false\)/);
+    // The autoFill and the manual fill both stop on a broken page.
+    expect(functionSource(checkout, "autoFill")).toContain("if (confirmPageIsBroken(ready)) {");
+    expect(functionSource(checkout, "fillAddress")).toContain("if (confirmPageIsBroken(ready)) {");
+  });
+
+  it("keeps watching the confirm page, so a stale view does not sit on a dead page", () => {
+    const watch = functionSource(checkout, "watchConfirmPage");
+    expect(functionSource(checkout, "renderConfirm")).toContain("watchConfirmPage(job, cost);");
+    expect(watch).toContain("if (confirmPageIsBroken(rendered)) {");
+    expect(watch).toContain("renderConfirm(job);");
+    // The address block changing (another address chosen) re-reads the total.
+    expect(watch).toContain("cost.again();");
+    expect(watch).toContain("if (!panel || panel.view !== view) return;");
+    expect(watch).toContain("if (!core.isConfirmPage(location.href)) return;");
+    expect(watch).not.toMatch(/runFill|fillAddress|guardedClick/);
+  });
+});
+
 describe("customer data stays inside the extension", () => {
   it("is never logged", () => {
     for (const source of [checkout, core, background, orders, bridge, popup]) expect(source).not.toMatch(/console\./);
@@ -323,7 +405,11 @@ describe("customer data stays inside the extension", () => {
   });
 
   it("is kept only in session storage, by the background worker", () => {
-    for (const source of [checkout, orders, bridge]) expect(source).not.toMatch(/chrome\.storage|localStorage|sessionStorage|indexedDB/);
+    for (const source of [checkout, orders]) expect(source).not.toMatch(/chrome\.storage|localStorage|sessionStorage|indexedDB/);
+    // The bridge reads one setting, the app origin it must accept messages
+    // from; it never reads a job, a token or an address.
+    expect(bridge).not.toMatch(/localStorage|sessionStorage|indexedDB/);
+    expect(bridge.match(/chrome\.storage\.[a-z]+\.[a-z]+\([^)]*\)/g)).toEqual(['chrome.storage.sync.get(["appUrl"])']);
     expect(core).not.toMatch(/chrome\.[a-z]+\.|localStorage|sessionStorage|indexedDB/);
     expect(background).not.toMatch(/storage\.local|localStorage|indexedDB|setAccessLevel/);
     expect(background).toMatch(/chrome\.storage\.session\.set\(/);
@@ -438,6 +524,18 @@ describe("the app-page bridge", () => {
     expect(register.indexOf("chrome.permissions.contains({ origins })")).toBeLessThan(register.indexOf("chrome.scripting.registerContentScripts("));
     expect(register).toContain("if (!granted) return false;");
     expect(register).toContain('js: ["app-bridge.js"], matches: origins');
+    expect(register).toContain("allFrames: true");
+    // The relay in the Shopify admin: the top frame only, and only while that
+    // origin is granted as well.
+    expect(register).toContain("const adminGranted = await chrome.permissions.contains({ origins: [ADMIN_MATCH] })");
+    expect(register).toContain('if (adminGranted) scripts.push({ id: ADMIN_BRIDGE_SCRIPT_ID, js: ["app-bridge.js"], matches: [ADMIN_MATCH], runAt: "document_idle", allFrames: false });');
+    expect(register).toContain("unregisterContentScripts({ ids: [BRIDGE_SCRIPT_ID, ADMIN_BRIDGE_SCRIPT_ID] })");
+    expect(background).toContain('const ADMIN_ORIGIN = "https://admin.shopify.com";');
+    expect(popup).toContain('const ADMIN_MATCH = "https://admin.shopify.com/*";');
+    // One button asks for both origins; the app's own site alone still works.
+    expect(popup).toContain("permissionButton(\"Allow access\", [...origins, ADMIN_MATCH]");
+    expect(popup).toContain('permissionButton("Allow the app\'s site only", origins');
+    expect(popup).toContain("so the Order button works inside the Shopify admin");
     // The start-up, onInstalled and onStartup calls are serialized, so two unregister/register pairs cannot race.
     expect(functionSource(background, "registerAppBridge", "")).toContain("bridgeChain = bridgeChain.then(registerAppBridgeNow, registerAppBridgeNow)");
     // Nothing calls the inner function directly: its only "()" is its declaration.
@@ -448,34 +546,53 @@ describe("the app-page bridge", () => {
   });
 
   it("relays only a purchase order id, from the page's own window and origin, and accepts it only from the app origin", () => {
-    expect(bridge).toContain("if (event.source !== window || event.origin !== location.origin) return;");
-    expect(bridge).toMatch(/window\.postMessage\(\{ source: EXTENSION, version, \.\.\.payload \}, location\.origin\)/);
-    expect(bridge).toContain('chrome.runtime.sendMessage({ type: "checkout:start-by-id", purchaseOrderId })');
-    expect(code(bridge)).not.toMatch(/address|token|fetch\(|chrome\.storage|chrome\.tabs/);
-    expect(functionSource(background, "route", "")).toMatch(/"checkout:start-by-id"\) \{\s*if \(!\(await fromAppPage\(sender\)\)\) return \{ ok: false/);
+    // On the app's origin: the page's own window only, as before.
+    expect(bridge).toContain("const sameWindow = event.source === window && event.origin === location.origin;");
+    expect(bridge).toContain("const onApp = location.origin === appOrigin;");
+    expect(bridge).toContain("if (onApp ? !sameWindow : sameWindow || event.origin !== appOrigin || !event.source) return;");
+    // Never "*": the answer goes to the window it came from, at its own origin.
+    expect(bridge).toMatch(/target\.postMessage\(\{ source: EXTENSION, version, \.\.\.payload \}, targetOrigin\)/);
+    expect(bridge).not.toMatch(/postMessage\([^)]*"\*"/);
+    expect(bridge).toContain('chrome.runtime.sendMessage({ type: "checkout:start-by-id", purchaseOrderId, appOrigin })');
+    expect(code(bridge)).not.toMatch(/address|token|fetch\(|chrome\.tabs/);
+    expect(functionSource(background, "route", "")).toMatch(/"checkout:start-by-id"\) \{\s*if \(!\(await fromAppPage\(sender, message\)\)\) return \{ ok: false/);
     const from = functionSource(background, "fromAppPage", "");
-    expect(from).toContain("origin === settings.base");
+    expect(from).toContain("if (origin === settings.base) return true;");
+    // The relay is accepted only from the admin page, and only for the origin
+    // the worker itself has stored: never "any sender".
+    expect(from).toContain('return origin === ADMIN_ORIGIN && String(message?.appOrigin ?? "") === settings.base;');
+    expect(from).toContain("if (origin === null) return false;");
     expect(functionSource(background, "startCheckoutById", "")).toContain("core.isPurchaseOrderId(purchaseOrderId)");
   });
 
-  it("opens the checkout tab beside the app tab, and without an opener from the popup", () => {
+  it("opens the checkout tab beside the app tab, in its tab group, and without an opener from the popup", () => {
     // The app-bridge path hands the sender's tab as the opener; the popup path passes none.
-    expect(functionSource(background, "route", "")).toContain("startCheckoutById(message.purchaseOrderId, { tabId: sender.tab.id, windowId: sender.tab.windowId })");
+    expect(functionSource(background, "route", "")).toContain("startCheckoutById(message.purchaseOrderId, { tabId: sender.tab.id, windowId: sender.tab.windowId, groupId: sender.tab.groupId })");
     expect(functionSource(background, "route", "")).toMatch(/message\.type === "checkout:start" \? startCheckout\(message\.order\) :/);
     const create = functionSource(background, "createCheckoutTab", "");
     expect(create).toContain("openerTabId: opener.tabId");
     // Chrome may refuse the opener; the tab is then created without one, never not at all.
-    expect(create).toMatch(/try \{\s*return await chrome\.tabs\.create\(\{ \.\.\.options, openerTabId: opener\.tabId[\s\S]*?\} catch \{[\s\S]*?\}\s*\}\s*return chrome\.tabs\.create\(options\);/);
+    expect(create).toMatch(/try \{\s*const tab = await chrome\.tabs\.create\(\{ \.\.\.options, openerTabId: opener\.tabId[\s\S]*?\} catch \{[\s\S]*?\}\s*\}\s*return chrome\.tabs\.create\(options\);/);
     expect(count(background, /chrome\.tabs\.create\(/)).toBe(2);
     expect(functionSource(background, "startCheckout", "")).toContain("const tab = await createCheckoutTab(opener);");
+    // Chrome did not put the checkout tab in the opener's group by itself.
+    const group = functionSource(background, "groupWithOpener", "");
+    expect(create).toContain("await groupWithOpener(tab, opener);");
+    expect(group).toContain("if (!Number.isInteger(tab?.id) || !Number.isInteger(opener?.groupId) || opener.groupId <= -1) return;");
+    expect(group).toMatch(/try \{\s*await chrome\.tabs\.group\(\{ tabIds: \[tab\.id\], groupId: opener\.groupId \}\);\s*\} catch \{/);
+    expect(count(background, /chrome\.tabs\.group\(/)).toBe(1);
+    // Grouping is the only thing the new permission is for.
+    expect(background).not.toMatch(/chrome\.tabGroups\./);
   });
 });
 
 describe("manifest", () => {
-  it("is version 1.6.0 with the background worker and no new permissions", () => {
-    expect(manifest.version).toBe("1.6.0");
+  it("is version 1.6.1 with the background worker and tabGroups as its only new permission", () => {
+    expect(manifest.version).toBe("1.6.1");
     expect(manifest.background).toEqual({ service_worker: "background.js" });
-    expect(manifest.permissions).toEqual(["activeTab", "scripting", "storage"]);
+    expect(manifest.permissions).toEqual(["activeTab", "scripting", "storage", "tabGroups"]);
+    // The admin origin is asked for at run time, from the popup, like the app's own.
+    expect(manifest.optional_host_permissions).toEqual(["https://*/*", "http://localhost/*", "http://127.0.0.1/*"]);
     expect(manifest.host_permissions).toEqual(["https://*.aliexpress.com/*", "https://*.aliexpress.us/*", "https://cjdropshipping.com/*", "https://*.cjdropshipping.com/*"]);
     expect(background.startsWith("/* global chrome, importScripts, DropshipHubCheckout */")).toBe(true);
     expect(background).toContain('importScripts("checkout-core.js");');

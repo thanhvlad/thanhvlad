@@ -25,6 +25,10 @@ const core = DropshipHubCheckout;
 const JOB_PREFIX = "checkout:";
 const FETCH_TIMEOUT_MS = 20000;
 const BRIDGE_SCRIPT_ID = "dropshiphub-app-bridge";
+const ADMIN_BRIDGE_SCRIPT_ID = "dropshiphub-admin-bridge";
+/** The Shopify admin, which embeds the app as a cross-origin iframe. */
+const ADMIN_ORIGIN = "https://admin.shopify.com";
+const ADMIN_MATCH = `${ADMIN_ORIGIN}/*`;
 
 function jobKey(tabId) {
   return `${JOB_PREFIX}${tabId}`;
@@ -187,16 +191,24 @@ async function postQuote(job) {
 // ---------------------------------------------------------------------------
 
 async function registerAppBridgeNow() {
-  await chrome.scripting.unregisterContentScripts({ ids: [BRIDGE_SCRIPT_ID] }).catch(() => undefined);
+  await chrome.scripting.unregisterContentScripts({ ids: [BRIDGE_SCRIPT_ID, ADMIN_BRIDGE_SCRIPT_ID] }).catch(() => undefined);
   const settings = await appSettings();
   if (settings.error) return false;
   const origins = [`${settings.base}/*`];
   const granted = await chrome.permissions.contains({ origins }).catch(() => false);
   if (!granted) return false;
+  // allFrames: the app runs inside the Shopify admin's iframe, and the
+  // bridge has to run in that frame, whose URL is the app's origin.
+  const scripts = [{ id: BRIDGE_SCRIPT_ID, js: ["app-bridge.js"], matches: origins, runAt: "document_idle", allFrames: true }];
+  // Chrome did not run that registration in the app's frame inside the
+  // Shopify admin (measured: the button said the extension had no access,
+  // while the same bridge answered on the app's origin as a top-level page).
+  // The same script runs in the admin's TOP frame as a relay, and only while
+  // the merchant has granted that origin too.
+  const adminGranted = await chrome.permissions.contains({ origins: [ADMIN_MATCH] }).catch(() => false);
+  if (adminGranted) scripts.push({ id: ADMIN_BRIDGE_SCRIPT_ID, js: ["app-bridge.js"], matches: [ADMIN_MATCH], runAt: "document_idle", allFrames: false });
   try {
-    // allFrames: the app runs inside the Shopify admin's iframe, and the
-    // bridge has to run in that frame, whose URL is the app's origin.
-    await chrome.scripting.registerContentScripts([{ id: BRIDGE_SCRIPT_ID, js: ["app-bridge.js"], matches: origins, runAt: "document_idle", allFrames: true }]);
+    await chrome.scripting.registerContentScripts(scripts);
     return true;
   } catch {
     return false;
@@ -256,13 +268,26 @@ function fromAliExpressTab(sender) {
   }
 }
 
-/** The app bridge: a content script in a frame whose origin is the configured app origin. */
-async function fromAppPage(sender) {
+/**
+ * The app bridge: a content script in a frame whose origin is the configured
+ * app origin, or the relay in the Shopify admin's top frame.
+ *
+ * Embedded in the Shopify admin the app is a cross-origin iframe, and a
+ * content script registered for the app's origin does not reach that frame
+ * (measured: the very same bridge answered on the app's origin as a
+ * top-level page). The relay runs on the admin page instead and names the
+ * origin it accepted the page's message from; that origin must be the
+ * configured app origin, and the relay itself must be the admin page. Any
+ * other sender is refused exactly as before.
+ */
+async function fromAppPage(sender, message) {
   if (sender.id !== chrome.runtime.id || !sender.tab) return false;
   const settings = await appSettings();
   if (settings.error) return false;
   const origin = senderOrigin(sender);
-  return origin !== null && origin === settings.base;
+  if (origin === null) return false;
+  if (origin === settings.base) return true;
+  return origin === ADMIN_ORIGIN && String(message?.appOrigin ?? "") === settings.base;
 }
 
 /**
@@ -275,12 +300,29 @@ async function createCheckoutTab(opener) {
   const options = { url: "about:blank", active: true };
   if (opener && Number.isInteger(opener.tabId)) {
     try {
-      return await chrome.tabs.create({ ...options, openerTabId: opener.tabId, ...(Number.isInteger(opener.windowId) ? { windowId: opener.windowId } : {}) });
+      const tab = await chrome.tabs.create({ ...options, openerTabId: opener.tabId, ...(Number.isInteger(opener.windowId) ? { windowId: opener.windowId } : {}) });
+      await groupWithOpener(tab, opener);
+      return tab;
     } catch {
       // Fall through: the checkout still opens, just not beside the app tab.
     }
   }
   return chrome.tabs.create(options);
+}
+
+/**
+ * Puts the checkout tab in the opener's tab group. Chrome did not do it by
+ * itself on the measured account even with openerTabId, and the checkout tab
+ * was then hard to find beside the app's. Grouping is cosmetic: a group that
+ * is gone, or a Chrome without tabGroups, leaves the tab where it is.
+ */
+async function groupWithOpener(tab, opener) {
+  if (!Number.isInteger(tab?.id) || !Number.isInteger(opener?.groupId) || opener.groupId <= -1) return;
+  try {
+    await chrome.tabs.group({ tabIds: [tab.id], groupId: opener.groupId });
+  } catch {
+    // The tab is open either way; where it sits is not worth failing for.
+  }
 }
 
 async function startCheckout(order, opener = null) {
@@ -408,7 +450,11 @@ async function handleTabMessage(message, sender) {
       // A recorded item goes forward (Next item, Send), never back to its
       // product page, where a second checkout for it could start.
       if (job.stage === "recorded") return { ok: false, error: "This item's order number is already recorded." };
-      await writeJob({ ...job, stage: "product", fill: null });
+      // The panel reopens an item by itself when AliExpress answers with its
+      // error page; that is noted per item, so it happens once and the tab
+      // cannot be put in a reload loop by a checkout that keeps failing.
+      const reopened = (Array.isArray(job.reopened) ? job.reopened : job.items.map(() => false)).map((value, index) => (index === job.itemIndex && message.automatic === true ? true : value === true));
+      await writeJob({ ...job, stage: "product", fill: null, reopened });
       await chrome.tabs.update(tabId, { url: core.productPageUrl(item.externalProductId) });
       return { ok: true };
     }
@@ -513,8 +559,8 @@ async function route(message, sender) {
     return message.type === "checkout:start" ? startCheckout(message.order) : forgetCheckout(message.purchaseOrderId);
   }
   if (message.type === "checkout:start-by-id") {
-    if (!(await fromAppPage(sender))) return { ok: false, error: "Not allowed." };
-    return startCheckoutById(message.purchaseOrderId, { tabId: sender.tab.id, windowId: sender.tab.windowId });
+    if (!(await fromAppPage(sender, message))) return { ok: false, error: "Not allowed." };
+    return startCheckoutById(message.purchaseOrderId, { tabId: sender.tab.id, windowId: sender.tab.windowId, groupId: sender.tab.groupId });
   }
   if (fromAliExpressTab(sender)) return handleTabMessage(message, sender);
   return { ok: false, error: "Not allowed." };
