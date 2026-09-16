@@ -393,6 +393,70 @@ describe("the page the fill runs on", () => {
   });
 });
 
+describe("the sign-in wall and the regional host", () => {
+  it("shows the wall instead of any other view, and fills, quotes, saves and records nothing on it", () => {
+    const view = functionSource(checkout, "renderLoginWall");
+    const refresh = functionSource(checkout, "refresh");
+    // Before every stage, so the record-only view cannot offer to walk back into the wall.
+    expect(refresh.indexOf("core.isLoginPage(url)")).toBeGreaterThan(-1);
+    expect(refresh.indexOf("core.isLoginPage(url)")).toBeLessThan(refresh.indexOf('job.stage === "product"'));
+    expect(refresh).toContain("await renderLoginWall(job);");
+    expect(view).not.toMatch(/runFill|fillAddress|sendQuote|saveAddressForm|costBlock|recordBlock|observePayClick|guardedClick/);
+    expect(view).toContain("cancelButton()");
+  });
+
+  it("moves the item to the other site once by itself, then only on the merchant's button", () => {
+    const view = functionSource(checkout, "renderLoginWall");
+    // One report per page address: a re-render cannot ask for a second move.
+    expect(view).toContain("if (loginWallFor === location.href) return;");
+    expect(view.indexOf("loginWallFor = location.href;")).toBeLessThan(view.indexOf('ask({ type: "checkout:login-wall" })'));
+    expect(view).toContain("core.alternateHost(host)");
+    expect(view).toContain('ask({ type: "checkout:switch-host", host: alternate })');
+    // The worker moves an item once and remembers nothing on that move: no host has read as signed in yet.
+    expect(background).toMatch(/case "checkout:login-wall": \{[\s\S]*?core\.alternateHost\(senderHost\(sender\)\)/);
+    expect(background).toMatch(/case "checkout:login-wall": \{[\s\S]*?if \(!url \|\| switched\[job\.itemIndex\] === true \|\| !SWITCHABLE_STAGES\.includes\(job\.stage\)\) return \{ ok: true, switched: false \};/);
+    expect(background).toMatch(/case "checkout:login-wall": \{[\s\S]*?hostSwitched: switched\.map/);
+    expect(core).toMatch(/hostSwitched: items\.map\(\(\) => false\)/);
+    // The merchant's own switch is validated against the two known hosts, and uses up the automatic one.
+    expect(background).toMatch(/case "checkout:switch-host": \{[\s\S]*?if \(!core\.PRODUCT_HOSTS\.includes\(host\)\) return \{ ok: false/);
+    // Neither switch sends an item whose payment has started, or whose number is in, back to its product page.
+    expect(background).toContain('const SWITCHABLE_STAGES = ["product", "confirm"];');
+    expect(background).toMatch(/case "checkout:switch-host": \{[\s\S]*?if \(!SWITCHABLE_STAGES\.includes\(job\.stage\)\) \{/);
+    expect(background).toMatch(/case "checkout:switch-host": \{[\s\S]*?await rememberHost\(host\);/);
+    expect(background).toMatch(/case "checkout:switch-host": \{[\s\S]*?hostSwitched: switched \}\)/);
+    // Both switches put the item back on its product page, as the reopen does.
+    expect(background).toMatch(/case "checkout:login-wall": \{[\s\S]*?stage: "product", fill: null/);
+    expect(background).toMatch(/case "checkout:switch-host": \{[\s\S]*?stage: "product", fill: null/);
+  });
+
+  it("remembers only a host a signed-in page was read on, in session storage, and opens products there", () => {
+    expect(checkout).toContain('ask({ type: "checkout:host-ok" });');
+    // Reported only after the page's own product model has been read back for this item.
+    const product = functionSource(checkout, "renderProductStage");
+    expect(product.indexOf("const page = await readSkus();")).toBeLessThan(product.indexOf('ask({ type: "checkout:host-ok" })'));
+    expect(product.indexOf("core.sameProduct(page.productId, item.externalProductId)")).toBeLessThan(product.indexOf('ask({ type: "checkout:host-ok" })'));
+    // The worker takes the host from the sender, never from the message, and keeps it out of sync storage.
+    expect(background).toContain('const PREFERRED_HOST_KEY = "preferredHost";');
+    expect(background).toMatch(/if \(message\.type === "checkout:host-ok"\) \{[\s\S]*?const host = senderHost\(sender\);/);
+    expect(background).toMatch(/if \(message\.type === "checkout:host-ok"\) \{[\s\S]*?return \{ ok: true, remembered: await rememberHost\(host\) \};/);
+    // The orders list worked on the very host whose item URL showed the wall, so only a product page overrules the memory.
+    expect(background).toContain('if (!core.isProductPage(sender.url ?? "") && (await preferredHost())) return { ok: true, remembered: false };');
+    expect(functionSource(background, "rememberHost", "")).toContain("if (!core.PRODUCT_HOSTS.includes(host)) return false;");
+    expect(functionSource(background, "rememberHost", "")).toContain("chrome.storage.session.set({ [PREFERRED_HOST_KEY]: host })");
+    expect(functionSource(background, "preferredHost", "")).toContain("core.PRODUCT_HOSTS.includes(value) ? value : null");
+    // The key carries no job prefix, so the sweeps that drop jobs never touch it.
+    const jobPrefix = /const JOB_PREFIX = "([^"]+)";/.exec(background)?.[1] ?? "";
+    expect(jobPrefix).toBeTruthy();
+    expect("preferredHost".startsWith(jobPrefix)).toBe(false);
+    // No product page is opened past the two known hosts.
+    expect(count(background, /core\.productPageUrl\(/)).toBe(1);
+    expect(functionSource(background, "productUrlFor", "")).toContain("core.productPageUrlOn(host, item.externalProductId)");
+    expect(background).toContain("chrome.tabs.update(tab.id, { url: await productUrlFor(job.items[0]) });");
+    expect(background).toContain("chrome.tabs.update(tabId, { url: await productUrlFor(item) });");
+    expect(background).toContain("chrome.tabs.update(tabId, { url: await productUrlFor(next.items[next.itemIndex]) });");
+  });
+});
+
 describe("customer data stays inside the extension", () => {
   it("is never logged", () => {
     for (const source of [checkout, core, background, orders, bridge, popup]) expect(source).not.toMatch(/console\./);
@@ -494,8 +558,12 @@ describe("the orders-page sync reads order ids, product ids, SKU text, status, t
     expect(orders).toContain('[class*="logistic-info-v2--carrierTitle"]');
     expect(orders).toContain('[class*="logistic-info-v2--mailNoValue"]');
     for (const parser of ["core.parseOrderCard(", "core.parseOrderDetail(", "core.parseTrackingPage("]) expect(orders).toContain(parser);
-    // Only these two messages leave the page, and the worker forwards only well-formed values.
-    expect(orders.match(/ask\(\{ type: "([^"]+)"/g)).toEqual(['ask({ type: "sync:orders"', 'ask({ type: "sync:tracking"']);
+    // Only these messages leave the page, and the worker forwards only
+    // well-formed values. "checkout:host-ok" carries nothing at all: it says
+    // that order cards were parsed here, and the worker reads the host it was
+    // sent from.
+    expect(orders.match(/ask\(\{ type: "([^"]+)"/g)).toEqual(['ask({ type: "sync:orders"', 'ask({ type: "sync:tracking"', 'ask({ type: "checkout:host-ok"']);
+    expect(orders).toMatch(/if \(cards\) \{[\s\S]*?await ask\(\{ type: "checkout:host-ok" \}\);/);
     // The paying hints carry a purchase order id and a time, read from the jobs in stage "paying", nothing of the customer.
     expect(background).toMatch(/sync:orders"\) \{\s*const body = core\.ordersSyncBody\(message\.orders, await payingHints\(\)\)/);
     const hints = functionSource(background, "payingHints", "");
@@ -587,8 +655,8 @@ describe("the app-page bridge", () => {
 });
 
 describe("manifest", () => {
-  it("is version 1.6.1 with the background worker and tabGroups as its only new permission", () => {
-    expect(manifest.version).toBe("1.6.1");
+  it("is version 1.6.2 with the background worker and tabGroups as its only new permission", () => {
+    expect(manifest.version).toBe("1.6.2");
     expect(manifest.background).toEqual({ service_worker: "background.js" });
     expect(manifest.permissions).toEqual(["activeTab", "scripting", "storage", "tabGroups"]);
     // The admin origin is asked for at run time, from the popup, like the app's own.

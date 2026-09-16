@@ -296,6 +296,29 @@ order page in DropshipHub. Page facts it relies on are in `docs/ALIEXPRESS_PAGE_
    opens beside that tab and is put in its tab group (`chrome.tabs.group`, the extension's
    `tabGroups` permission): Chrome does not do that by itself from `openerTabId`, and the new
    tab was hard to find next to the app's.
+
+   **Which site the product opens on.** On the owner's US-routed account the `.com` item URL
+   answered with AliExpress's sign-in page (`/p/ug-login-page/login.html`) although the
+   account was signed in, while the same product on `www.aliexpress.us` was signed in and the
+   orders list on `.com` worked. So the extension remembers the host a content script last
+   read a page on that only a signed-in account is shown - the product's own model, or an
+   order card of your orders list - and opens the next product page there. Because the orders
+   list worked on the very host whose item URL showed the wall, an orders page only fills that
+   memory in while it is empty; a product page is what overrules it. The host and what proved
+   it are read from the sender's own URL in the worker, never taken from the message. The
+   memory is one value in `chrome.storage.session`, alongside the jobs: it is no secret, but
+   it belongs to this browsing session, and it is never synced to your other computers, where
+   the routing may differ. Only `www.aliexpress.com` and `www.aliexpress.us` are ever used.
+
+   **The sign-in wall.** When a page is a sign-in page the panel shows that instead of any
+   other view, whatever the item was waiting for: it says AliExpress asked you to sign in on
+   this site and that DropshipHub fills, saves and records nothing until you are, with
+   **Check again**, **Try aliexpress.us** / **Try aliexpress.com** (which also becomes the
+   remembered host) and **Cancel this checkout**. The extension moves the item to the other
+   site **once by itself** and then leaves it to that button, so two sites that both answer
+   with the wall cannot put the tab in a reload loop. Without this the job moved on to
+   "confirm" while the tab sat on the sign-in page, the panel offered "Open this item's
+   checkout again", and that button walked straight back into the wall.
 2. On the product page the extension reads the page's own product id and SKU list, checks
    that the item's SKU still exists and is in stock, and opens that host's
    `/p/trade/confirm.html` for the SKU, quantity, the customer's country and the item's
@@ -465,3 +488,11 @@ and `127.0.0.1`, because the token travels with every request.
    the tab that started it; Chrome does not do that by itself from `openerTabId`. Press
    *Reload* on the extension card, then open the popup once and press **Allow access**
    again to grant `https://admin.shopify.com` for the order page's button.
+8. **Version 1.6.2** is the fix-up after the second live checkout, where the product opened
+   on `www.aliexpress.com` answered with AliExpress's sign-in page although the account was
+   signed in. The extension now recognises that page, shows it for what it is at any stage
+   with **Check again** and **Try aliexpress.us** / **Try aliexpress.com** instead of a
+   checkout view over nothing, moves the item to the other site once by itself, and
+   remembers (for the session only) the site a signed-in page was last read on, so the next
+   product page opens there. Press *Reload* on the extension card, then reload any open
+   AliExpress tabs. No new permission is asked for.

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DropshipHub Product Capture",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "Add AliExpress or CJ products to DropshipHub, place its orders on AliExpress with the address filled in, and sync their order numbers and tracking.",
   "permissions": [
     "activeTab",

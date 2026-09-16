@@ -75,13 +75,52 @@
   }
 
   /**
-   * The product page a checkout opens for an item. Always the global host with
-   * the global id: AliExpress redirects to the account's regional host itself,
-   * and the content script reads the id that host uses from the page.
+   * The two hosts a product page is opened on, the global one first. Opening
+   * the global host is the default: AliExpress redirects a regional account to
+   * its own host, and the content script reads the id that host uses from the
+   * page. On the owner's US-routed account that redirect became a sign-in wall
+   * instead (isLoginPage, and "Regional hosts and the login wall" in
+   * docs/ALIEXPRESS_PAGE_MODEL.md) while the same product on www.aliexpress.us
+   * was signed in, so a checkout can be moved to the other host of the pair.
    */
+  const PRODUCT_HOSTS = Object.freeze(["www.aliexpress.com", "www.aliexpress.us"]);
+
+  /**
+   * The item URL on one of PRODUCT_HOSTS, carrying the id that host uses (the
+   * .us id is the global id plus 2^51). Null for any other host, so a host
+   * that came from a message can never send the tab somewhere else.
+   */
+  function productPageUrlOn(host, storedId) {
+    const hostname = String(host ?? "").toLowerCase();
+    if (!PRODUCT_HOSTS.includes(hostname)) return null;
+    const id = productIdForHost(storedId, hostname);
+    return id === null ? null : `https://${hostname}/item/${id}.html`;
+  }
+
+  /** The product page a checkout opens for an item, on the default (global) host. */
   function productPageUrl(storedId) {
-    const global = globalProductId(storedId);
-    return global === null ? null : `https://www.aliexpress.com/item/${global}.html`;
+    return productPageUrlOn(PRODUCT_HOSTS[0], storedId);
+  }
+
+  /** The other host of the pair; null for anything that is not one of them. */
+  function alternateHost(host) {
+    const index = PRODUCT_HOSTS.indexOf(String(host ?? "").toLowerCase());
+    return index === -1 ? null : PRODUCT_HOSTS[1 - index];
+  }
+
+  /**
+   * AliExpress's sign-in wall. Measured on the owner's signed-in account:
+   * `www.aliexpress.com/item/<global id>.html` answered with
+   * `www.aliexpress.com/p/ug-login-page/login.html` while the same product on
+   * `www.aliexpress.us` loaded signed in, and the orders list on the .com host
+   * worked. A page like this has no buyer context, so the panel fills, quotes
+   * and records nothing on it whatever stage the job is in.
+   */
+  function isLoginPage(raw) {
+    const url = parseUrl(raw);
+    if (!url || !isAliExpressHost(url.hostname)) return false;
+    const segments = url.pathname.toLowerCase().split("/").filter(Boolean);
+    return segments.includes("login.html") || segments[0] === "login";
   }
 
   function isProductPage(raw) {
@@ -1061,6 +1100,10 @@
         // It does that once, then leaves it to the merchant's button, so a
         // page that keeps failing cannot put the tab in a reload loop.
         reopened: items.map(() => false),
+        // Per item: whether this item has already been moved to the other
+        // regional host after a sign-in wall. Also once, for the same reason:
+        // after it, the host is changed only by the merchant's own button.
+        hostSwitched: items.map(() => false),
         payingAt: null,
         stage: "product",
         startedAt: now,
@@ -1369,6 +1412,7 @@
 
   root.DropshipHubCheckout = Object.freeze({
     REGIONAL_OFFSET,
+    PRODUCT_HOSTS,
     STREET_MAX,
     JOB_MAX_AGE_MS,
     US_STATES,
@@ -1380,7 +1424,10 @@
     sameProduct,
     isAliExpressHost,
     isUsHost,
+    alternateHost,
     productPageUrl,
+    productPageUrlOn,
+    isLoginPage,
     isProductPage,
     productIdFromUrl,
     isConfirmPage,

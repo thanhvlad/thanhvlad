@@ -65,6 +65,50 @@ describe("product ids across regional hosts", () => {
     expect(core.isConfirmPage("https://evil.example/p/trade/confirm.html")).toBe(false);
     expect(core.isConfirmPage("https://www.aliexpress.com/p/order/index.html")).toBe(false);
   });
+
+  it("builds the item URL on either host of the pair, and on no other host", () => {
+    expect(core.PRODUCT_HOSTS).toEqual(["www.aliexpress.com", "www.aliexpress.us"]);
+    expect(core.productPageUrlOn("www.aliexpress.com", US_ID)).toBe(`https://www.aliexpress.com/item/${GLOBAL_ID}.html`);
+    expect(core.productPageUrlOn("www.aliexpress.us", GLOBAL_ID)).toBe(`https://www.aliexpress.us/item/${US_ID}.html`);
+    expect(core.productPageUrlOn("WWW.ALIEXPRESS.US", GLOBAL_ID)).toBe(`https://www.aliexpress.us/item/${US_ID}.html`);
+    // The default stays the global host, so a checkout with nothing remembered opens where it always did.
+    expect(core.productPageUrl(GLOBAL_ID)).toBe(core.productPageUrlOn("www.aliexpress.com", GLOBAL_ID));
+    // A host that is not one of the two is refused, so a host that came from a
+    // message can never send the tab somewhere else.
+    expect(core.productPageUrlOn("vi.aliexpress.com", GLOBAL_ID)).toBeNull();
+    expect(core.productPageUrlOn("www.aliexpress.com.evil.example", GLOBAL_ID)).toBeNull();
+    expect(core.productPageUrlOn("", GLOBAL_ID)).toBeNull();
+    expect(core.productPageUrlOn(null, GLOBAL_ID)).toBeNull();
+    expect(core.productPageUrlOn("www.aliexpress.us", "nope")).toBeNull();
+  });
+
+  it("names the other host of the pair, and nothing for anything else", () => {
+    expect(core.alternateHost("www.aliexpress.com")).toBe("www.aliexpress.us");
+    expect(core.alternateHost("www.aliexpress.us")).toBe("www.aliexpress.com");
+    expect(core.alternateHost("WWW.ALIEXPRESS.COM")).toBe("www.aliexpress.us");
+    expect(core.alternateHost("vi.aliexpress.com")).toBeNull();
+    expect(core.alternateHost("")).toBeNull();
+    expect(core.alternateHost(null)).toBeNull();
+  });
+
+  it("recognises AliExpress's sign-in wall, which no stage may be worked on", () => {
+    // Measured: the .com item URL of a signed-in, US-routed account answered with this page.
+    expect(core.isLoginPage("https://www.aliexpress.com/p/ug-login-page/login.html")).toBe(true);
+    expect(core.isLoginPage("https://www.aliexpress.com/p/ug-login-page/login.html?return_url=%2Fitem%2F1.html")).toBe(true);
+    expect(core.isLoginPage("https://www.aliexpress.us/p/ug-login-page/login.html")).toBe(true);
+    expect(core.isLoginPage("https://login.aliexpress.com/login.html")).toBe(true);
+    expect(core.isLoginPage("https://www.aliexpress.com/login")).toBe(true);
+    expect(core.isLoginPage("https://www.aliexpress.com/login/")).toBe(true);
+    expect(core.isLoginPage("https://www.aliexpress.com/LOGIN.HTML")).toBe(true);
+    // The pages the checkout works on are not sign-in pages, and neither is another site's.
+    expect(core.isLoginPage(`https://www.aliexpress.com/item/${GLOBAL_ID}.html`)).toBe(false);
+    expect(core.isLoginPage("https://www.aliexpress.com/p/trade/confirm.html?objectId=1")).toBe(false);
+    expect(core.isLoginPage("https://www.aliexpress.com/p/order/index.html")).toBe(false);
+    expect(core.isLoginPage("https://www.aliexpress.com/p/relogin-page/x.html")).toBe(false);
+    expect(core.isLoginPage("https://evil.example/p/ug-login-page/login.html")).toBe(false);
+    expect(core.isLoginPage("not a url")).toBe(false);
+    expect(core.isLoginPage(null)).toBe(false);
+  });
 });
 
 describe("the confirm page URL", () => {
@@ -924,8 +968,10 @@ describe("the checkout job", () => {
     expect(error).toBeUndefined();
     expect(job).toMatchObject({ tabId: 7, purchaseOrderId: "po_cm123456", orderName: "#1001", currency: "USD", expectedTotal: "8.99", itemIndex: 0, stage: "product", startedAt: 1_000 });
     expect(job.recordedOrderIds).toEqual([[], []]);
-    // No item's checkout has been reopened after an error page yet.
+    // No item's checkout has been reopened after an error page yet, and no
+    // item has been moved to the other regional host after a sign-in wall.
     expect(job.reopened).toEqual([false, false]);
+    expect(job.hostSwitched).toEqual([false, false]);
     expect(job.address).toMatchObject({ firstName: "Jane", lastName: "Doe", countryCode: "US", provinceCode: "TX" });
     expect(JSON.stringify(job)).not.toContain("jane@example.com");
     expect(job.items[0]).toMatchObject({ externalProductId: GLOBAL_ID, externalSkuId: SKU_ID, carrierCode: "CAINIAO_FULFILLMENT_STD", quantity: 2 });

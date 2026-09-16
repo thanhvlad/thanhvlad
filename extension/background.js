@@ -91,6 +91,53 @@ chrome.tabs.onUpdated.addListener((_tabId, change) => {
 sweep().catch(() => undefined);
 
 // ---------------------------------------------------------------------------
+// The host the merchant is signed in on
+//
+// The extension used to open every product on www.aliexpress.com. On the
+// owner's US-routed account that URL answered with AliExpress's sign-in page
+// although the account was signed in, while the same product on
+// www.aliexpress.us loaded signed in and the orders list on .com worked. So
+// the host a content script has just read a signed-in page on is remembered
+// and used for the next product page.
+//
+// It lives in chrome.storage.session beside the jobs: it is no secret, but it
+// describes this browsing session and has no business surviving it, and
+// chrome.storage.sync would push it to the merchant's other computers, where
+// the routing may differ. The key carries no job prefix, so sweep() and the
+// job scans never see it.
+// ---------------------------------------------------------------------------
+
+const PREFERRED_HOST_KEY = "preferredHost";
+/** The stages an item may be moved to the other host in: before any money is at stake. */
+const SWITCHABLE_STAGES = ["product", "confirm"];
+
+async function preferredHost() {
+  const value = (await chrome.storage.session.get(PREFERRED_HOST_KEY))[PREFERRED_HOST_KEY];
+  return core.PRODUCT_HOSTS.includes(value) ? value : null;
+}
+
+/** Remembers a host the merchant was read as signed in on. Anything else is ignored. */
+async function rememberHost(host) {
+  if (!core.PRODUCT_HOSTS.includes(host)) return false;
+  await chrome.storage.session.set({ [PREFERRED_HOST_KEY]: host });
+  return true;
+}
+
+function senderHost(sender) {
+  try {
+    return new URL(sender.url ?? sender.tab?.url ?? "").hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+/** The item's product page on the remembered host, falling back to the global one. */
+async function productUrlFor(item) {
+  const host = await preferredHost();
+  return (host && core.productPageUrlOn(host, item.externalProductId)) || core.productPageUrl(item.externalProductId);
+}
+
+// ---------------------------------------------------------------------------
 // The app's API
 // ---------------------------------------------------------------------------
 
@@ -337,7 +384,7 @@ async function startCheckout(order, opener = null) {
   const tab = await createCheckoutTab(opener);
   const job = { ...built.job, tabId: tab.id };
   await writeJob(job);
-  await chrome.tabs.update(tab.id, { url: core.productPageUrl(job.items[0].externalProductId) });
+  await chrome.tabs.update(tab.id, { url: await productUrlFor(job.items[0]) });
   return { ok: true };
 }
 
@@ -430,6 +477,21 @@ async function handleTabMessage(message, sender) {
     return { ok: true, result: call.answer.result, orderName: call.answer.orderName ?? null, number: tracking.trackingNumber };
   }
 
+  if (message.type === "checkout:host-ok") {
+    // A content script read a page that only a signed-in account is shown:
+    // the product's own model, or an order card of the merchant's orders
+    // list. Both the host and what proved it are taken from the sender's own
+    // URL, never from the message.
+    //
+    // A product page is the proof that counts. In the live test the orders
+    // list worked on the very host whose item URL answered with the sign-in
+    // wall, so an orders page only fills the memory in while it is empty; it
+    // never overrules a host a product page has rendered on.
+    const host = senderHost(sender);
+    if (!core.isProductPage(sender.url ?? "") && (await preferredHost())) return { ok: true, remembered: false };
+    return { ok: true, remembered: await rememberHost(host) };
+  }
+
   const job = await readJob(tabId);
   if (message.type === "checkout:get") return { ok: true, job };
   if (!job) return { ok: false, error: "This checkout has ended. Start it again from the extension's popup or the order in DropshipHub." };
@@ -455,7 +517,41 @@ async function handleTabMessage(message, sender) {
       // cannot be put in a reload loop by a checkout that keeps failing.
       const reopened = (Array.isArray(job.reopened) ? job.reopened : job.items.map(() => false)).map((value, index) => (index === job.itemIndex && message.automatic === true ? true : value === true));
       await writeJob({ ...job, stage: "product", fill: null, reopened });
-      await chrome.tabs.update(tabId, { url: core.productPageUrl(item.externalProductId) });
+      await chrome.tabs.update(tabId, { url: await productUrlFor(item) });
+      return { ok: true };
+    }
+    case "checkout:login-wall": {
+      // AliExpress showed its sign-in page where this item's product should
+      // be. The item is moved to the other regional host ONCE, without
+      // remembering that host: nothing there has read as signed in yet. After
+      // that the panel's own button is the only way, so two hosts that both
+      // answer with the sign-in wall cannot put the tab in a reload loop.
+      const alternate = core.alternateHost(senderHost(sender));
+      const switched = Array.isArray(job.hostSwitched) ? job.hostSwitched : job.items.map(() => false);
+      const url = alternate ? core.productPageUrlOn(alternate, item.externalProductId) : null;
+      // Never once the merchant has started paying or the number is in: an
+      // item whose payment is under way must not be sent back to its product
+      // page, where a second checkout for it could start.
+      if (!url || switched[job.itemIndex] === true || !SWITCHABLE_STAGES.includes(job.stage)) return { ok: true, switched: false };
+      await writeJob({ ...job, stage: "product", fill: null, hostSwitched: switched.map((value, index) => (index === job.itemIndex ? true : value === true)) });
+      await chrome.tabs.update(tabId, { url });
+      return { ok: true, switched: true, host: alternate };
+    }
+    case "checkout:switch-host": {
+      // The merchant chose the other site themselves. That choice is worth
+      // remembering for the next item, and it also uses up this item's
+      // automatic switch, so the worker never moves the tab under them.
+      const host = String(message.host ?? "").toLowerCase();
+      if (!core.PRODUCT_HOSTS.includes(host)) return { ok: false, error: "That is not an AliExpress site DropshipHub opens products on." };
+      if (!SWITCHABLE_STAGES.includes(job.stage)) {
+        return { ok: false, error: job.stage === "paying" ? "This item's payment has already been started on AliExpress. Check it in your AliExpress orders." : "This item's order number is already recorded." };
+      }
+      const url = core.productPageUrlOn(host, item.externalProductId);
+      if (!url) return { ok: false, error: "The product page address could not be built for this item." };
+      const switched = (Array.isArray(job.hostSwitched) ? job.hostSwitched : job.items.map(() => false)).map((value, index) => (index === job.itemIndex ? true : value === true));
+      await rememberHost(host);
+      await writeJob({ ...job, stage: "product", fill: null, hostSwitched: switched });
+      await chrome.tabs.update(tabId, { url });
       return { ok: true };
     }
     case "checkout:fill-result": {
@@ -517,7 +613,7 @@ async function handleTabMessage(message, sender) {
       if (job.stage !== "recorded" || core.isLastItem(job)) return { ok: false, error: "Record this item's order number first." };
       const next = { ...job, itemIndex: job.itemIndex + 1, stage: "product", fill: null, payingAt: null };
       await writeJob(next);
-      await chrome.tabs.update(tabId, { url: core.productPageUrl(next.items[next.itemIndex].externalProductId) });
+      await chrome.tabs.update(tabId, { url: await productUrlFor(next.items[next.itemIndex]) });
       return { ok: true };
     }
     case "checkout:cancel": {

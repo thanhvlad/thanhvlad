@@ -48,6 +48,9 @@
   let panel = null;
   let lastUrl = location.href;
   let productCheckFor = null;
+  // The sign-in wall is reported to the worker once per page address, so the
+  // one automatic move to the other regional host cannot repeat on a re-render.
+  let loginWallFor = null;
   // The automatic fill runs once per item per page load; a reload consults
   // the outcome recorded in the job instead (core.shouldAutoFill).
   let autoFillFor = null;
@@ -339,6 +342,61 @@
     return null;
   }
 
+  // ---------------------------------------------------------------------------
+  // The sign-in wall, at any stage
+  // ---------------------------------------------------------------------------
+
+  /**
+   * AliExpress asked the merchant to sign in where this item's page should be.
+   * Measured on the owner's signed-in account: the product on
+   * www.aliexpress.com answered with /p/ug-login-page/login.html while the
+   * same product on www.aliexpress.us was signed in, and the confirm page
+   * opened after it had no buyer context at all ("Query product info failed
+   * …"). This view wins over every stage, because on a sign-in page there is
+   * no checkout to fill and no order to record, and the record-only view's
+   * "Open this item's checkout again" walked straight back into the wall.
+   *
+   * The worker moves the item to the other site once by itself; after that
+   * only the merchant's button below does, so no reload loop is possible.
+   */
+  async function renderLoginWall(job) {
+    const body = freshBody();
+    const host = location.hostname;
+    // The wall was measured on a host the checkout itself opens. Should
+    // AliExpress ever show it on another of its hosts, the other site of the
+    // pair is still offered, so this view is never a dead end.
+    const alternate = core.alternateHost(host) ?? (core.isUsHost(host) ? core.PRODUCT_HOSTS[0] : core.PRODUCT_HOSTS[1]);
+    const result = el("div");
+    const actions = el("div", { className: "stack" });
+    body.append(
+      itemBlock(job),
+      el("div", { className: "line err", text: `AliExpress asked you to sign in on ${host}. DropshipHub fills, saves and records nothing until you are signed in.` }),
+      el("div", {
+        className: "muted",
+        text: "Sign in in this tab and press Check again. An account signed in on one AliExpress site can still be asked to sign in on the other; the item opens there instead.",
+      }),
+      result,
+      actions,
+      cancelButton(),
+    );
+    actions.append(
+      button("Check again", () => refresh(true), "act secondary"),
+      button(
+        `Try ${alternate.replace(/^www\./, "")}`,
+        async () => {
+          say(result, `Opening this item on ${alternate}…`);
+          const answer = await ask({ type: "checkout:switch-host", host: alternate });
+          if (!answer.ok) say(result, answer.error, "err");
+        },
+        "act secondary",
+      ),
+    );
+    if (loginWallFor === location.href) return;
+    loginWallFor = location.href;
+    const answer = await ask({ type: "checkout:login-wall" });
+    if (answer.ok && answer.switched) say(result, `Opening this item on ${answer.host}, where you may already be signed in…`);
+  }
+
   function renderWaiting(job) {
     const body = freshBody();
     const message = el("div");
@@ -374,6 +432,11 @@
       actions.append(button("Check again", () => renderProductStage(job), "act secondary"));
       return;
     }
+
+    // The page's own product model was read, which AliExpress only serves a
+    // signed-in account: this host works, and the worker opens the next
+    // product page on it rather than on the one that showed the sign-in wall.
+    ask({ type: "checkout:host-ok" });
 
     const availability = core.skuAvailability(page.skus, item.externalSkuId, item.quantity);
     if (!availability.ok) {
@@ -2030,6 +2093,12 @@
       return;
     }
     const url = location.href;
+    // Before any stage: on AliExpress's sign-in page there is no product, no
+    // checkout and no order, whatever the job says the item is waiting for.
+    if (core.isLoginPage(url)) {
+      await renderLoginWall(job);
+      return;
+    }
     if (job.stage === "product") {
       if (core.isProductPage(url)) await renderProductStage(job);
       else renderWaiting(job);

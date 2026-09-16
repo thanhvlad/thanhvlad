@@ -117,6 +117,37 @@ The US page's model reports the US id as its `productId`, and `data-sku-col`,
 the extension builds from a stored product id must use the id of the host it
 is on. The account's display currency followed the account (VND), not the host.
 
+### Regional hosts and the login wall (measured 2026-09-16)
+
+On the same account, signed in, the redirect above did not always happen.
+`https://www.aliexpress.com/item/<global id>.html` answered with
+
+```
+https://www.aliexpress.com/p/ug-login-page/login.html
+```
+
+— AliExpress's sign-in page — while the account was signed in: the very same
+product on `https://www.aliexpress.us/item/<global id + 2^51>.html` loaded
+normally, signed in, with the Buy now button present, and the account's orders
+list on `https://www.aliexpress.com/p/order/index.html` also worked. So the
+wall is not "signed out": some `.com` pages bounce a US-routed account to it
+and others do not.
+
+What it costs downstream: the confirm page built from such a page has no buyer
+context. It rendered "Query product info failed, query param orderLine DTO is
+empty" and then "Oops! Something went wrong", which is the same error page as
+in "Checkout: the confirm page" below but with a different cause — reopening
+the product on the same host walks straight back into the wall.
+
+The extension therefore treats a sign-in page as its own state
+(`isLoginPage`: `/p/ug-login-page/login.html`, any path segment `login.html`,
+or `/login` on an AliExpress host), never as a product or checkout page, and
+keeps the pair `www.aliexpress.com` / `www.aliexpress.us` so an item can be
+opened on the other one. A host a signed-in page was actually read on (the
+product model, or an order card of the orders list) is the one the next
+product page is opened on - with the product page as the stronger proof,
+since the orders list worked on the host whose item URL did not.
+
 ## Checkout: the confirm page
 
 "Buy now" does not create anything; it navigates to a confirm page whose URL

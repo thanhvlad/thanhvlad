@@ -222,7 +222,15 @@
           const list = readCards();
           return list.length > 0 ? list : null;
         }, 15000);
-        if (cards) await syncOrders(cards);
+        if (cards) {
+          // The merchant's own orders are listed, so this host is one they are
+          // signed in on: the checkout opens its next product page there
+          // rather than on one that answers with AliExpress's sign-in wall.
+          // The message carries nothing of the page; the worker takes the host
+          // from the sender.
+          await ask({ type: "checkout:host-ok" });
+          await syncOrders(cards);
+        }
       }
     } finally {
       running = false;
